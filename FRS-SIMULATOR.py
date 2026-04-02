@@ -302,7 +302,7 @@ class MainMenuGUI(_BaseWindow):
 		self.cache_enabled = tk.BooleanVar(value=True)  # キャッシュ有効/無効
 		self._shared_fem_cache = None       # FEM用SharedCacheManager
 		self._shared_overlap_cache = None   # Overlap/Heatmap用SharedCacheManager
-		self._init_shared_cache()
+		# ※ _init_shared_cache() は _load_state() でNASパスを復元した後に呼ぶ
 
 		# Fittingパラメータ
 		# RANSACパラメータ
@@ -334,6 +334,8 @@ class MainMenuGUI(_BaseWindow):
 
 		# 状態復元（可能なら）
 		self._load_state()
+		# NASパスを含む状態復元後にキャッシュを初期化
+		self._init_shared_cache()
 
 		# スタイル設定（LabelFrameのタイトルを太字に）
 		style = ttk.Style()
@@ -499,7 +501,7 @@ class MainMenuGUI(_BaseWindow):
 			# FEM用キャッシュ
 			self._shared_fem_cache = SharedCacheManager(
 				local_dir=str(base_dir / ".fem_cache"),
-				nas_dir=nas_path + "/fem_cache" if nas_path else None,
+				nas_dir=nas_path + "/.fem_cache" if nas_path else None,
 				namespace="fem",
 				max_local_gb=2.0,
 				max_nas_gb=10.0,
@@ -508,7 +510,7 @@ class MainMenuGUI(_BaseWindow):
 			# Overlap/Heatmap用キャッシュ
 			self._shared_overlap_cache = SharedCacheManager(
 				local_dir=str(base_dir / ".overlap_cache"),
-				nas_dir=nas_path + "/overlap_cache" if nas_path else None,
+				nas_dir=nas_path + "/.overlap_cache" if nas_path else None,
 				namespace="overlap",
 				max_local_gb=2.0,
 				max_nas_gb=10.0,
@@ -11756,13 +11758,10 @@ class MainMenuGUI(_BaseWindow):
 		try: self.show_fem_analysis.set(bool(data.get("show_fem_analysis", False)))
 		except (ValueError, TypeError): self.show_fem_analysis.set(False)
 
-		# 共有キャッシュ設定の復元
+		# 共有キャッシュ設定の復元（キャッシュ初期化は _load_state() 呼び出し元が行う）
 		self.cache_nas_path.set(str(data.get("cache_nas_path", "")))
 		try: self.cache_enabled.set(bool(data.get("cache_enabled", True)))
 		except (ValueError, TypeError): self.cache_enabled.set(True)
-		# NASパスが復元されたら共有キャッシュを再初期化
-		if self.cache_nas_path.get().strip():
-			self._reinit_shared_cache()
 
 	def _save_state(self) -> None:
 		data = {
