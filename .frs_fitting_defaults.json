@@ -1,0 +1,9 @@
+{
+  "ransac_distance_threshold": 3.0,
+  "ransac_max_iterations": 70000,
+  "ransac_confidence": 0.99,
+  "icp_threshold": 0.8,
+  "icp_max_iterations": 20000,
+  "sample_points": 50000,
+  "distance_threshold": 0.01
+}

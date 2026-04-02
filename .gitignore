@@ -1,0 +1,5 @@
+.venv/
+.overlap_cache/
+.fem_cache/
+__pycache__/
+.claude/
