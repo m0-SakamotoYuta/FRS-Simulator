@@ -106,10 +106,17 @@ class FEMResults:
 # ============================================================================
 
 class FEMCacheManager:
-    """FEM解析結果のキャッシュ管理"""
+    """FEM解析結果のキャッシュ管理（SharedCacheManager対応版）
 
-    def __init__(self, cache_dir: Optional[str] = None, enabled: bool = True):
+    shared_cacheが渡された場合はそれを使用（NAS+ローカル2層キャッシュ）。
+    渡されない場合は従来のローカルのみキャッシュで動作（後方互換）。
+    """
+
+    def __init__(self, cache_dir: Optional[str] = None, enabled: bool = True,
+                 shared_cache=None):
         self.enabled = enabled
+        self._shared_cache = shared_cache  # SharedCacheManager instance or None
+
         if cache_dir is None:
             try:
                 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -146,6 +153,14 @@ class FEMCacheManager:
             if key is None:
                 return None
 
+            # SharedCacheManager経由（NAS+ローカル2層）
+            if self._shared_cache is not None:
+                result = self._shared_cache.get(f"fem_{key}")
+                if result is not None and isinstance(result, FEMResults):
+                    return result
+                return None
+
+            # 従来のローカルのみキャッシュ
             if key in self._memory_cache:
                 print(f"[キャッシュ] メモリキャッシュヒット (key={key})")
                 return self._memory_cache[key]
@@ -171,6 +186,13 @@ class FEMCacheManager:
                                       boundary_mode, max_nodes)
             if key is None:
                 return
+
+            # SharedCacheManager経由
+            if self._shared_cache is not None:
+                self._shared_cache.put(f"fem_{key}", results)
+                return
+
+            # 従来のローカルのみキャッシュ
             self._memory_cache[key] = results
             os.makedirs(self.cache_dir, exist_ok=True)
             cache_file = os.path.join(self.cache_dir, f"fem_{key}.pkl")
@@ -182,6 +204,9 @@ class FEMCacheManager:
 
     def clear(self):
         self._memory_cache.clear()
+        if self._shared_cache is not None:
+            self._shared_cache.clear_local()
+            return
         try:
             if os.path.exists(self.cache_dir):
                 import shutil
@@ -210,14 +235,18 @@ class FEMContactSolver:
         verbose: bool = True,
         cache_enabled: bool = False,
         cache_dir: Optional[str] = None,
+        shared_cache=None,
     ):
         self.material = material or MaterialProperties()
         self.contact = contact or ContactParameters()
         self.verbose = verbose
 
-        # キャッシュ
+        # キャッシュ（shared_cacheが渡されたら自動有効化）
         try:
-            self._cache = FEMCacheManager(cache_dir=cache_dir, enabled=cache_enabled)
+            enabled = cache_enabled or (shared_cache is not None)
+            self._cache = FEMCacheManager(
+                cache_dir=cache_dir, enabled=enabled, shared_cache=shared_cache
+            )
         except Exception:
             self._cache = FEMCacheManager(enabled=False)
 

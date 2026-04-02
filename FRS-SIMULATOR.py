@@ -109,6 +109,13 @@ try:
 except ImportError:
 	_HAS_REPORT = False
 
+# 共有キャッシュマネージャ（NAS + ローカル2層キャッシュ）
+try:
+	from shared_cache_manager import SharedCacheManager, compute_content_hash
+	_HAS_SHARED_CACHE = True
+except ImportError:
+	_HAS_SHARED_CACHE = False
+
 # Open3Dの警告を抑制
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 # endregion インポートと初期設定
@@ -290,6 +297,13 @@ class MainMenuGUI(_BaseWindow):
 		self.fem_last_dist_bone_mesh = None
 		self.fem_is_running = False
 
+		# 共有キャッシュ設定（NAS + ローカル2層）
+		self.cache_nas_path = tk.StringVar(value="")  # NASキャッシュパス（空=NAS無効）
+		self.cache_enabled = tk.BooleanVar(value=True)  # キャッシュ有効/無効
+		self._shared_fem_cache = None       # FEM用SharedCacheManager
+		self._shared_overlap_cache = None   # Overlap/Heatmap用SharedCacheManager
+		self._init_shared_cache()
+
 		# Fittingパラメータ
 		# RANSACパラメータ
 		self.ransac_distance_threshold = tk.DoubleVar(value=1.0)  # 距離閾値 (mm)
@@ -405,6 +419,10 @@ class MainMenuGUI(_BaseWindow):
 		self.pp_merge_tab = ttk.Frame(self.utilities_notebook, padding=12)
 		self.utilities_notebook.add(self.pp_merge_tab, text="pp merge")
 
+		# Utilities > Cache Settings
+		self.cache_tab = ttk.Frame(self.utilities_notebook, padding=12)
+		self.utilities_notebook.add(self.cache_tab, text="Cache Settings")
+
 		# Simulatorタブのコンテンツを作成
 		self._create_simulator_tab()
 
@@ -445,6 +463,9 @@ class MainMenuGUI(_BaseWindow):
 		# pp mergeタブのコンテンツを作成
 		self._create_pp_merge_tab()
 
+		# Cache Settingsタブのコンテンツを作成
+		self._create_cache_tab()
+
 		# 初期状態のボタン活性制御
 		self.update_button_states()
 
@@ -463,6 +484,57 @@ class MainMenuGUI(_BaseWindow):
 		# ウィンドウが完全に表示された後にサイズを保存
 		self.after(100, self._save_initial_geometry)
 	# endregion 初期化とUI構築
+
+	# region 共有キャッシュ初期化
+	def _init_shared_cache(self) -> None:
+		"""SharedCacheManagerを初期化する。
+
+		NASパスが設定されていればNAS+ローカル2層、
+		未設定ならローカルのみのキャッシュを構築。
+		"""
+		try:
+			nas_path = self.cache_nas_path.get().strip() or None
+			base_dir = Path(__file__).parent
+
+			# FEM用キャッシュ
+			self._shared_fem_cache = SharedCacheManager(
+				local_dir=str(base_dir / ".fem_cache"),
+				nas_dir=nas_path + "/fem_cache" if nas_path else None,
+				namespace="fem",
+				max_local_gb=2.0,
+				max_nas_gb=10.0,
+			)
+
+			# Overlap/Heatmap用キャッシュ
+			self._shared_overlap_cache = SharedCacheManager(
+				local_dir=str(base_dir / ".overlap_cache"),
+				nas_dir=nas_path + "/overlap_cache" if nas_path else None,
+				namespace="overlap",
+				max_local_gb=2.0,
+				max_nas_gb=10.0,
+			)
+
+			if nas_path:
+				print(f"[SharedCache] NASパス設定: {nas_path}")
+				if self._shared_fem_cache.is_nas_available():
+					print("[SharedCache] NAS接続OK (FEM)")
+				else:
+					print("[SharedCache] NAS接続失敗 → ローカルフォールバック (FEM)")
+				if self._shared_overlap_cache.is_nas_available():
+					print("[SharedCache] NAS接続OK (Overlap)")
+				else:
+					print("[SharedCache] NAS接続失敗 → ローカルフォールバック (Overlap)")
+			else:
+				print("[SharedCache] NAS未設定 → ローカルキャッシュのみ")
+		except Exception as e:
+			print(f"[SharedCache] 初期化エラー: {e}")
+			self._shared_fem_cache = None
+			self._shared_overlap_cache = None
+
+	def _reinit_shared_cache(self) -> None:
+		"""NASパス変更時にキャッシュを再初期化する"""
+		self._init_shared_cache()
+	# endregion 共有キャッシュ初期化
 
 	# region UI構築メソッド
 	def _create_simulator_tab(self) -> None:
@@ -1573,7 +1645,7 @@ class MainMenuGUI(_BaseWindow):
 					penalty_stiffness=self.fem_penalty_stiffness.get(),
 					contact_tolerance=self.fem_contact_tolerance.get(),
 				)
-				solver = FEMContactSolver(material=material, contact=contact, verbose=True)
+				solver = FEMContactSolver(material=material, contact=contact, verbose=True, shared_cache=self._shared_fem_cache)
 				results = solver.analyze(
 					prox_cart, dist_cart,
 					boundary_mode=self.fem_boundary_mode.get(),
@@ -1754,7 +1826,7 @@ class MainMenuGUI(_BaseWindow):
 				penalty_stiffness=self.fem_penalty_stiffness.get(),
 				contact_tolerance=self.fem_contact_tolerance.get(),
 			)
-			solver = FEMContactSolver(material=material, contact=contact, verbose=True)
+			solver = FEMContactSolver(material=material, contact=contact, verbose=True, shared_cache=self._shared_fem_cache)
 
 			# 現在のメッシュ位置のコピーで解析
 			prox_cart_copy = prox_cartilage_mesh.copy()
@@ -2623,6 +2695,121 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			messagebox.showerror("エラー", f"PPファイルの統合に失敗しました:\n{e}")
 			traceback.print_exc()
+
+	# ================================================================
+	# Cache Settings タブ
+	# ================================================================
+
+	def _create_cache_tab(self) -> None:
+		"""Cache Settingsタブのコンテンツを作成"""
+		container = self.cache_tab
+		container.columnconfigure(0, weight=1)
+
+		# --- NASパス設定 ---
+		nas_frame = ttk.LabelFrame(container, text="NAS共有キャッシュ設定")
+		nas_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+		nas_frame.columnconfigure(1, weight=1)
+
+		ttk.Label(nas_frame, text="NASパス:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+		ttk.Entry(nas_frame, textvariable=self.cache_nas_path).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+		ttk.Button(nas_frame, text="参照...", command=self._choose_cache_nas_path).grid(row=0, column=2, padx=4, pady=4)
+
+		ttk.Label(nas_frame, text="例: Z:/FRS_cache  や  //NAS_NAME/share/FRS_cache",
+				  foreground="gray").grid(row=1, column=0, columnspan=3, sticky="w", padx=8)
+
+		ttk.Checkbutton(nas_frame, text="キャッシュ有効", variable=self.cache_enabled).grid(
+			row=2, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+
+		# --- 操作ボタン ---
+		btn_frame = ttk.Frame(container)
+		btn_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+
+		ttk.Button(btn_frame, text="NASパスを適用（再初期化）",
+				   command=self._on_cache_reinit).pack(side="left", padx=4)
+		ttk.Button(btn_frame, text="ローカル→NAS同期",
+				   command=self._on_cache_sync).pack(side="left", padx=4)
+		ttk.Button(btn_frame, text="統計情報を表示",
+				   command=self._on_cache_show_stats).pack(side="left", padx=4)
+
+		# --- 統計情報表示エリア ---
+		self._cache_stats_text = tk.Text(container, height=12, width=60, state="disabled",
+										 font=("Consolas", 9))
+		self._cache_stats_text.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+		container.rowconfigure(2, weight=1)
+
+		# --- 危険ゾーン ---
+		danger_frame = ttk.LabelFrame(container, text="キャッシュ削除")
+		danger_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+
+		ttk.Button(danger_frame, text="ローカルキャッシュを削除",
+				   command=self._on_cache_clear_local).pack(side="left", padx=4, pady=4)
+		ttk.Button(danger_frame, text="全キャッシュを削除（NAS含む）",
+				   command=self._on_cache_clear_all).pack(side="left", padx=4, pady=4)
+
+	def _choose_cache_nas_path(self) -> None:
+		d = filedialog.askdirectory(title="NASキャッシュディレクトリを選択")
+		if d:
+			self.cache_nas_path.set(d)
+
+	def _on_cache_reinit(self) -> None:
+		self._reinit_shared_cache()
+		self._on_cache_show_stats()
+		messagebox.showinfo("キャッシュ", "共有キャッシュを再初期化しました。")
+
+	def _on_cache_sync(self) -> None:
+		stats_fem = {'synced': 0, 'failed': 0, 'skipped': 0}
+		stats_overlap = {'synced': 0, 'failed': 0, 'skipped': 0}
+		if self._shared_fem_cache:
+			stats_fem = self._shared_fem_cache.sync()
+		if self._shared_overlap_cache:
+			stats_overlap = self._shared_overlap_cache.sync()
+		total_synced = stats_fem['synced'] + stats_overlap['synced']
+		total_failed = stats_fem['failed'] + stats_overlap['failed']
+		messagebox.showinfo("同期結果",
+			f"FEM: 同期={stats_fem['synced']}, 失敗={stats_fem['failed']}, スキップ={stats_fem['skipped']}\n"
+			f"Overlap: 同期={stats_overlap['synced']}, 失敗={stats_overlap['failed']}, スキップ={stats_overlap['skipped']}\n"
+			f"\n合計: 同期={total_synced}, 失敗={total_failed}")
+		self._on_cache_show_stats()
+
+	def _on_cache_show_stats(self) -> None:
+		lines = []
+		for name, cache in [("FEM", self._shared_fem_cache), ("Overlap", self._shared_overlap_cache)]:
+			if cache is None:
+				lines.append(f"[{name}] 未初期化")
+				continue
+			s = cache.stats()
+			lines.append(f"[{name}]")
+			lines.append(f"  ローカル: {s['local_count']}件 ({s['local_size_mb']:.1f} MB)")
+			lines.append(f"  NAS接続:  {'OK' if s['nas_available'] else 'なし'}")
+			if s['nas_available']:
+				lines.append(f"  NAS:      {s['nas_count']}件 ({s['nas_size_mb']:.1f} MB)")
+			lines.append(f"  同期待ち: {s['pending_sync']}件")
+			lines.append(f"  メモリ:   {s['memory_count']}件")
+			lines.append("")
+		self._cache_stats_text.config(state="normal")
+		self._cache_stats_text.delete("1.0", "end")
+		self._cache_stats_text.insert("1.0", "\n".join(lines))
+		self._cache_stats_text.config(state="disabled")
+
+	def _on_cache_clear_local(self) -> None:
+		if not messagebox.askyesno("確認", "ローカルキャッシュを削除しますか？"):
+			return
+		if self._shared_fem_cache:
+			self._shared_fem_cache.clear_local()
+		if self._shared_overlap_cache:
+			self._shared_overlap_cache.clear_local()
+		self._on_cache_show_stats()
+		messagebox.showinfo("完了", "ローカルキャッシュを削除しました。")
+
+	def _on_cache_clear_all(self) -> None:
+		if not messagebox.askyesno("確認", "全キャッシュ（NAS含む）を削除しますか？\nこの操作は取り消せません。"):
+			return
+		if self._shared_fem_cache:
+			self._shared_fem_cache.clear_all()
+		if self._shared_overlap_cache:
+			self._shared_overlap_cache.clear_all()
+		self._on_cache_show_stats()
+		messagebox.showinfo("完了", "全キャッシュを削除しました。")
 
 	def choose_randomizer_input(self) -> None:
 		path = filedialog.askopenfilename(
@@ -5444,60 +5631,73 @@ class MainMenuGUI(_BaseWindow):
 		close_btn.pack(pady=10)
 
 	def _get_cache_hash(self, prox_mesh, dist_mesh, transform_data, simplify_mesh=False):
-		"""キャッシュファイル用のハッシュを生成
-		
+		"""キャッシュファイル用のハッシュを生成（コンテンツベース）
+
+		ファイルパスではなくデータの中身に基づくため、異なるPC・OSで
+		同じデータなら同じハッシュが生成される。
+
 		Args:
-			prox_mesh: 近位メッシュ（整合性のため引数としては残すが、実際はパスを使用）
-			dist_mesh: 遠位メッシュ（同上）
+			prox_mesh: 近位メッシュ
+			dist_mesh: 遠位メッシュ
 			transform_data: 変換データ
 			simplify_mesh: メッシュ簡略化フラグ
-			
+
 		Returns:
 			str: ハッシュ文字列
 		"""
-		# メッシュと変換データから一意のハッシュを生成
-		hash_input = ["v5_robust_params"]  # バージョンを変更
-		
-		# ファイルパスを使用（ポイント配列より安定かつ確実）
-		hash_input.append(f"pm:{self.prox_model_path.get()}")
-		hash_input.append(f"dm:{self.dist_model_path.get()}")
-		hash_input.append(f"tg:{self.transform_group_path.get()}")
-		
-		# PPファイル（座標系・変換に影響）
-		hash_input.append(f"pp1:{self.prox_pp_abcd_path.get()}")
-		hash_input.append(f"pp2:{self.prox_pp_olmn_path.get()}")
-		hash_input.append(f"dp1:{self.dist_pp_abc_path.get()}")
-		hash_input.append(f"dp2:{self.dist_pp_olmn_path.get()}")
-		
+		hasher = hashlib.sha256()
+		hasher.update(b"v6_content_based")
+
+		# メッシュの頂点座標（ファイルパスではなく実データ）
+		hasher.update(np.round(np.array(prox_mesh.points), 2).tobytes())
+		hasher.update(np.round(np.array(dist_mesh.points), 2).tobytes())
+
+		# 変換データ（行列の中身）
+		hasher.update(str(len(transform_data)).encode())
+		for tf in transform_data:
+			m = tf['matrix']
+			hasher.update(np.round(np.array(m), 6).tobytes())
+
 		# パラメータ（抽出領域・ヒートマップに影響）
-		hash_input.append(f"pr:{self.prox_radius.get()}")
-		hash_input.append(f"dr:{self.dist_radius.get()}")
-		hash_input.append(f"po:{self.prox_offset_x.get()}/{self.prox_offset_y.get()}/{self.prox_offset_z.get()}")
-		hash_input.append(f"do:{self.dist_offset_x.get()}/{self.dist_offset_y.get()}/{self.dist_offset_z.get()}")
-		
-		# 変換データのフレーム数
-		hash_input.append(str(len(transform_data)))
-		
-		# ※ transform_dataの中身（numpy配列）を文字列化してハッシュに含めると、
-		#   浮動小数点の表示形式の違いなどでハッシュが不安定になる場合があるため、
-		#   ファイルパスとフレーム数で識別する形に変更。
-		
-		# メッシュ簡略化フラグを追加
-		hash_input.append(f"simplify:{simplify_mesh}")
-		
-		# ハッシュ生成
-		hash_str = '|'.join(hash_input)
-		return hashlib.md5(hash_str.encode()).hexdigest()
+		params = (
+			f"pr:{self.prox_radius.get()}|dr:{self.dist_radius.get()}|"
+			f"po:{self.prox_offset_x.get()}/{self.prox_offset_y.get()}/{self.prox_offset_z.get()}|"
+			f"do:{self.dist_offset_x.get()}/{self.dist_offset_y.get()}/{self.dist_offset_z.get()}|"
+			f"simplify:{simplify_mesh}"
+		)
+		hasher.update(params.encode('utf-8'))
+
+		return hasher.hexdigest()[:20]
 
 	def _get_cache_filepath(self, cache_hash):
-		"""キャッシュファイルのパスを取得
-		
+		"""キャッシュファイルのパスを取得（SharedCacheManager対応）
+
+		SharedCacheManagerが設定されている場合はNAS→ローカルの順に検索。
+		設定されていない場合は従来のローカルキャッシュ。
+
 		Args:
 			cache_hash: ハッシュ文字列
-			
+
 		Returns:
 			Path: キャッシュファイルのパス
 		"""
+		# SharedCacheManagerが設定されている場合
+		if hasattr(self, '_shared_overlap_cache') and self._shared_overlap_cache is not None:
+			scm = self._shared_overlap_cache
+			# NASにあるか確認
+			if scm.is_nas_available() and scm._nas_dir is not None:
+				nas_file = scm._nas_dir / f"overlap_{cache_hash}.pkl"
+				if nas_file.exists():
+					return nas_file
+			# ローカルにあるか確認
+			local_file = scm._local_dir / f"overlap_{cache_hash}.pkl"
+			if local_file.exists():
+				return local_file
+			# 新規保存用にローカルパスを返す
+			scm._local_dir.mkdir(parents=True, exist_ok=True)
+			return local_file
+
+		# 従来のローカルキャッシュ
 		cache_dir = Path(__file__).parent / ".overlap_cache"
 		cache_dir.mkdir(exist_ok=True)
 		return cache_dir / f"overlap_{cache_hash}.pkl"
@@ -5585,6 +5785,20 @@ class MainMenuGUI(_BaseWindow):
 			print(f"[キャッシュ] 保存完了: {cache_filepath}")
 			if heatmap_meshes is not None:
 				print(f"[キャッシュ] ヒートマップデータも保存: {len(heatmap_meshes)}フレーム")
+
+			# SharedCacheManagerが設定されている場合、NASにも同期
+			if hasattr(self, '_shared_overlap_cache') and self._shared_overlap_cache is not None:
+				scm = self._shared_overlap_cache
+				if scm.is_nas_available() and scm._nas_dir is not None:
+					try:
+						import shutil
+						nas_file = scm._nas_dir / cache_filepath.name
+						if not nas_file.exists():
+							scm._nas_dir.mkdir(parents=True, exist_ok=True)
+							shutil.copy2(str(cache_filepath), str(nas_file))
+							print(f"[キャッシュ] NASに同期完了: {nas_file}")
+					except Exception as e2:
+						print(f"[キャッシュ] NAS同期エラー（無視）: {e2}")
 		except Exception as e:
 			print(f"[キャッシュ] 保存失敗 (詳細): {e}")
 			import traceback
@@ -9727,7 +9941,7 @@ class MainMenuGUI(_BaseWindow):
 										dist_joint_transformed = self._apply_transform(dist_joint_region.copy(), matrix)
 										dist_fem_surface = dist_joint_transformed.extract_surface() if hasattr(dist_joint_transformed, 'extract_surface') else dist_joint_transformed
 										# FEM解析を実行
-										solver = FEMContactSolver(material=material, contact=contact, verbose=False)
+										solver = FEMContactSolver(material=material, contact=contact, verbose=False, shared_cache=self._shared_fem_cache)
 										results = solver.analyze(
 											prox_fem_surface.copy(), dist_fem_surface.copy(),
 											boundary_mode=self.fem_boundary_mode.get(),
@@ -11542,6 +11756,14 @@ class MainMenuGUI(_BaseWindow):
 		try: self.show_fem_analysis.set(bool(data.get("show_fem_analysis", False)))
 		except (ValueError, TypeError): self.show_fem_analysis.set(False)
 
+		# 共有キャッシュ設定の復元
+		self.cache_nas_path.set(str(data.get("cache_nas_path", "")))
+		try: self.cache_enabled.set(bool(data.get("cache_enabled", True)))
+		except (ValueError, TypeError): self.cache_enabled.set(True)
+		# NASパスが復元されたら共有キャッシュを再初期化
+		if self.cache_nas_path.get().strip():
+			self._reinit_shared_cache()
+
 	def _save_state(self) -> None:
 		data = {
 			"joint": self.joint_var.get(),
@@ -11630,6 +11852,9 @@ class MainMenuGUI(_BaseWindow):
 			"fem_show_dist_mesh": self.fem_show_dist_mesh.get(),
 			"fem_show_bone": self.fem_show_bone.get(),
 			"show_fem_analysis": self.show_fem_analysis.get(),
+			# 共有キャッシュ設定
+			"cache_nas_path": self.cache_nas_path.get(),
+			"cache_enabled": self.cache_enabled.get(),
 		}
 		try:
 			p = self._state_file_path()
