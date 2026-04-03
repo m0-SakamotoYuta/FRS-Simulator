@@ -157,6 +157,7 @@ class FEMCacheManager:
             if self._shared_cache is not None:
                 result = self._shared_cache.get(f"fem_{key}")
                 if result is not None and isinstance(result, FEMResults):
+                    print(f"[FEMキャッシュ] ヒット (key={key})")
                     return result
                 return None
 
@@ -233,7 +234,7 @@ class FEMContactSolver:
         material: Optional[MaterialProperties] = None,
         contact: Optional[ContactParameters] = None,
         verbose: bool = True,
-        cache_enabled: bool = False,
+        cache_enabled: bool = True,
         cache_dir: Optional[str] = None,
         shared_cache=None,
     ):

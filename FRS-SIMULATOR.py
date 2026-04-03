@@ -6203,7 +6203,7 @@ class MainMenuGUI(_BaseWindow):
 		use_cache_var = tk.BooleanVar(value=True)
 		use_bbox_var = tk.BooleanVar(value=True)
 		use_simplify_var = tk.BooleanVar(value=True)
-		enable_fem_precompute_var = tk.BooleanVar(value=False)  # FEM事前計算
+		enable_fem_precompute_var = tk.BooleanVar(value=True if (_HAS_FEM and has_cartilage) else False)  # FEM事前計算
 		
 		# タイトル
 		title_label = ttk.Label(
@@ -6382,6 +6382,9 @@ class MainMenuGUI(_BaseWindow):
 		x = (progress_window.winfo_screenwidth() // 2) - (progress_window.winfo_width() // 2)
 		y = (progress_window.winfo_screenheight() // 2) - (progress_window.winfo_height() // 2)
 		progress_window.geometry(f"+{x}+{y}")
+
+		# 自動スタート（ポップアップ表示後すぐに計算開始）
+		progress_window.after(200, start_computation)
 		
 		options_dict = {
 			'use_parallel': use_parallel_var,
@@ -9911,7 +9914,7 @@ class MainMenuGUI(_BaseWindow):
 								print(f"[キャッシュ] 新規計算したヒートマップをキャッシュに保存します...")
 								self._save_overlap_cache(cache_filepath, overlap_precomputed, overlap_areas_precomputed, overlap_depths_precomputed, heatmap_precomputed)
 							
-							messagebox.showinfo("完了", f"事前計算が完了しました。\n{len(overlap_precomputed)}フレーム分のオーバーラップと\n{len(heatmap_precomputed)}フレーム分のヒートマップを生成しました。")
+							print(f"[事前計算] 完了: {len(overlap_precomputed)}フレーム分のオーバーラップ, {len(heatmap_precomputed)}フレーム分のヒートマップ")
 
 					# --- FEM接触解析の事前計算（関節領域で実行） ---
 					fem_pressure_precomputed = []  # List of (pressure_array, results_summary_dict) per frame
