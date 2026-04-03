@@ -1834,11 +1834,28 @@ class MainMenuGUI(_BaseWindow):
 			prox_cart_copy = prox_cartilage_mesh.copy()
 			dist_cart_copy = dist_cartilage_mesh.copy()
 
+			# キャッシュ存在確認 → 状態ウィンドウ表示
+			boundary_mode = self.fem_boundary_mode.get()
+			max_nodes = self.fem_max_nodes.get()
+			from_cache = solver.has_cache(prox_cart_copy, dist_cart_copy, boundary_mode, max_nodes)
+			status_win = tk.Toplevel(self)
+			status_win.title("FEM解析")
+			status_win.resizable(False, False)
+			status_win.transient(self)
+			msg = "キャッシュからFEM結果を読み込んでいます..." if from_cache else "FEM接触解析を実行中..."
+			ttk.Label(status_win, text=msg, padding=20).pack()
+			status_win.update_idletasks()
+			x = self.winfo_rootx() + (self.winfo_width() - status_win.winfo_width()) // 2
+			y = self.winfo_rooty() + (self.winfo_height() - status_win.winfo_height()) // 2
+			status_win.geometry(f"+{x}+{y}")
+			status_win.update()
+
 			results = solver.analyze(
 				prox_cart_copy, dist_cart_copy,
-				boundary_mode=self.fem_boundary_mode.get(),
-				max_nodes=self.fem_max_nodes.get(),
+				boundary_mode=boundary_mode,
+				max_nodes=max_nodes,
 			)
+			status_win.destroy()
 
 			# 結果を可視化
 			scalar_name = self.fem_scalar_name.get()
@@ -1890,6 +1907,10 @@ class MainMenuGUI(_BaseWindow):
 			plotter.show()
 
 		except Exception as e:
+			try:
+				status_win.destroy()
+			except Exception:
+				pass
 			messagebox.showerror("FEM解析エラー", f"解析中にエラーが発生しました:\n{e}")
 			import traceback
 			traceback.print_exc()
