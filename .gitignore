@@ -3,3 +3,9 @@
 .fem_cache/
 __pycache__/
 .claude/
+
+# PC固有・OS固有ファイル（各PCで自動生成されるため同期対象外）
+frs2015_gui_state.json
+.DS_Store
+.vscode/
+*.test_cache/
