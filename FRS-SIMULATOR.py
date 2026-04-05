@@ -5672,20 +5672,11 @@ class MainMenuGUI(_BaseWindow):
 		# SharedCacheManagerが設定されている場合
 		if hasattr(self, '_shared_overlap_cache') and self._shared_overlap_cache is not None:
 			scm = self._shared_overlap_cache
-			# NASにあるか確認
 			if scm.is_nas_available() and scm._nas_dir is not None:
 				nas_file = scm._nas_dir / f"overlap_{cache_hash}.pkl"
-				if nas_file.exists():
-					return nas_file
-			# ローカルにあるか確認
-			local_file = scm._local_dir / f"overlap_{cache_hash}.pkl"
-			if local_file.exists():
-				return local_file
-			# 新規保存用にローカルパスを返す
-			scm._local_dir.mkdir(parents=True, exist_ok=True)
-			return local_file
+				return nas_file  # 存在有無にかかわらずNASパスを返す
 
-		# 従来のローカルキャッシュ
+		# NAS未設定時はローカルキャッシュ
 		cache_dir = Path(__file__).parent / ".overlap_cache"
 		cache_dir.mkdir(exist_ok=True)
 		return cache_dir / f"overlap_{cache_hash}.pkl"
@@ -9667,7 +9658,9 @@ class MainMenuGUI(_BaseWindow):
 			overlap_areas_precomputed = []  # 面積リストを追加
 			overlap_depths_precomputed = []  # 深度リストを追加
 			heatmap_precomputed = []  # 距離ヒートマップリストを追加
-			
+			fem_pressure_precomputed = []  # FEM接触圧リスト
+			prox_fem_surface = None  # FEM近位表面メッシュ
+
 			if skip_var.get():
 				# 事前計算をスキップ
 				try:
