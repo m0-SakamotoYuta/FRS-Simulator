@@ -2806,17 +2806,90 @@ class MainMenuGUI(_BaseWindow):
 		"""キャッシュ一覧を更新する"""
 		tree = self._cache_list_tree
 		tree.delete(*tree.get_children())
+
+		# NASベースパス配下の全サブフォルダをスキャン（フォルダ名の変遷に対応）
+		nas_base = self.cache_nas_path.get().strip()
 		all_meta = []
-		for cache in [self._shared_fem_cache, self._shared_overlap_cache]:
-			if cache:
-				all_meta.extend(cache.get_all_metadata())
+
+		if nas_base:
+			from pathlib import Path
+			base = Path(nas_base)
+			print(f"[CacheList] NASベースパス: {base}")
+			# 候補フォルダを全て試す（ドットあり・なし両方）
+			candidate_dirs = [
+				(base / "fem_cache",     "fem"),
+				(base / ".fem_cache",    "fem"),
+				(base / "overlap_cache", "overlap"),
+				(base / ".overlap_cache","overlap"),
+			]
+			visited_keys = set()
+			for scan_dir, cache_type in candidate_dirs:
+				if not scan_dir.exists():
+					print(f"[CacheList]   スキップ（存在しない）: {scan_dir}")
+					continue
+				print(f"[CacheList]   スキャン中: {scan_dir}")
+				# メタデータJSONを読み込み
+				import json as _json
+				for meta_file in scan_dir.glob("_meta_*.json"):
+					try:
+						with open(meta_file, 'r', encoding='utf-8') as f:
+							meta = _json.load(f)
+						mk = meta_file.stem[6:]
+						if mk in visited_keys:
+							continue
+						meta['_meta_key'] = mk
+						meta['_scan_dir'] = str(scan_dir)
+						all_meta.append(meta)
+						visited_keys.add(mk)
+					except Exception:
+						pass
+				# メタデータのないPKLファイルをスキャン
+				for pkl_file in scan_dir.glob("*.pkl"):
+					if pkl_file.name.startswith('_'):
+						continue
+					stem = pkl_file.stem
+					if stem.startswith('fem_'):
+						key = stem[4:]
+					elif stem.startswith('overlap_'):
+						key = stem[8:]
+					else:
+						key = stem
+					if key in visited_keys:
+						continue
+					try:
+						stat = pkl_file.stat()
+						mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+						size_mb = round(stat.st_size / (1024**2), 1)
+						all_meta.append({
+							'type': cache_type,
+							'xlsx': '（情報なし）',
+							'prox_stl': '（情報なし）',
+							'dist_stl': '（情報なし）',
+							'frames': '-',
+							'date': mtime.strftime('%Y-%m-%d %H:%M'),
+							'size_mb': size_mb,
+							'_meta_key': key,
+							'_no_meta': True,
+							'_scan_dir': str(scan_dir),
+						})
+						visited_keys.add(key)
+					except Exception:
+						pass
+			print(f"[CacheList] 合計 {len(all_meta)} 件")
+		else:
+			print("[CacheList] NASパス未設定")
+
 		# 日時でソート（新しい順）
 		all_meta.sort(key=lambda m: m.get('date', ''), reverse=True)
 		for meta in all_meta:
-			type_label = "FEM" if meta.get('type') == 'fem' else "Overlap"
-			frames_str = str(meta.get('frames_cached', meta.get('frames', '-')))
-			if meta.get('type') == 'fem':
-				frames_str = f"{meta.get('frames_cached', '?')}/{meta.get('frames', '?')}"
+			cache_type = meta.get('type', 'unknown')
+			type_label = {"fem": "FEM", "overlap": "Overlap"}.get(cache_type, cache_type)
+			if meta.get('_no_meta'):
+				type_label += "※"  # メタデータなし（旧キャッシュ）
+			if cache_type == 'fem':
+				frames_str = f"{meta.get('frames_cached','?')}/{meta.get('frames','?')}"
+			else:
+				frames_str = str(meta.get('frames', '-'))
 			tree.insert("", "end",
 				values=(
 					type_label,
@@ -2826,7 +2899,7 @@ class MainMenuGUI(_BaseWindow):
 					frames_str,
 					meta.get('date', ''),
 				),
-				tags=(meta.get('type', ''), meta.get('_meta_key', ''))
+				tags=(cache_type, meta.get('_meta_key', ''))
 			)
 		if not all_meta:
 			tree.insert("", "end", values=("", "キャッシュなし（NAS未接続またはデータなし）", "", "", "", ""))

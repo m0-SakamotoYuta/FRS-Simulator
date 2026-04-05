@@ -15,6 +15,7 @@
 import pickle
 import hashlib
 import json
+import datetime
 import numpy as np
 from pathlib import Path
 from typing import Optional, Any, Dict, List
@@ -199,24 +200,68 @@ class SharedCacheManager:
             self._log(f"メタデータ保存エラー: {e}")
 
     def get_all_metadata(self) -> List[dict]:
-        """NAS上の全メタデータを取得（更新日時の新しい順）。"""
+        """NAS上の全メタデータを取得（更新日時の新しい順）。
+        メタデータJSONがないPKLファイルもファイル情報のみで一覧に含める。
+        """
         if not self.is_nas_available():
             return []
         result = []
+        meta_keys_found = set()
         try:
-            for meta_file in sorted(
-                self._nas_dir.glob("_meta_*.json"),
-                key=lambda f: f.stat().st_mtime, reverse=True
-            ):
+            # 1. メタデータJSONを読み込み
+            for meta_file in self._nas_dir.glob("_meta_*.json"):
                 try:
                     with open(meta_file, 'r', encoding='utf-8') as f:
                         meta = json.load(f)
-                    meta['_meta_key'] = meta_file.stem[6:]  # "_meta_" を除去
+                    meta_key = meta_file.stem[6:]  # "_meta_" を除去
+                    meta['_meta_key'] = meta_key
                     result.append(meta)
+                    meta_keys_found.add(meta_key)
                 except Exception:
                     pass
+
+            # 2. メタデータのないPKLファイルをファイル情報のみで追加
+            for pkl_file in self._nas_dir.glob("*.pkl"):
+                if pkl_file.name.startswith('_'):
+                    continue  # 内部ファイルはスキップ
+                # ファイル名からキーとタイプを推定
+                stem = pkl_file.stem  # 例: "fem_abc123" or "overlap_abc123"
+                if stem.startswith('fem_'):
+                    key = stem[4:]
+                    type_str = 'fem'
+                elif stem.startswith('overlap_'):
+                    key = stem[8:]
+                    type_str = 'overlap'
+                else:
+                    key = stem
+                    type_str = 'unknown'
+
+                if key in meta_keys_found:
+                    continue  # メタデータあり → スキップ
+
+                try:
+                    stat = pkl_file.stat()
+                    mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+                    size_mb = round(stat.st_size / (1024**2), 1)
+                    result.append({
+                        'type': type_str,
+                        'xlsx': '（情報なし）',
+                        'prox_stl': '（情報なし）',
+                        'dist_stl': '（情報なし）',
+                        'frames': '-',
+                        'date': mtime.strftime('%Y-%m-%d %H:%M'),
+                        'size_mb': size_mb,
+                        '_meta_key': key,
+                        '_no_meta': True,  # メタデータなしフラグ
+                    })
+                except Exception:
+                    pass
+
         except Exception:
             pass
+
+        # 日時でソート（新しい順）
+        result.sort(key=lambda m: m.get('date', ''), reverse=True)
         return result
 
     def delete_dataset(self, meta_key: str) -> None:
