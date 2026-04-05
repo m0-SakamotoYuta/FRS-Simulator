@@ -1834,11 +1834,28 @@ class MainMenuGUI(_BaseWindow):
 			prox_cart_copy = prox_cartilage_mesh.copy()
 			dist_cart_copy = dist_cartilage_mesh.copy()
 
+			# キャッシュ存在確認 → 状態ウィンドウ表示
+			boundary_mode = self.fem_boundary_mode.get()
+			max_nodes = self.fem_max_nodes.get()
+			from_cache = solver.has_cache(prox_cart_copy, dist_cart_copy, boundary_mode, max_nodes)
+			status_win = tk.Toplevel(self)
+			status_win.title("FEM解析")
+			status_win.resizable(False, False)
+			status_win.transient(self)
+			msg = "キャッシュからFEM結果を読み込んでいます..." if from_cache else "FEM接触解析を実行中..."
+			ttk.Label(status_win, text=msg, padding=20).pack()
+			status_win.update_idletasks()
+			x = self.winfo_rootx() + (self.winfo_width() - status_win.winfo_width()) // 2
+			y = self.winfo_rooty() + (self.winfo_height() - status_win.winfo_height()) // 2
+			status_win.geometry(f"+{x}+{y}")
+			status_win.update()
+
 			results = solver.analyze(
 				prox_cart_copy, dist_cart_copy,
-				boundary_mode=self.fem_boundary_mode.get(),
-				max_nodes=self.fem_max_nodes.get(),
+				boundary_mode=boundary_mode,
+				max_nodes=max_nodes,
 			)
+			status_win.destroy()
 
 			# 結果を可視化
 			scalar_name = self.fem_scalar_name.get()
@@ -1890,6 +1907,10 @@ class MainMenuGUI(_BaseWindow):
 			plotter.show()
 
 		except Exception as e:
+			try:
+				status_win.destroy()
+			except Exception:
+				pass
 			messagebox.showerror("FEM解析エラー", f"解析中にエラーが発生しました:\n{e}")
 			import traceback
 			traceback.print_exc()
@@ -6203,7 +6224,7 @@ class MainMenuGUI(_BaseWindow):
 		use_cache_var = tk.BooleanVar(value=True)
 		use_bbox_var = tk.BooleanVar(value=True)
 		use_simplify_var = tk.BooleanVar(value=True)
-		enable_fem_precompute_var = tk.BooleanVar(value=False)  # FEM事前計算
+		enable_fem_precompute_var = tk.BooleanVar(value=True if (_HAS_FEM and has_cartilage) else False)  # FEM事前計算
 		
 		# タイトル
 		title_label = ttk.Label(
@@ -6382,6 +6403,9 @@ class MainMenuGUI(_BaseWindow):
 		x = (progress_window.winfo_screenwidth() // 2) - (progress_window.winfo_width() // 2)
 		y = (progress_window.winfo_screenheight() // 2) - (progress_window.winfo_height() // 2)
 		progress_window.geometry(f"+{x}+{y}")
+
+		# 自動スタート（ポップアップ表示後すぐに計算開始）
+		progress_window.after(200, start_computation)
 		
 		options_dict = {
 			'use_parallel': use_parallel_var,
@@ -9911,7 +9935,7 @@ class MainMenuGUI(_BaseWindow):
 								print(f"[キャッシュ] 新規計算したヒートマップをキャッシュに保存します...")
 								self._save_overlap_cache(cache_filepath, overlap_precomputed, overlap_areas_precomputed, overlap_depths_precomputed, heatmap_precomputed)
 							
-							messagebox.showinfo("完了", f"事前計算が完了しました。\n{len(overlap_precomputed)}フレーム分のオーバーラップと\n{len(heatmap_precomputed)}フレーム分のヒートマップを生成しました。")
+							print(f"[事前計算] 完了: {len(overlap_precomputed)}フレーム分のオーバーラップ, {len(heatmap_precomputed)}フレーム分のヒートマップ")
 
 					# --- FEM接触解析の事前計算（関節領域で実行） ---
 					fem_pressure_precomputed = []  # List of (pressure_array, results_summary_dict) per frame

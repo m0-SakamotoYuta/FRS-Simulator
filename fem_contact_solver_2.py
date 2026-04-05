@@ -157,6 +157,7 @@ class FEMCacheManager:
             if self._shared_cache is not None:
                 result = self._shared_cache.get(f"fem_{key}")
                 if result is not None and isinstance(result, FEMResults):
+                    print(f"[FEMキャッシュ] ヒット (key={key})")
                     return result
                 return None
 
@@ -176,6 +177,32 @@ class FEMCacheManager:
         except Exception as e:
             print(f"[キャッシュ] 取得エラー（無視）: {e}")
         return None
+
+    def has_cache(self, prox_points, dist_points, material, contact,
+                 boundary_mode, max_nodes) -> bool:
+        """キャッシュが存在するか確認（取得はしない）"""
+        if not self.enabled:
+            return False
+        try:
+            key = self._compute_hash(prox_points, dist_points, material, contact,
+                                      boundary_mode, max_nodes)
+            if key is None:
+                return False
+            if self._shared_cache is not None:
+                if key in self._shared_cache._memory:
+                    return True
+                if self._shared_cache.is_nas_available():
+                    nas_file = self._shared_cache._nas_dir / f"fem_{key}.pkl"
+                    if nas_file.exists():
+                        return True
+                local_file = self._shared_cache._local_dir / f"fem_{key}.pkl"
+                return local_file.exists()
+            if key in self._memory_cache:
+                return True
+            cache_file = os.path.join(self.cache_dir, f"fem_{key}.pkl")
+            return os.path.exists(cache_file)
+        except Exception:
+            return False
 
     def put(self, prox_points, dist_points, material, contact,
             boundary_mode, max_nodes, results):
@@ -233,7 +260,7 @@ class FEMContactSolver:
         material: Optional[MaterialProperties] = None,
         contact: Optional[ContactParameters] = None,
         verbose: bool = True,
-        cache_enabled: bool = False,
+        cache_enabled: bool = True,
         cache_dir: Optional[str] = None,
         shared_cache=None,
     ):
@@ -259,8 +286,20 @@ class FEMContactSolver:
         self._n_dof: int = 0
 
     # ================================================================
-    # 公開メソッド: analyze (v1完全互換API)
+    # 公開メソッド: has_cache / analyze (v1完全互換API)
     # ================================================================
+
+    def has_cache(self, prox_mesh, dist_mesh,
+                  boundary_mode: str = "auto",
+                  max_nodes: int = 50000) -> bool:
+        """解析前にキャッシュが存在するか確認する"""
+        try:
+            prox_pts = np.array(prox_mesh.points, dtype=np.float64)
+            dist_pts = np.array(dist_mesh.points, dtype=np.float64)
+            return self._cache.has_cache(prox_pts, dist_pts, self.material,
+                                         self.contact, boundary_mode, max_nodes)
+        except Exception:
+            return False
 
     def analyze(self, prox_mesh, dist_mesh,
                 boundary_mode: str = "auto",
