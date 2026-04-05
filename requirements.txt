@@ -1,15 +1,16 @@
-# FRS Simulator 2.1 - 依存パッケージ一覧
-# Usage:
-#   pip install -r requirements.txt
+# FRS Simulator - 依存パッケージ一覧
+# Usage: pip install -r requirements.txt
 
 # --- 3Dビジュアライゼーション ---
 numpy>=1.21
 pyvista>=0.38
 open3d>=0.17
+vtk>=9.0
 
 # --- データ処理 ---
 scipy>=1.9
 openpyxl>=3.0
+pandas>=1.5
 
 # --- FEMレポート生成 ---
 python-docx>=0.8.11
