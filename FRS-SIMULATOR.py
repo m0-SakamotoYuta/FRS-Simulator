@@ -83,6 +83,7 @@ import open3d as o3d # type: ignore
 import traceback
 import threading
 import time
+import datetime
 from multiprocessing import Pool, cpu_count
 import os
 import pickle
@@ -2754,9 +2755,39 @@ class MainMenuGUI(_BaseWindow):
 		self._cache_stats_text.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
 		container.rowconfigure(2, weight=1)
 
+		# --- キャッシュ一覧 ---
+		list_frame = ttk.LabelFrame(container, text="計算済みデータ一覧")
+		list_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+		container.rowconfigure(3, weight=1)
+
+		list_btn_frame = ttk.Frame(list_frame)
+		list_btn_frame.pack(fill=tk.X, padx=4, pady=4)
+		ttk.Button(list_btn_frame, text="一覧を更新",
+				   command=self._on_cache_list_refresh).pack(side="left", padx=4)
+		ttk.Button(list_btn_frame, text="選択行を削除",
+				   command=self._on_cache_list_delete_selected).pack(side="left", padx=4)
+
+		cols = ("type", "xlsx", "prox_stl", "dist_stl", "frames", "date")
+		col_labels = {"type": "種類", "xlsx": "運動データ(xlsx)", "prox_stl": "近位STL",
+					  "dist_stl": "遠位STL", "frames": "フレーム数", "date": "計算日時"}
+		self._cache_list_tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=8)
+		for c in cols:
+			self._cache_list_tree.heading(c, text=col_labels[c])
+		self._cache_list_tree.column("type",     width=70,  anchor="center")
+		self._cache_list_tree.column("xlsx",     width=220, anchor="w")
+		self._cache_list_tree.column("prox_stl", width=140, anchor="w")
+		self._cache_list_tree.column("dist_stl", width=140, anchor="w")
+		self._cache_list_tree.column("frames",   width=80,  anchor="center")
+		self._cache_list_tree.column("date",     width=130, anchor="center")
+
+		sb = ttk.Scrollbar(list_frame, orient="vertical", command=self._cache_list_tree.yview)
+		self._cache_list_tree.configure(yscrollcommand=sb.set)
+		self._cache_list_tree.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+		sb.pack(side="left", fill="y", pady=4)
+
 		# --- 危険ゾーン ---
 		danger_frame = ttk.LabelFrame(container, text="キャッシュ削除")
-		danger_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+		danger_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
 
 		ttk.Button(danger_frame, text="NASキャッシュを全削除",
 				   command=self._on_cache_clear_all).pack(side="left", padx=4, pady=4)
@@ -2770,6 +2801,54 @@ class MainMenuGUI(_BaseWindow):
 		self._reinit_shared_cache()
 		self._on_cache_show_stats()
 		messagebox.showinfo("キャッシュ", "共有キャッシュを再初期化しました。")
+
+	def _on_cache_list_refresh(self) -> None:
+		"""キャッシュ一覧を更新する"""
+		tree = self._cache_list_tree
+		tree.delete(*tree.get_children())
+		all_meta = []
+		for cache in [self._shared_fem_cache, self._shared_overlap_cache]:
+			if cache:
+				all_meta.extend(cache.get_all_metadata())
+		# 日時でソート（新しい順）
+		all_meta.sort(key=lambda m: m.get('date', ''), reverse=True)
+		for meta in all_meta:
+			type_label = "FEM" if meta.get('type') == 'fem' else "Overlap"
+			frames_str = str(meta.get('frames_cached', meta.get('frames', '-')))
+			if meta.get('type') == 'fem':
+				frames_str = f"{meta.get('frames_cached', '?')}/{meta.get('frames', '?')}"
+			tree.insert("", "end",
+				values=(
+					type_label,
+					meta.get('xlsx', ''),
+					meta.get('prox_stl', ''),
+					meta.get('dist_stl', ''),
+					frames_str,
+					meta.get('date', ''),
+				),
+				tags=(meta.get('type', ''), meta.get('_meta_key', ''))
+			)
+		if not all_meta:
+			tree.insert("", "end", values=("", "キャッシュなし（NAS未接続またはデータなし）", "", "", "", ""))
+
+	def _on_cache_list_delete_selected(self) -> None:
+		"""選択行のキャッシュを削除する"""
+		tree = self._cache_list_tree
+		selected = tree.selection()
+		if not selected:
+			messagebox.showwarning("選択なし", "削除する行を選択してください。")
+			return
+		if not messagebox.askyesno("確認", f"{len(selected)}件のキャッシュを削除しますか？"):
+			return
+		for item in selected:
+			tags = tree.item(item, "tags")
+			if len(tags) >= 2:
+				cache_type, meta_key = tags[0], tags[1]
+				cache = self._shared_fem_cache if cache_type == 'fem' else self._shared_overlap_cache
+				if cache and meta_key:
+					cache.delete_dataset(meta_key)
+		self._on_cache_list_refresh()
+		messagebox.showinfo("完了", "選択したキャッシュを削除しました。")
 
 	def _on_cache_show_stats(self) -> None:
 		lines = []
@@ -5765,7 +5844,7 @@ class MainMenuGUI(_BaseWindow):
 			if heatmap_meshes is not None:
 				print(f"[キャッシュ] ヒートマップデータも保存: {len(heatmap_meshes)}フレーム")
 
-			# SharedCacheManagerが設定されている場合、NASにも同期
+			# SharedCacheManagerが設定されている場合、NASにも同期＋メタデータ保存
 			if hasattr(self, '_shared_overlap_cache') and self._shared_overlap_cache is not None:
 				scm = self._shared_overlap_cache
 				if scm.is_nas_available() and scm._nas_dir is not None:
@@ -5778,6 +5857,22 @@ class MainMenuGUI(_BaseWindow):
 							print(f"[キャッシュ] NASに同期完了: {nas_file}")
 					except Exception as e2:
 						print(f"[キャッシュ] NAS同期エラー（無視）: {e2}")
+					# メタデータ保存
+					try:
+						cache_hash = cache_filepath.stem.replace('overlap_', '')
+						size_mb = round(cache_filepath.stat().st_size / (1024**2), 1) if cache_filepath.exists() else 0
+						meta = {
+							'type': 'overlap',
+							'xlsx': os.path.basename(self.transform_group_path.get()),
+							'prox_stl': os.path.basename(self.prox_model_path.get()),
+							'dist_stl': os.path.basename(self.dist_model_path.get()),
+							'frames': len(overlap_meshes),
+							'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
+							'size_mb': size_mb,
+						}
+						scm.save_metadata(cache_hash, meta)
+					except Exception as e3:
+						print(f"[キャッシュ] メタデータ保存エラー（無視）: {e3}")
 		except Exception as e:
 			print(f"[キャッシュ] 保存失敗 (詳細): {e}")
 			import traceback
@@ -9956,6 +10051,25 @@ class MainMenuGUI(_BaseWindow):
 										update_progress(i + 1, len(transform_data), f"FEM解析: フレーム {i+1}/{len(transform_data)}")
 								n_success = sum(1 for x in fem_pressure_precomputed if x is not None)
 								print(f"[FEM事前計算] 完了: {n_success}/{len(transform_data)}フレーム成功")
+								# FEMメタデータ保存
+								if self._shared_fem_cache and n_success > 0:
+									try:
+										xlsx_name = os.path.basename(self.transform_group_path.get())
+										prox_name = os.path.basename(self.prox_model_path.get())
+										dist_name = os.path.basename(self.dist_model_path.get())
+										meta_key = compute_content_hash(xlsx_name, prox_name, dist_name)
+										meta = {
+											'type': 'fem',
+											'xlsx': xlsx_name,
+											'prox_stl': prox_name,
+											'dist_stl': dist_name,
+											'frames': len(transform_data),
+											'frames_cached': n_success,
+											'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
+										}
+										self._shared_fem_cache.save_metadata(meta_key, meta)
+									except Exception as _e:
+										print(f"[FEM] メタデータ保存エラー（無視）: {_e}")
 							except Exception as e:
 								print(f"[FEM事前計算] 初期化エラー: {e}")
 								traceback.print_exc()

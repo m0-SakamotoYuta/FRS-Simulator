@@ -14,6 +14,7 @@
 
 import pickle
 import hashlib
+import json
 import numpy as np
 from pathlib import Path
 from typing import Optional, Any, Dict, List
@@ -181,6 +182,68 @@ class SharedCacheManager:
             import shutil
             shutil.rmtree(str(self._nas_dir), ignore_errors=True)
             self._log("NASキャッシュを削除しました")
+
+    # ================================================================
+    # メタデータ管理（キャッシュ一覧表示用）
+    # ================================================================
+
+    def save_metadata(self, meta_key: str, metadata: dict) -> None:
+        """キャッシュエントリのメタデータをNASに保存する。"""
+        if not self.is_nas_available():
+            return
+        try:
+            meta_file = self._nas_dir / f"_meta_{meta_key}.json"
+            with open(meta_file, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log(f"メタデータ保存エラー: {e}")
+
+    def get_all_metadata(self) -> List[dict]:
+        """NAS上の全メタデータを取得（更新日時の新しい順）。"""
+        if not self.is_nas_available():
+            return []
+        result = []
+        try:
+            for meta_file in sorted(
+                self._nas_dir.glob("_meta_*.json"),
+                key=lambda f: f.stat().st_mtime, reverse=True
+            ):
+                try:
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        meta = json.load(f)
+                    meta['_meta_key'] = meta_file.stem[6:]  # "_meta_" を除去
+                    result.append(meta)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return result
+
+    def delete_dataset(self, meta_key: str) -> None:
+        """メタデータとそれに紐づくPKLファイルを削除する。"""
+        if not self.is_nas_available():
+            return
+        try:
+            # メタデータ読み込み（frame_keysがあればPKLも削除）
+            meta_file = self._nas_dir / f"_meta_{meta_key}.json"
+            if meta_file.exists():
+                with open(meta_file, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                meta_file.unlink()
+                # FEM: frame_keysリストのPKL削除
+                for key in meta.get('frame_keys', []):
+                    pkl = self._nas_dir / f"{key}.pkl"
+                    if pkl.exists():
+                        pkl.unlink()
+                    self._memory.pop(key, None)
+                # Overlap: meta_keyと同名のPKL削除
+                if meta.get('type') == 'overlap':
+                    pkl = self._nas_dir / f"{meta_key}.pkl"
+                    if pkl.exists():
+                        pkl.unlink()
+                    self._memory.pop(meta_key, None)
+        except Exception as e:
+            self._log(f"データセット削除エラー: {e}")
 
     def set_nas_dir(self, nas_dir: Optional[str]) -> None:
         """NASディレクトリを変更する"""
