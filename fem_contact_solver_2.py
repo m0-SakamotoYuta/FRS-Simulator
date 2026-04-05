@@ -193,10 +193,8 @@ class FEMCacheManager:
                     return True
                 if self._shared_cache.is_nas_available():
                     nas_file = self._shared_cache._nas_dir / f"fem_{key}.pkl"
-                    if nas_file.exists():
-                        return True
-                local_file = self._shared_cache._local_dir / f"fem_{key}.pkl"
-                return local_file.exists()
+                    return nas_file.exists()
+                return False
             if key in self._memory_cache:
                 return True
             cache_file = os.path.join(self.cache_dir, f"fem_{key}.pkl")

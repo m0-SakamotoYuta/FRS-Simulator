@@ -500,19 +500,15 @@ class MainMenuGUI(_BaseWindow):
 
 			# FEM用キャッシュ
 			self._shared_fem_cache = SharedCacheManager(
-				local_dir=str(base_dir / ".fem_cache"),
-				nas_dir=nas_path + "/.fem_cache" if nas_path else None,
+				nas_dir=nas_path + "/fem_cache" if nas_path else None,
 				namespace="fem",
-				max_local_gb=2.0,
 				max_nas_gb=10.0,
 			)
 
 			# Overlap/Heatmap用キャッシュ
 			self._shared_overlap_cache = SharedCacheManager(
-				local_dir=str(base_dir / ".overlap_cache"),
-				nas_dir=nas_path + "/.overlap_cache" if nas_path else None,
+				nas_dir=nas_path + "/overlap_cache" if nas_path else None,
 				namespace="overlap",
-				max_local_gb=2.0,
 				max_nas_gb=10.0,
 			)
 
@@ -2749,8 +2745,6 @@ class MainMenuGUI(_BaseWindow):
 
 		ttk.Button(btn_frame, text="NASパスを適用（再初期化）",
 				   command=self._on_cache_reinit).pack(side="left", padx=4)
-		ttk.Button(btn_frame, text="ローカル→NAS同期",
-				   command=self._on_cache_sync).pack(side="left", padx=4)
 		ttk.Button(btn_frame, text="統計情報を表示",
 				   command=self._on_cache_show_stats).pack(side="left", padx=4)
 
@@ -2764,9 +2758,7 @@ class MainMenuGUI(_BaseWindow):
 		danger_frame = ttk.LabelFrame(container, text="キャッシュ削除")
 		danger_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
 
-		ttk.Button(danger_frame, text="ローカルキャッシュを削除",
-				   command=self._on_cache_clear_local).pack(side="left", padx=4, pady=4)
-		ttk.Button(danger_frame, text="全キャッシュを削除（NAS含む）",
+		ttk.Button(danger_frame, text="NASキャッシュを全削除",
 				   command=self._on_cache_clear_all).pack(side="left", padx=4, pady=4)
 
 	def _choose_cache_nas_path(self) -> None:
@@ -2779,21 +2771,6 @@ class MainMenuGUI(_BaseWindow):
 		self._on_cache_show_stats()
 		messagebox.showinfo("キャッシュ", "共有キャッシュを再初期化しました。")
 
-	def _on_cache_sync(self) -> None:
-		stats_fem = {'synced': 0, 'failed': 0, 'skipped': 0}
-		stats_overlap = {'synced': 0, 'failed': 0, 'skipped': 0}
-		if self._shared_fem_cache:
-			stats_fem = self._shared_fem_cache.sync()
-		if self._shared_overlap_cache:
-			stats_overlap = self._shared_overlap_cache.sync()
-		total_synced = stats_fem['synced'] + stats_overlap['synced']
-		total_failed = stats_fem['failed'] + stats_overlap['failed']
-		messagebox.showinfo("同期結果",
-			f"FEM: 同期={stats_fem['synced']}, 失敗={stats_fem['failed']}, スキップ={stats_fem['skipped']}\n"
-			f"Overlap: 同期={stats_overlap['synced']}, 失敗={stats_overlap['failed']}, スキップ={stats_overlap['skipped']}\n"
-			f"\n合計: 同期={total_synced}, 失敗={total_failed}")
-		self._on_cache_show_stats()
-
 	def _on_cache_show_stats(self) -> None:
 		lines = []
 		for name, cache in [("FEM", self._shared_fem_cache), ("Overlap", self._shared_overlap_cache)]:
@@ -2802,37 +2779,25 @@ class MainMenuGUI(_BaseWindow):
 				continue
 			s = cache.stats()
 			lines.append(f"[{name}]")
-			lines.append(f"  ローカル: {s['local_count']}件 ({s['local_size_mb']:.1f} MB)")
 			lines.append(f"  NAS接続:  {'OK' if s['nas_available'] else 'なし'}")
 			if s['nas_available']:
 				lines.append(f"  NAS:      {s['nas_count']}件 ({s['nas_size_mb']:.1f} MB)")
-			lines.append(f"  同期待ち: {s['pending_sync']}件")
-			lines.append(f"  メモリ:   {s['memory_count']}件")
+			lines.append(f"  メモリ:   {s['memory_count']}件（セッション内）")
 			lines.append("")
 		self._cache_stats_text.config(state="normal")
 		self._cache_stats_text.delete("1.0", "end")
 		self._cache_stats_text.insert("1.0", "\n".join(lines))
 		self._cache_stats_text.config(state="disabled")
 
-	def _on_cache_clear_local(self) -> None:
-		if not messagebox.askyesno("確認", "ローカルキャッシュを削除しますか？"):
-			return
-		if self._shared_fem_cache:
-			self._shared_fem_cache.clear_local()
-		if self._shared_overlap_cache:
-			self._shared_overlap_cache.clear_local()
-		self._on_cache_show_stats()
-		messagebox.showinfo("完了", "ローカルキャッシュを削除しました。")
-
 	def _on_cache_clear_all(self) -> None:
-		if not messagebox.askyesno("確認", "全キャッシュ（NAS含む）を削除しますか？\nこの操作は取り消せません。"):
+		if not messagebox.askyesno("確認", "NASキャッシュを全削除しますか？\nこの操作は取り消せません。"):
 			return
 		if self._shared_fem_cache:
 			self._shared_fem_cache.clear_all()
 		if self._shared_overlap_cache:
 			self._shared_overlap_cache.clear_all()
 		self._on_cache_show_stats()
-		messagebox.showinfo("完了", "全キャッシュを削除しました。")
+		messagebox.showinfo("完了", "NASキャッシュを削除しました。")
 
 	def choose_randomizer_input(self) -> None:
 		path = filedialog.askopenfilename(
