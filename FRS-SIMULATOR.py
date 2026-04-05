@@ -366,19 +366,23 @@ class MainMenuGUI(_BaseWindow):
 		self.simulator_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.simulator_tab, text="Simulator")
 
-		# タブ2: Fitting
+		# タブ2: Cache Settings
+		self.cache_tab = ttk.Frame(self.notebook, padding=12)
+		self.notebook.add(self.cache_tab, text="Cache Settings")
+
+		# タブ3: Fitting
 		self.fitting_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.fitting_tab, text="Fitting")
 
-		# タブ3: 軟骨分離 (Cartilage Separation)
+		# タブ4: 軟骨分離 (Cartilage Separation)
 		self.cartilage_sep_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.cartilage_sep_tab, text="軟骨分離")
 
-		# タブ4: FEM解析
+		# タブ5: FEM解析
 		self.fem_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.fem_tab, text="FEM解析")
 
-		# タブ5: Utilities (サブタブを含むコンテナ)
+		# タブ6: Utilities (サブタブを含むコンテナ)
 		self.utilities_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.utilities_tab, text="Utilities")
 		
@@ -422,9 +426,6 @@ class MainMenuGUI(_BaseWindow):
 		self.pp_merge_tab = ttk.Frame(self.utilities_notebook, padding=12)
 		self.utilities_notebook.add(self.pp_merge_tab, text="pp merge")
 
-		# Utilities > Cache Settings
-		self.cache_tab = ttk.Frame(self.utilities_notebook, padding=12)
-		self.utilities_notebook.add(self.cache_tab, text="Cache Settings")
 
 		# Simulatorタブのコンテンツを作成
 		self._create_simulator_tab()
