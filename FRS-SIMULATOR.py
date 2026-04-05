@@ -10000,7 +10000,6 @@ class MainMenuGUI(_BaseWindow):
 								print(f"[FEM事前計算] 完了: {n_success}/{len(transform_data)}フレーム成功")
 							except Exception as e:
 								print(f"[FEM事前計算] 初期化エラー: {e}")
-								import traceback
 								traceback.print_exc()
 								fem_pressure_precomputed = []
 						else:
@@ -11210,7 +11209,6 @@ class MainMenuGUI(_BaseWindow):
 				except Exception as e:
 					# エラー内容を詳細に表示
 					print(f"[致命的エラー] フレーム{frame_idx}でshow_frame()がクラッシュ: {e}")
-					import traceback
 					traceback.print_exc()
 					if not force_render:
 						is_animation_active[0] = False
