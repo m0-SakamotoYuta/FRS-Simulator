@@ -539,7 +539,36 @@ class MainMenuGUI(_BaseWindow):
 	# region UI構築メソッド
 	def _create_simulator_tab(self) -> None:
 		"""Simulatorタブのコンテンツを作成"""
-		container = self.simulator_tab
+		# スクロール可能なメインフレーム
+		canvas = tk.Canvas(self.simulator_tab, highlightthickness=0)
+		scrollbar = ttk.Scrollbar(self.simulator_tab, orient="vertical", command=canvas.yview)
+		scrollable_frame = ttk.Frame(canvas)
+
+		scrollable_frame.bind(
+			"<Configure>",
+			lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+		)
+
+		canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+		canvas.configure(yscrollcommand=scrollbar.set)
+
+		canvas.pack(side="left", fill="both", expand=True)
+		scrollbar.pack(side="right", fill="y")
+
+		# マウスホイールでスクロール（Mac/Windows両対応）
+		def _on_mousewheel(event):
+			if hasattr(event, 'delta') and event.delta:
+				canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+			elif hasattr(event, 'num'):
+				if event.num == 4:
+					canvas.yview_scroll(-1, "units")
+				elif event.num == 5:
+					canvas.yview_scroll(1, "units")
+		canvas.bind_all("<MouseWheel>", _on_mousewheel)
+		canvas.bind_all("<Button-4>", _on_mousewheel)
+		canvas.bind_all("<Button-5>", _on_mousewheel)
+
+		container = scrollable_frame
 		container.columnconfigure(0, weight=1)
 
 		# Section: 使用する関節
@@ -10636,7 +10665,8 @@ class MainMenuGUI(_BaseWindow):
 			control_window = tk.Toplevel(self)
 			control_window.title("再生コントロール")
 			control_window.geometry("850x360")
-			control_window.resizable(False, False)
+			control_window.resizable(True, True)  # リサイズ可能（Mac対応）
+			control_window.minsize(400, 200)       # 最小サイズを設定
 			control_window.attributes('-topmost', True)  # 常に最前面に表示
 			
 			# 情報表示フレーム
@@ -10712,11 +10742,10 @@ class MainMenuGUI(_BaseWindow):
 				from_=0,
 				to=len(transform_data)-1,
 				orient=tk.HORIZONTAL,
-				length=810,
 				label="Frame Position",
 				command=lambda val: on_playback_scale_change(int(val))
 			)
-			playback_scale.pack(pady=5, padx=10)
+			playback_scale.pack(pady=5, padx=10, fill=tk.X)
 			
 			# マウスイベントをバインド
 			playback_scale.bind("<ButtonPress-1>", on_scale_button_press)
@@ -10739,12 +10768,11 @@ class MainMenuGUI(_BaseWindow):
 				to=10.0,
 				resolution=0.25,
 				orient=tk.HORIZONTAL,
-				length=810,
 				label="Playback Speed (0.25x - 10x)",
 				command=on_speed_change
 			)
 			speed_scale.set(1.0)  # 初期値: 等倍速
-			speed_scale.pack(pady=5, padx=10)
+			speed_scale.pack(pady=5, padx=10, fill=tk.X)
 			
 			# 一時停止/再生ボタン
 			button_frame = ttk.Frame(control_window)
@@ -11684,7 +11712,14 @@ class MainMenuGUI(_BaseWindow):
 
 	# ----- Persistence -----
 	def _state_file_path(self) -> Path:
-		return Path(__file__).with_name("frs2015_gui_state.json")
+		import platform
+		if platform.system() == "Darwin":
+			# macOS: ホームディレクトリ配下の隠しフォルダに保存（スクリプトディレクトリが書き込み不可の場合に対応）
+			state_dir = Path.home() / ".frs_simulator"
+			state_dir.mkdir(parents=True, exist_ok=True)
+			return state_dir / "frs2015_gui_state.json"
+		else:
+			return Path(__file__).with_name("frs2015_gui_state.json")
 
 	def _load_state(self) -> None:
 		try:
@@ -12027,9 +12062,9 @@ class MainMenuGUI(_BaseWindow):
 			p = self._state_file_path()
 			with p.open("w", encoding="utf-8") as f:
 				json.dump(data, f, ensure_ascii=False, indent=2)
-		except Exception:
-			# 保存失敗は致命的でないため無視
-			pass
+			print(f"[状態保存] {p}")
+		except Exception as e:
+			print(f"[状態保存] 失敗: {e}")
 
 	def _on_close(self) -> None:
 		self._save_state()
