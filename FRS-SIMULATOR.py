@@ -30,17 +30,6 @@ VERSION = "2.4"  # ここでバージョンを変更してください
 #       3.10 ボタン状態管理                           (行 6753-6845)
 #       3.11 状態保存・復元                           (行 6846-7045)
 #       3.12 座標系・幾何処理                         (行 7045-7440)
-#       3.13 並列処理ヘルパー                         (行 7441-7850)
-#       3.14 その他ユーティリティ                     (行 7851-7950)
-#   4. main()エントリーポイント                       (行 7952-7960)
-#
-# ■ 重要メソッド一覧（改修頻度が高い箇所）
-#   - on_animate():               シミュレーションのメインループ（行 5279）
-#   - on_fitting_execute():       RANSAC/ICPフィッティング（行 3043）
-#   - on_visualize_all():         関節全体の可視化（行 1382）
-#   - _compute_distance_heatmap(): ヒートマップ計算（行 7070）
-#   - _load_transform_matrices():  Excelデータ読み込み（行 2121）
-#   - _build_coordinate_system():  座標系構築（近位）（行 7249）
 #
 # ■ VSCode region/endregion マーカー
 #   このファイルはVSCodeのregion/endregion機能に対応しています。
@@ -4101,8 +4090,55 @@ class MainMenuGUI(_BaseWindow):
 						model2_transformed.save(save_path2)
 						print(f"座標系一致済みモデル2を保存: {Path(save_path2).name}")
 			
+			# --- カラー統合モデルの保存 ---
+			want_combined = messagebox.askyesno(
+				"カラー統合モデル保存",
+				"骨モデルと軟骨モデルを色分けした状態で\n"
+				"1つの3Dモデル（PLY形式）として保存しますか？\n\n"
+				f"  骨モデル : {self.cs_bone_color}  ({model2_transformed.n_cells}面)\n"
+				f"  軟骨モデル: {self.cs_cartilage_color}  ({cartilage_mesh.n_cells}面)\n\n"
+				"MeshLabやBlenderで色付きのまま開けます。")
+			if want_combined:
+				def _hex_to_rgb(hex_color):
+					h = hex_color.lstrip('#')
+					return [int(h[i:i+2], 16) for i in (0, 2, 4)]
+
+				bone_rgb = _hex_to_rgb(self.cs_bone_color)
+				cart_rgb = _hex_to_rgb(self.cs_cartilage_color)
+
+				m2_colored = model2_transformed.copy()
+				cart_colored = cartilage_mesh.copy()
+
+				m2_colored.point_data['RGB'] = np.full(
+					(m2_colored.n_points, 3), bone_rgb, dtype=np.uint8)
+				cart_colored.point_data['RGB'] = np.full(
+					(cart_colored.n_points, 3), cart_rgb, dtype=np.uint8)
+
+				combined = m2_colored.merge(cart_colored)
+
+				original_path = Path(self.cs_prox_model1_whole_path.get())
+				default_name = original_path.stem + "_カラー統合.ply"
+				save_path_combined = filedialog.asksaveasfilename(
+					title="カラー統合モデルを保存（骨＋軟骨・色分け済み）",
+					defaultextension=".ply",
+					initialdir=str(original_path.parent),
+					initialfile=default_name,
+					filetypes=[
+						("PLY files（色情報あり）", "*.ply"),
+						("All files", "*.*")
+					]
+				)
+				if save_path_combined:
+					combined.save(save_path_combined)
+					print(f"カラー統合モデルを保存: {save_path_combined}")
+					messagebox.showinfo(
+						"保存完了",
+						f"カラー統合モデルを保存しました。\n\n"
+						f"保存先:\n{save_path_combined}\n\n"
+						f"MeshLab / Blender などで色付きのまま開けます。")
+
 			print("\n=== 軟骨分離処理完了 ===")
-		
+
 		except Exception as e:
 			messagebox.showerror("エラー", f"軟骨分離中にエラーが発生しました:\n{str(e)}")
 			print(f"エラー詳細: {e}")
