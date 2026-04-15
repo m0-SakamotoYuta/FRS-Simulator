@@ -16,6 +16,7 @@ import pickle
 import hashlib
 import json
 import datetime
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional, Any, Dict, List
@@ -99,20 +100,32 @@ class SharedCacheManager:
     # ================================================================
 
     def is_nas_available(self) -> bool:
-        """NASが設定されていてアクセス可能かどうか"""
+        """NASが設定されていてアクセス可能かどうか（最大5秒でタイムアウト）"""
         if self._nas_dir is None:
             return False
-        try:
-            if self._nas_dir.exists():
-                test_file = self._nas_dir / ".write_test"
-                test_file.write_text("ok")
-                test_file.unlink()
-                return True
-            else:
-                self._nas_dir.mkdir(parents=True, exist_ok=True)
-                return True
-        except (OSError, PermissionError):
+
+        result = [False]
+
+        def _check():
+            try:
+                if self._nas_dir.exists():
+                    test_file = self._nas_dir / ".write_test"
+                    test_file.write_text("ok")
+                    test_file.unlink()
+                    result[0] = True
+                else:
+                    self._nas_dir.mkdir(parents=True, exist_ok=True)
+                    result[0] = True
+            except (OSError, PermissionError):
+                result[0] = False
+
+        t = threading.Thread(target=_check, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        if t.is_alive():
+            self._log("NAS接続チェック タイムアウト（5秒）")
             return False
+        return result[0]
 
     # ================================================================
     # 取得（メモリ → NAS の順に検索）
@@ -161,15 +174,16 @@ class SharedCacheManager:
 
     def stats(self) -> Dict[str, Any]:
         """キャッシュの統計情報を返す"""
+        nas_ok = self.is_nas_available()
         nas_files = []
         nas_size = 0
-        if self.is_nas_available():
+        if nas_ok:
             nas_files = list(self._nas_dir.glob("*.pkl"))
             nas_size = sum(f.stat().st_size for f in nas_files)
 
         return {
             'namespace': self.namespace,
-            'nas_available': self.is_nas_available(),
+            'nas_available': nas_ok,
             'nas_count': len(nas_files),
             'nas_size_mb': nas_size / (1024**2),
             'memory_count': len(self._memory),

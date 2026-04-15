@@ -516,14 +516,21 @@ class MainMenuGUI(_BaseWindow):
 
 			if nas_path:
 				print(f"[SharedCache] NASパス設定: {nas_path}")
-				if self._shared_fem_cache.is_nas_available():
-					print("[SharedCache] NAS接続OK (FEM)")
-				else:
-					print("[SharedCache] NAS接続失敗 → ローカルフォールバック (FEM)")
-				if self._shared_overlap_cache.is_nas_available():
-					print("[SharedCache] NAS接続OK (Overlap)")
-				else:
-					print("[SharedCache] NAS接続失敗 → ローカルフォールバック (Overlap)")
+				# NAS接続チェック（ログ目的のみ）をバックグラウンドで実行（UIをブロックしない）
+				fem_cache_ref = self._shared_fem_cache
+				overlap_cache_ref = self._shared_overlap_cache
+
+				def _check_nas_log():
+					if fem_cache_ref.is_nas_available():
+						print("[SharedCache] NAS接続OK (FEM)")
+					else:
+						print("[SharedCache] NAS接続失敗 → ローカルフォールバック (FEM)")
+					if overlap_cache_ref.is_nas_available():
+						print("[SharedCache] NAS接続OK (Overlap)")
+					else:
+						print("[SharedCache] NAS接続失敗 → ローカルフォールバック (Overlap)")
+
+				threading.Thread(target=_check_nas_log, daemon=True).start()
 			else:
 				print("[SharedCache] NAS未設定 → ローカルキャッシュのみ")
 		except Exception as e:
