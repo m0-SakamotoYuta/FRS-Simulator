@@ -4110,18 +4110,50 @@ class MainMenuGUI(_BaseWindow):
 					h = hex_color.lstrip('#')
 					return [int(h[i:i+2], 16) for i in (0, 2, 4)]
 
+				def _write_colored_ply(save_path, meshes_with_colors):
+					"""
+					頂点カラー付きPLY（バイナリ）を直接書き出す。
+					PyVistaのsave()はRGB属性を無視するためカスタム実装。
+					meshes_with_colors: [(pv_mesh, [r,g,b]), ...]
+					"""
+					import struct
+					all_verts  = []
+					all_colors = []
+					all_faces  = []
+					vert_offset = 0
+					for mesh, color in meshes_with_colors:
+						tri = mesh.triangulate()
+						pts = tri.points.astype(np.float32)
+						all_verts.append(pts)
+						all_colors.append(np.full((len(pts), 3), color, dtype=np.uint8))
+						all_faces.append(tri.faces.reshape(-1, 4)[:, 1:].astype(np.int32) + vert_offset)
+						vert_offset += len(pts)
+					verts  = np.concatenate(all_verts,  axis=0)
+					colors = np.concatenate(all_colors, axis=0)
+					faces  = np.concatenate(all_faces,  axis=0)
+					header = (
+						"ply\n"
+						"format binary_little_endian 1.0\n"
+						f"element vertex {len(verts)}\n"
+						"property float x\n"
+						"property float y\n"
+						"property float z\n"
+						"property uchar red\n"
+						"property uchar green\n"
+						"property uchar blue\n"
+						f"element face {len(faces)}\n"
+						"property list uchar int vertex_indices\n"
+						"end_header\n"
+					).encode('ascii')
+					with open(save_path, 'wb') as fp:
+						fp.write(header)
+						for (x, y, z), (r, g, b) in zip(verts, colors):
+							fp.write(struct.pack('<fffBBB', x, y, z, r, g, b))
+						for (v0, v1, v2) in faces:
+							fp.write(struct.pack('<Biii', 3, v0, v1, v2))
+
 				bone_rgb = _hex_to_rgb(self.cs_bone_color)
 				cart_rgb = _hex_to_rgb(self.cs_cartilage_color)
-
-				m2_colored = model2_transformed.copy()
-				cart_colored = cartilage_mesh.copy()
-
-				m2_colored.point_data['RGB'] = np.full(
-					(m2_colored.n_points, 3), bone_rgb, dtype=np.uint8)
-				cart_colored.point_data['RGB'] = np.full(
-					(cart_colored.n_points, 3), cart_rgb, dtype=np.uint8)
-
-				combined = m2_colored.merge(cart_colored)
 
 				original_path = Path(self.cs_prox_model1_whole_path.get())
 				default_name = original_path.stem + "_カラー統合.ply"
@@ -4136,13 +4168,19 @@ class MainMenuGUI(_BaseWindow):
 					]
 				)
 				if save_path_combined:
-					combined.save(save_path_combined)
+					_write_colored_ply(
+						save_path_combined,
+						[
+							(model2_transformed, bone_rgb),
+							(cartilage_mesh,     cart_rgb),
+						]
+					)
 					print(f"カラー統合モデルを保存: {save_path_combined}")
 					messagebox.showinfo(
 						"保存完了",
 						f"カラー統合モデルを保存しました。\n\n"
 						f"保存先:\n{save_path_combined}\n\n"
-						f"MeshLab / Blender などで色付きのまま開けます。")
+						f"MeshLab / Blender / Windows 3Dビューアで色付きのまま開けます。")
 
 			print("\n=== 軟骨分離処理完了 ===")
 
