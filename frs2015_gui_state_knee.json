@@ -82,10 +82,10 @@
   "show_fem_analysis": false,
   "cache_nas_path": "//10.1.90.221/Common_2021/研究/関節班/2. 関節力学試験ロボットシステム(FRS-2015)/7. ファイル共有/5_cash/FRS_cashe",
   "cache_enabled": true,
-  "viz_show_prox_model": false,
-  "viz_show_prox_pp": true,
-  "viz_show_prox_axes": true,
-  "viz_show_dist_model": false,
-  "viz_show_dist_pp": true,
+  "viz_show_prox_model": true,
+  "viz_show_prox_pp": false,
+  "viz_show_prox_axes": false,
+  "viz_show_dist_model": true,
+  "viz_show_dist_pp": false,
   "viz_show_dist_axes": false
 }

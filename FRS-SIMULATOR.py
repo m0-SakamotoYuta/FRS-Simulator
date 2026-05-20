@@ -5120,9 +5120,8 @@ class MainMenuGUI(_BaseWindow):
 		dist_z_axis_initial = dist_z_axis.copy() if dist_z_axis is not None else None
 		
 		# 遠位座標系の軸ラインを保持（動的更新用）
-		# 近位軸 (50mm) と区別しやすいよう 100mm まで延長し、色も区別する。
-		# 中立位では prox 軸の50mm外側まで突き出すので、骨に埋まらず視認できる。
-		DIST_AXIS_LENGTH = 100.0
+		# 近位軸に合わせて長さと色を統一
+		DIST_AXIS_LENGTH = 50.0
 		dist_x_line = None
 		dist_y_line = None
 		dist_z_line = None
@@ -5132,10 +5131,10 @@ class MainMenuGUI(_BaseWindow):
 			dist_z_line = pv.Line(dist_origin, dist_origin + dist_z_axis * DIST_AXIS_LENGTH)
 
 			# 遠位座標系の軸をプロッターに追加（スライダーで動的に更新される）
-			# 色は近位と区別するため明るい色 (orange/lime/cyan) を使う
-			dx_actor = all_plotter.add_mesh(dist_x_line, color='darkorange', line_width=5, label='Dist X')
-			dy_actor = all_plotter.add_mesh(dist_y_line, color='lime',       line_width=5, label='Dist Y')
-			dz_actor = all_plotter.add_mesh(dist_z_line, color='cyan',       line_width=5, label='Dist Z')
+			# 近位と同じ配色・太さに統一
+			dx_actor = all_plotter.add_mesh(dist_x_line, color='red',   line_width=3, label='Dist X')
+			dy_actor = all_plotter.add_mesh(dist_y_line, color='green', line_width=3, label='Dist Y')
+			dz_actor = all_plotter.add_mesh(dist_z_line, color='blue',  line_width=3, label='Dist Z')
 			
 			# トグル制御用にアクターをリストに追加
 			dist_axis_actors.append(dx_actor)
@@ -5155,41 +5154,40 @@ class MainMenuGUI(_BaseWindow):
 				except Exception as e:
 					print(f"[viz toggle] SetVisibility failed: {e}")
 
-		def _deferred_toggle(actors_func, var, state):
-			"""actor リスト関数と状態保持varを受け取り、Tk のアイドル時に安全に適用。"""
-			def _do():
-				try:
-					_safe_set_visibility(actors_func(), state)
-				except Exception as e:
-					print(f"[viz toggle deferred SetVisibility] {e}")
-				try:
-					var.set(bool(state))
-				except Exception as e:
-					print(f"[viz toggle deferred var.set] {e}")
+		# VTKコールバックからTk操作を避けるため、可視化変更はキューに積んで
+		# Tkのrender_loop内でまとめて適用する。
+		pending_visibility = {
+			"prox_model": None,
+			"prox_pp": None,
+			"prox_axes": None,
+			"dist_model": None,
+			"dist_pp": None,
+			"dist_axes": None,
+		}
+
+		def _queue_visibility(key, state):
 			try:
-				self.after(0, _do)
+				pending_visibility[key] = bool(state)
 			except Exception as e:
-				print(f"[viz toggle schedule] {e}")
+				print(f"[viz toggle queue] {key}: {e}")
 
 		def toggle_prox_model(state):
-			_deferred_toggle(lambda: [prox_mesh_actor], self.viz_show_prox_model, state)
+			_queue_visibility("prox_model", state)
 
 		def toggle_prox_points(state):
-			_deferred_toggle(lambda: [prox_points_actor] + list(prox_label_actors),
-			                 self.viz_show_prox_pp, state)
+			_queue_visibility("prox_pp", state)
 
 		def toggle_dist_model(state):
-			_deferred_toggle(lambda: [dist_mesh_actor], self.viz_show_dist_model, state)
+			_queue_visibility("dist_model", state)
 
 		def toggle_dist_points(state):
-			_deferred_toggle(lambda: [dist_points_actor] + list(dist_label_actors),
-			                 self.viz_show_dist_pp, state)
+			_queue_visibility("dist_pp", state)
 
 		def toggle_prox_axes(state):
-			_deferred_toggle(lambda: prox_axis_actors, self.viz_show_prox_axes, state)
+			_queue_visibility("prox_axes", state)
 
 		def toggle_dist_axes(state):
-			_deferred_toggle(lambda: dist_axis_actors, self.viz_show_dist_axes, state)
+			_queue_visibility("dist_axes", state)
 
 		# 起動時の保存済み表示状態の反映は show() 完了後に遅延適用する。
 		# （init 中の SetVisibility が VTK 内部の初期化と競合してクラッシュする
@@ -5389,7 +5387,7 @@ class MainMenuGUI(_BaseWindow):
 				transformed_y_axis = rotation_matrix @ dist_y_axis_initial
 				transformed_z_axis = rotation_matrix @ dist_z_axis_initial
 				
-				axis_length = 100.0  # 遠位は近位(50mm)より長く突き出させて視認性確保
+				axis_length = 50.0  # 近位と同じ長さに統一
 				# X軸の更新
 				dist_x_line.points = np.array([transformed_origin, transformed_origin + transformed_x_axis * axis_length])
 				# Y軸の更新
@@ -6484,6 +6482,42 @@ class MainMenuGUI(_BaseWindow):
 
 		# レンダループ: PyVista の VTK イベントを Tk の after で駆動
 		render_after_id = [None]
+		def _apply_pending_visibility():
+			"""チェックボックスからの可視化変更を安全に適用。"""
+			try:
+				if pending_visibility["prox_model"] is not None:
+					state = pending_visibility["prox_model"]
+					_safe_set_visibility([prox_mesh_actor], state)
+					self.viz_show_prox_model.set(state)
+					pending_visibility["prox_model"] = None
+				if pending_visibility["prox_pp"] is not None:
+					state = pending_visibility["prox_pp"]
+					_safe_set_visibility([prox_points_actor] + list(prox_label_actors), state)
+					self.viz_show_prox_pp.set(state)
+					pending_visibility["prox_pp"] = None
+				if pending_visibility["prox_axes"] is not None:
+					state = pending_visibility["prox_axes"]
+					_safe_set_visibility(prox_axis_actors, state)
+					self.viz_show_prox_axes.set(state)
+					pending_visibility["prox_axes"] = None
+				if pending_visibility["dist_model"] is not None:
+					state = pending_visibility["dist_model"]
+					_safe_set_visibility([dist_mesh_actor], state)
+					self.viz_show_dist_model.set(state)
+					pending_visibility["dist_model"] = None
+				if pending_visibility["dist_pp"] is not None:
+					state = pending_visibility["dist_pp"]
+					_safe_set_visibility([dist_points_actor] + list(dist_label_actors), state)
+					self.viz_show_dist_pp.set(state)
+					pending_visibility["dist_pp"] = None
+				if pending_visibility["dist_axes"] is not None:
+					state = pending_visibility["dist_axes"]
+					_safe_set_visibility(dist_axis_actors, state)
+					self.viz_show_dist_axes.set(state)
+					pending_visibility["dist_axes"] = None
+			except Exception as e:
+				print(f"[viz toggle apply] {e}")
+
 		def render_loop():
 			if not plotter_alive[0]:
 				stop_all_autoplay()
@@ -6494,6 +6528,7 @@ class MainMenuGUI(_BaseWindow):
 					pass
 				return
 			try:
+				_apply_pending_visibility()
 				all_plotter.update()
 			except Exception:
 				plotter_alive[0] = False

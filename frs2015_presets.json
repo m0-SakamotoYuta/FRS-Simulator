@@ -21,6 +21,17 @@
         "AP": -17.252599291596795,
         "PD": -14.97395410214061
       }
+    },
+    {
+      "name": "26英論用_AP試験",
+      "params": {
+        "FE": -17.57812003294768,
+        "VV": 0.0,
+        "IE": 0.0,
+        "ML": 0.0,
+        "AP": -12.369788171333546,
+        "PD": -14.97395410214061
+      }
     }
   ],
   "sequences": [],
@@ -39,7 +50,7 @@
       ],
       "thickness": 1.5,
       "color": "#ff8000",
-      "visible": false
+      "visible": true
     },
     {
       "name": "PCL",
@@ -55,7 +66,7 @@
       ],
       "thickness": 1.5,
       "color": "#FF8800",
-      "visible": false
+      "visible": true
     },
     {
       "name": "LCL",
@@ -71,7 +82,7 @@
       ],
       "thickness": 1.5,
       "color": "#FF8800",
-      "visible": false
+      "visible": true
     },
     {
       "name": "MCL",
@@ -87,7 +98,7 @@
       ],
       "thickness": 1.5,
       "color": "#FF8800",
-      "visible": false
+      "visible": true
     }
   ]
 }
