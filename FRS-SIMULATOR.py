@@ -337,18 +337,9 @@ class MainMenuGUI(_BaseWindow):
 		# 直前の関節種別を記録（関節切替時の差分判定用）
 		self._prev_joint = self.joint_var.get()
 
-		# 可視化チェックボックスの状態を即時永続化（再起動後の引き継ぎ確実化）
-		def _autosave_viz_state(*_args):
-			try:
-				self._save_state()
-			except Exception as e:
-				print(f"[viz auto-save] 失敗: {e}")
-		for _v in (self.viz_show_prox_model, self.viz_show_prox_pp, self.viz_show_prox_axes,
-				   self.viz_show_dist_model, self.viz_show_dist_pp, self.viz_show_dist_axes):
-			try:
-				_v.trace_add("write", _autosave_viz_state)
-			except Exception:
-				pass
+		# 可視化チェックボックスの状態は、可視化ウィンドウを閉じる時に _save_state で
+		# 永続化する（trace_add で即時保存すると VTK のcallback 内で再入が起きて
+		# PyVista ウィンドウが落ちることがあるため）。
 		# NASパスを含む状態復元後にキャッシュを初期化
 		self._init_shared_cache()
 
@@ -5129,19 +5120,22 @@ class MainMenuGUI(_BaseWindow):
 		dist_z_axis_initial = dist_z_axis.copy() if dist_z_axis is not None else None
 		
 		# 遠位座標系の軸ラインを保持（動的更新用）
+		# 近位軸 (50mm) と区別しやすいよう 100mm まで延長し、色も区別する。
+		# 中立位では prox 軸の50mm外側まで突き出すので、骨に埋まらず視認できる。
+		DIST_AXIS_LENGTH = 100.0
 		dist_x_line = None
 		dist_y_line = None
 		dist_z_line = None
 		if dist_origin is not None and dist_x_axis is not None and dist_y_axis is not None and dist_z_axis is not None:
-			axis_length = 50.0
-			dist_x_line = pv.Line(dist_origin, dist_origin + dist_x_axis * axis_length)
-			dist_y_line = pv.Line(dist_origin, dist_origin + dist_y_axis * axis_length)
-			dist_z_line = pv.Line(dist_origin, dist_origin + dist_z_axis * axis_length)
-			
+			dist_x_line = pv.Line(dist_origin, dist_origin + dist_x_axis * DIST_AXIS_LENGTH)
+			dist_y_line = pv.Line(dist_origin, dist_origin + dist_y_axis * DIST_AXIS_LENGTH)
+			dist_z_line = pv.Line(dist_origin, dist_origin + dist_z_axis * DIST_AXIS_LENGTH)
+
 			# 遠位座標系の軸をプロッターに追加（スライダーで動的に更新される）
-			dx_actor = all_plotter.add_mesh(dist_x_line, color='red', line_width=3, label='Dist X')
-			dy_actor = all_plotter.add_mesh(dist_y_line, color='green', line_width=3, label='Dist Y')
-			dz_actor = all_plotter.add_mesh(dist_z_line, color='blue', line_width=3, label='Dist Z')
+			# 色は近位と区別するため明るい色 (orange/lime/cyan) を使う
+			dx_actor = all_plotter.add_mesh(dist_x_line, color='darkorange', line_width=5, label='Dist X')
+			dy_actor = all_plotter.add_mesh(dist_y_line, color='lime',       line_width=5, label='Dist Y')
+			dz_actor = all_plotter.add_mesh(dist_z_line, color='cyan',       line_width=5, label='Dist Z')
 			
 			# トグル制御用にアクターをリストに追加
 			dist_axis_actors.append(dx_actor)
@@ -5149,49 +5143,74 @@ class MainMenuGUI(_BaseWindow):
 			dist_axis_actors.append(dz_actor)
 		
 		# チェックボックスUI（BooleanVar に保存して再起動後も復元）
+		# 重要: VTKコールバック内で SetVisibility を直接呼ぶと、VTK内部の状態と
+		# 競合して Python が segfault することがある（try/except では捕えられない）。
+		# self.after(0, ...) で Tk のメインループに退避してから実行する。
+		def _safe_set_visibility(actors, state):
+			for a in actors:
+				if a is None:
+					continue
+				try:
+					a.SetVisibility(bool(state))
+				except Exception as e:
+					print(f"[viz toggle] SetVisibility failed: {e}")
+
+		def _deferred_toggle(actors_func, var, state):
+			"""actor リスト関数と状態保持varを受け取り、Tk のアイドル時に安全に適用。"""
+			def _do():
+				try:
+					_safe_set_visibility(actors_func(), state)
+				except Exception as e:
+					print(f"[viz toggle deferred SetVisibility] {e}")
+				try:
+					var.set(bool(state))
+				except Exception as e:
+					print(f"[viz toggle deferred var.set] {e}")
+			try:
+				self.after(0, _do)
+			except Exception as e:
+				print(f"[viz toggle schedule] {e}")
+
 		def toggle_prox_model(state):
-			prox_mesh_actor.SetVisibility(state)
-			self.viz_show_prox_model.set(bool(state))
+			_deferred_toggle(lambda: [prox_mesh_actor], self.viz_show_prox_model, state)
 
 		def toggle_prox_points(state):
-			prox_points_actor.SetVisibility(state)
-			for label_actor in prox_label_actors:
-				label_actor.SetVisibility(state)
-			self.viz_show_prox_pp.set(bool(state))
+			_deferred_toggle(lambda: [prox_points_actor] + list(prox_label_actors),
+			                 self.viz_show_prox_pp, state)
 
 		def toggle_dist_model(state):
-			dist_mesh_actor.SetVisibility(state)
-			self.viz_show_dist_model.set(bool(state))
+			_deferred_toggle(lambda: [dist_mesh_actor], self.viz_show_dist_model, state)
 
 		def toggle_dist_points(state):
-			dist_points_actor.SetVisibility(state)
-			for label_actor in dist_label_actors:
-				label_actor.SetVisibility(state)
-			self.viz_show_dist_pp.set(bool(state))
+			_deferred_toggle(lambda: [dist_points_actor] + list(dist_label_actors),
+			                 self.viz_show_dist_pp, state)
 
 		def toggle_prox_axes(state):
-			for actor in prox_axis_actors:
-				actor.SetVisibility(state)
-			self.viz_show_prox_axes.set(bool(state))
+			_deferred_toggle(lambda: prox_axis_actors, self.viz_show_prox_axes, state)
 
 		def toggle_dist_axes(state):
-			for actor in dist_axis_actors:
-				actor.SetVisibility(state)
-			self.viz_show_dist_axes.set(bool(state))
+			_deferred_toggle(lambda: dist_axis_actors, self.viz_show_dist_axes, state)
 
-		# 起動時に保存値を反映（actor とチェックボックスの初期値を一致させる）
-		prox_mesh_actor.SetVisibility(self.viz_show_prox_model.get())
-		prox_points_actor.SetVisibility(self.viz_show_prox_pp.get())
-		for la in prox_label_actors:
-			la.SetVisibility(self.viz_show_prox_pp.get())
-		for ax in prox_axis_actors:
-			ax.SetVisibility(self.viz_show_prox_axes.get())
-		dist_mesh_actor.SetVisibility(self.viz_show_dist_model.get())
-		dist_points_actor.SetVisibility(self.viz_show_dist_pp.get())
-		for la in dist_label_actors:
-			la.SetVisibility(self.viz_show_dist_pp.get())
-		for ax in dist_axis_actors:
-			ax.SetVisibility(self.viz_show_dist_axes.get())
+		# 起動時の保存済み表示状態の反映は show() 完了後に遅延適用する。
+		# （init 中の SetVisibility が VTK 内部の初期化と競合してクラッシュする
+		#  可能性があるため、show() で完全に立ち上がってから適用）
+		print(f"[viz init] prox_model={self.viz_show_prox_model.get()} "
+		      f"prox_pp={self.viz_show_prox_pp.get()} prox_axes={self.viz_show_prox_axes.get()} "
+		      f"dist_model={self.viz_show_dist_model.get()} dist_pp={self.viz_show_dist_pp.get()} "
+		      f"dist_axes={self.viz_show_dist_axes.get()}")
+		print(f"[viz init] actors: prox_mesh={prox_mesh_actor is not None} "
+		      f"prox_pts={prox_points_actor is not None} prox_axes_n={len(prox_axis_actors)} "
+		      f"dist_mesh={dist_mesh_actor is not None} dist_pts={dist_points_actor is not None} "
+		      f"dist_axes_n={len(dist_axis_actors)}")
+
+		def _apply_saved_viz_state():
+			"""保存済みの表示/非表示状態を実 actor に適用（show() 後に呼ぶ）。"""
+			_safe_set_visibility([prox_mesh_actor], self.viz_show_prox_model.get())
+			_safe_set_visibility([prox_points_actor] + list(prox_label_actors), self.viz_show_prox_pp.get())
+			_safe_set_visibility(prox_axis_actors, self.viz_show_prox_axes.get())
+			_safe_set_visibility([dist_mesh_actor], self.viz_show_dist_model.get())
+			_safe_set_visibility([dist_points_actor] + list(dist_label_actors), self.viz_show_dist_pp.get())
+			_safe_set_visibility(dist_axis_actors, self.viz_show_dist_axes.get())
 		
 		def update_prox_opacity(value):
 			prox_mesh_actor.GetProperty().SetOpacity(value)
@@ -5370,7 +5389,7 @@ class MainMenuGUI(_BaseWindow):
 				transformed_y_axis = rotation_matrix @ dist_y_axis_initial
 				transformed_z_axis = rotation_matrix @ dist_z_axis_initial
 				
-				axis_length = 50.0
+				axis_length = 100.0  # 遠位は近位(50mm)より長く突き出させて視認性確保
 				# X軸の更新
 				dist_x_line.points = np.array([transformed_origin, transformed_origin + transformed_x_axis * axis_length])
 				# Y軸の更新
@@ -6017,6 +6036,7 @@ class MainMenuGUI(_BaseWindow):
 						'dist_point_local': lig['dist_point_local'].tolist(),
 						'thickness': float(lig['thickness']),
 						'color': lig['color'],
+						'visible': bool(lig.get('visible', True)),
 					}
 					for lig in ligaments
 				]
@@ -6123,11 +6143,12 @@ class MainMenuGUI(_BaseWindow):
 				except Exception:
 					pass
 
-		def add_ligament(name, prox_pt, dist_local_pt, thickness=1.5, color="#FF8800"):
+		def add_ligament(name, prox_pt, dist_local_pt, thickness=1.5, color="#FF8800", visible=True):
 			"""靭帯データを構築してプロッタにチューブを追加。
 
 			thickness は ワールド単位 (mm) のチューブ半径。ズームしてもボーンとの
 			相対太さが変わらない（pv.Tube は実3D形状）。
+			visible: 初期表示状態（False で隠す）。
 			"""
 			prox_arr = np.array(prox_pt, dtype=float)
 			dist_local_arr = np.array(dist_local_pt, dtype=float)
@@ -6151,18 +6172,42 @@ class MainMenuGUI(_BaseWindow):
 					bold=True, shadow=True, show_points=False)
 			except Exception:
 				pass
+			# 初期可視状態を反映
+			try:
+				if actor is not None:
+					actor.SetVisibility(bool(visible))
+				if label_actor is not None:
+					label_actor.SetVisibility(bool(visible))
+			except Exception:
+				pass
 			lig = {
 				'name': name,
 				'prox_point': prox_arr,
 				'dist_point_local': dist_local_arr,
 				'thickness': float(thickness),
 				'color': color,
+				'visible': bool(visible),
 				'actor': actor,
 				'label_actor': label_actor,
 			}
 			ligaments.append(lig)
 			refresh_ligament_list()
 			persist_ligaments()
+
+		def toggle_ligament_visibility(idx, visible):
+			"""指定靭帯の表示/非表示を切替。"""
+			try:
+				lig = ligaments[idx]
+				lig['visible'] = bool(visible)
+				if lig.get('actor') is not None:
+					try: lig['actor'].SetVisibility(bool(visible))
+					except Exception: pass
+				if lig.get('label_actor') is not None:
+					try: lig['label_actor'].SetVisibility(bool(visible))
+					except Exception: pass
+				persist_ligaments()
+			except Exception as e:
+				print(f"[靭帯表示切替] 失敗: {e}")
 
 		def on_pick_callback(point):
 			"""ピックされた3D点を処理する。pick_state['mode']で分岐。
@@ -6345,6 +6390,7 @@ class MainMenuGUI(_BaseWindow):
 			if ligaments:
 				hdr_row = ttk.Frame(lig_list_frame)
 				hdr_row.pack(fill="x", pady=(2, 1))
+				ttk.Label(hdr_row, text="表示", width=5, font=hdr_font).pack(side="left", padx=2)
 				ttk.Label(hdr_row, text="名前", width=14, font=hdr_font).pack(side="left", padx=2)
 				ttk.Label(hdr_row, text="太さ", width=6, font=hdr_font).pack(side="left", padx=2)
 				ttk.Label(hdr_row, text="色",   width=6, font=hdr_font).pack(side="left", padx=2)
@@ -6353,6 +6399,13 @@ class MainMenuGUI(_BaseWindow):
 			for idx, lig in enumerate(ligaments):
 				row = ttk.Frame(lig_list_frame)
 				row.pack(fill="x", pady=1)
+
+				# 表示/非表示チェックボックス
+				vis_var = tk.BooleanVar(value=bool(lig.get('visible', True)))
+				vis_chk = ttk.Checkbutton(row, variable=vis_var,
+					command=lambda i=idx, vv=vis_var: toggle_ligament_visibility(i, vv.get()))
+				vis_chk.pack(side="left", padx=(8, 4))
+
 				name_var = tk.StringVar(value=lig['name'])
 				name_entry = ttk.Entry(row, textvariable=name_var, width=14)
 				name_entry.pack(side="left", padx=2)
@@ -6369,7 +6422,7 @@ class MainMenuGUI(_BaseWindow):
 				color_btn.pack(side="left", padx=2)
 
 				ttk.Button(row, text="削除", width=6, command=lambda i=idx: remove_ligament(i)).pack(side="right", padx=2)
-				lig_row_widgets.append({'frame': row, 'name_var': name_var})
+				lig_row_widgets.append({'frame': row, 'name_var': name_var, 'vis_var': vis_var})
 
 		refresh_ligament_list()
 
@@ -6386,6 +6439,7 @@ class MainMenuGUI(_BaseWindow):
 							dist_local_pt=np.array(sl.get('dist_point_local', [0,0,0]), dtype=float),
 							thickness=float(sl.get('thickness', 1.5)),
 							color=str(sl.get('color', '#FF8800')),
+							visible=bool(sl.get('visible', True)),
 						)
 					except Exception as e:
 						print(f"[靭帯復元] スキップ: {e}")
@@ -6406,6 +6460,11 @@ class MainMenuGUI(_BaseWindow):
 		def on_ctrl_close():
 			stop_all_autoplay()
 			stop_sequence()
+			# 表示状態などをここで永続化
+			try:
+				self._save_state()
+			except Exception as e:
+				print(f"[on_ctrl_close save] {e}")
 			try:
 				ctrl_window.destroy()
 			except Exception:
@@ -6416,6 +6475,12 @@ class MainMenuGUI(_BaseWindow):
 			all_plotter.show(auto_close=False, interactive_update=True)
 		except TypeError:
 			all_plotter.show(auto_close=False)
+
+		# show() 直後に保存済みの表示状態を適用（チェックボックスとactor の状態を一致させる）
+		try:
+			self.after(300, _apply_saved_viz_state)
+		except Exception as e:
+			print(f"[viz preset schedule] {e}")
 
 		# レンダループ: PyVista の VTK イベントを Tk の after で駆動
 		render_after_id = [None]
