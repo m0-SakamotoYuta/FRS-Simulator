@@ -61,7 +61,7 @@ IS_LINUX = sys.platform.startswith('linux')
 try:
 	from tkinterdnd2 import TkinterDnD, DND_FILES
 	_HAS_DND = True
-except ImportError:
+except ImportError:	
 	_HAS_DND = False
 import json
 from pathlib import Path
