@@ -63,10 +63,11 @@ def device_info() -> str:
     return dev or "cpu"
 
 
-def _closest_dist2_point_triangle(p, a, b, c):
-    """点 p と三角形(a,b,c) の最近点までの距離の二乗を返す（Ericson法のベクトル化）。
+def _closest_point_on_triangle(p, a, b, c):
+    """点 p と三角形(a,b,c) の最近点 closest と距離二乗 dist2 を返す（Ericson法のベクトル化）。
 
-    p: (K,1,3), a/b/c: (1,M,3) → ブロードキャストで (K,M,3)。戻り値 (K,M)。
+    p: (K,1,3), a/b/c: (1,M,3) → ブロードキャストで (K,M,3)。
+    戻り値: closest (K,M,3), dist2 (K,M)。
     """
     ab = b - a
     ac = c - a
@@ -112,7 +113,12 @@ def _closest_dist2_point_triangle(p, a, b, c):
     closest = torch.where(mBC.unsqueeze(-1), b + tBC * (c - b), closest)
 
     diff = p - closest
-    return (diff * diff).sum(-1)
+    return closest, (diff * diff).sum(-1)
+
+
+def _closest_dist2_point_triangle(p, a, b, c):
+    """後方互換: 距離二乗 (K,M) のみを返す。"""
+    return _closest_point_on_triangle(p, a, b, c)[1]
 
 
 def point_to_mesh_distance(query_points: np.ndarray,
@@ -163,6 +169,68 @@ def point_to_mesh_distance(query_points: np.ndarray,
                         except Exception:
                             pass
                     cur_batch = max(32, cur_batch // 2)
+                    print(f"[frs_gpu] メモリ不足 → バッチを {cur_batch} に縮小して再試行")
+                    continue
+                raise
+
+
+def signed_point_to_mesh_distance(query_points: np.ndarray,
+                                  tri_vertices: np.ndarray,
+                                  tri_faces: np.ndarray,
+                                  batch: int = 256,
+                                  device: str = "auto"):
+    """各 query 点から三角形メッシュ表面までの「符号付き」最短距離を一括計算する。
+
+    符号: 最近傍三角形の法線と (query - 最近点) の内積の符号。
+          外側(法線方向側)を正、内側(めり込み)を負とする。VTK の
+          compute_implicit_distance と同種の符号付き表面距離。
+
+    Returns:
+        (N,) の符号付き距離配列（np.float32）。PyTorch未導入なら None。
+    """
+    if not _HAS_TORCH:
+        return None
+    if len(tri_faces) == 0:
+        return None
+    dev = get_device(device)
+    with torch.no_grad():
+        V = torch.as_tensor(np.asarray(tri_vertices), dtype=torch.float32, device=dev)
+        F = torch.as_tensor(np.asarray(tri_faces), dtype=torch.long, device=dev)
+        A0 = V[F[:, 0]]
+        B0 = V[F[:, 1]]
+        C0 = V[F[:, 2]]
+        # 面法線（正規化）
+        Nf = torch.cross(B0 - A0, C0 - A0, dim=-1)
+        Nf = Nf / (Nf.norm(dim=-1, keepdim=True) + 1e-20)  # (M,3)
+        A = A0.unsqueeze(0)
+        B = B0.unsqueeze(0)
+        C = C0.unsqueeze(0)
+        Q = torch.as_tensor(np.asarray(query_points), dtype=torch.float32, device=dev)
+        n = Q.shape[0]
+        cur_batch = max(int(batch), 1)
+        while True:
+            try:
+                out = torch.empty(n, dtype=torch.float32, device=dev)
+                for i in range(0, n, cur_batch):
+                    q = Q[i:i + cur_batch].unsqueeze(1)  # (K,1,3)
+                    closest, d2 = _closest_point_on_triangle(q, A, B, C)  # (K,M,3),(K,M)
+                    idx = d2.argmin(dim=1)  # (K,)
+                    cmin = closest.gather(1, idx.view(-1, 1, 1).expand(-1, 1, 3)).squeeze(1)  # (K,3)
+                    dmin = d2.gather(1, idx.view(-1, 1)).squeeze(1).clamp_min(0).sqrt()  # (K,)
+                    nmin = Nf[idx]  # (K,3)
+                    qk = q.squeeze(1)  # (K,3)
+                    s = torch.sign(((qk - cmin) * nmin).sum(-1))
+                    s = torch.where(s == 0, torch.ones_like(s), s)
+                    out[i:i + cur_batch] = dmin * s
+                return out.detach().cpu().numpy().astype(np.float32)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and cur_batch > 16:
+                    if dev == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    cur_batch = max(16, cur_batch // 2)
                     print(f"[frs_gpu] メモリ不足 → バッチを {cur_batch} に縮小して再試行")
                     continue
                 raise

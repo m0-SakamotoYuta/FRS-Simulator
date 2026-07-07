@@ -12472,9 +12472,27 @@ class MainMenuGUI(_BaseWindow):
 								vtk_error_output.SetFileName("nul" if os.name == 'nt' else "/dev/null")
 								vtk_original_output = vtk.vtkOutputWindow.GetInstance()
 								vtk.vtkOutputWindow.SetInstance(vtk_error_output)
-								
+
+								# --- GPUがある場合は符号付き距離を一括GPU計算（VTK implicit と一致・大幅高速化） ---
+								_use_gpu_heatmap = False
 								try:
-									if use_parallel_heatmap:
+									import frs_gpu
+									if frs_gpu.has_torch() and frs_gpu.get_device() in ("cuda", "mps"):
+										print(f"[GPU] {frs_gpu.device_info()} でヒートマップ{len(transform_data)}フレームを一括計算します")
+										heatmap_precomputed = self._precompute_heatmaps_gpu(
+											prox_joint_region, dist_surface, prox_points, transform_data,
+											update_progress, cancel_var)
+										_use_gpu_heatmap = True
+										print(f"[GPU] ヒートマップ {len(heatmap_precomputed)}フレーム計算完了")
+								except Exception as e:
+									print(f"[GPU] ヒートマップGPU計算に失敗、CPUにフォールバック: {e}")
+									_use_gpu_heatmap = False
+									heatmap_precomputed = []
+
+								try:
+									if _use_gpu_heatmap:
+										pass  # 既にGPUで計算済み
+									elif use_parallel_heatmap:
 										# Phase 3: スレッド並列処理でヒートマップを計算（GIL制約あるが、I/O待機が多いため有効）
 										from concurrent.futures import ThreadPoolExecutor, as_completed
 										import multiprocessing
@@ -15204,6 +15222,60 @@ class MainMenuGUI(_BaseWindow):
 				fallback = pv.PolyData(np.array([[0.0, 0.0, 0.0]]))
 				fallback['distance'] = np.array([100.0])
 			return fallback
+
+	def _precompute_heatmaps_gpu(self, prox_joint_region, dist_surface, prox_points, transform_data,
+	                             update_progress, cancel_var):
+		"""全フレームの符号付き距離ヒートマップをGPUで一括計算する（frs_gpu使用）。
+
+		剛体変換の不変性を利用: 遠位メッシュ(固定)に対し、近位点を各フレームの inv(T_f) で
+		逆変換して符号付き距離を求める。これにより遠位三角形をGPUに一度載せるだけで、
+		全フレームをまとめてGPU計算できる。値はVTK compute_implicit_distanceと一致。
+
+		Returns: フレームごとの pv.PolyData(prox領域 + 'distance') のリスト。
+		"""
+		import frs_gpu
+		# 遠位表面の三角形（固定・元姿勢）
+		dm = dist_surface
+		if not isinstance(dm, pv.PolyData):
+			dm = dm.extract_surface()
+		dm = dm.triangulate()
+		dverts = np.asarray(dm.points, dtype=np.float64)
+		dfaces_raw = np.asarray(dm.faces)
+		if dfaces_raw.size < 4:
+			raise ValueError("遠位メッシュに三角形がありません")
+		dfaces = dfaces_raw.reshape(-1, 4)[:, 1:4].astype(np.int64)
+
+		pts = np.asarray(prox_points) if prox_points is not None else np.asarray(prox_joint_region.points)
+		n_pts = len(pts)
+		if n_pts == 0:
+			return []
+		homog = np.hstack([pts, np.ones((n_pts, 1))])  # (P,4)
+		same_struct = (prox_points is None or n_pts == prox_joint_region.n_points)
+
+		n_frames = len(transform_data)
+		results = [None] * n_frames
+		# 近位点を逆変換して、複数フレームをまとめてGPUへ（目安: 約600万点/チャンク）
+		frames_per_chunk = max(1, min(128, max(1, 6_000_000 // max(n_pts, 1))))
+		for start in range(0, n_frames, frames_per_chunk):
+			if cancel_var.get():
+				break
+			chunk = transform_data[start:start + frames_per_chunk]
+			big = np.empty((len(chunk) * n_pts, 3), dtype=np.float64)
+			for k, tf in enumerate(chunk):
+				Tinv = np.linalg.inv(np.asarray(tf['matrix'], dtype=float))
+				big[k * n_pts:(k + 1) * n_pts] = (Tinv @ homog.T).T[:, :3]
+			signed = frs_gpu.signed_point_to_mesh_distance(big, dverts, dfaces, batch=256)
+			if signed is None:
+				raise RuntimeError("GPU符号付き距離が利用できません")
+			for k in range(len(chunk)):
+				d = signed[k * n_pts:(k + 1) * n_pts]
+				hm = prox_joint_region.copy(deep=False) if same_struct else pv.PolyData(pts)
+				hm['distance'] = np.asarray(d, dtype=float)
+				results[start + k] = hm
+			done = min(start + len(chunk), n_frames)
+			if not update_progress(done, n_frames, f"[GPU] ヒートマップ計算中: {done}/{n_frames}"):
+				break
+		return [h for h in results if h is not None]
 
 		
 		# 変換を適用
