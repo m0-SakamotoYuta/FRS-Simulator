@@ -12819,35 +12819,49 @@ class MainMenuGUI(_BaseWindow):
 				heatmap_mesh['distance'] = np.array([0.0])
 				print(f"[デバッグ] ヒートマップメッシュをダミーで初期化（データなし）")
 			
-			# カラースケール（符号付き距離対応: 0を中心に対称）
+			# カラースケール: 接触=緑, めり込み(負)=赤(深いほど濃い), 離間(正)=透明(素のモデルを見せる)
+			# 全フレームの最深めり込み量からスケールを決定
+			pent_max = 5.0
 			if len(heatmap_precomputed) > 0 and 'distance' in heatmap_precomputed[0].array_names:
 				try:
-					# 全フレームの距離範囲を走査してスケールを安定化
 					mins = []
-					maxs = []
 					for hm in heatmap_precomputed:
 						if hm is not None and hm.n_points > 0 and 'distance' in hm.array_names:
 							d = np.asarray(hm['distance'])
 							if d.size:
 								mins.append(np.nanmin(d))
-								maxs.append(np.nanmax(d))
-					min_val = np.nanmin(mins) if mins else 0.0
-					max_val = np.nanmax(maxs) if maxs else 1.0
-					max_abs = float(max(abs(min_val), abs(max_val)))
-					if max_abs <= 1e-6:
-						max_abs = 1.0
+					deepest = np.nanmin(mins) if mins else -1.0
+					pent_max = max(float(-deepest), 1.0)  # 最深めり込み量(正の数)。最低1mm
 				except Exception:
-					max_abs = 5.0
-			else:
-				max_abs = 5.0
+					pent_max = 5.0
+
+			sep_band = 1.0  # これ以上離れたら透明（素のモデルを見せる）[mm]
+			# カラーマップ: めり込み(負)=赤 → 接触(0付近)=緑
+			try:
+				from matplotlib.colors import LinearSegmentedColormap
+				t0 = pent_max / (pent_max + sep_band)  # 距離0(接触)の正規化位置
+				heatmap_cmap = LinearSegmentedColormap.from_list(
+					'contact_pen',
+					[(0.0, (0.75, 0.0, 0.0)),                 # 最深めり込み: 濃い赤
+					 (max(t0 * 0.5, 0.01), (1.0, 0.6, 0.0)),  # 浅いめり込み: オレンジ
+					 (t0, (0.1, 0.75, 0.1)),                  # 接触(0mm): 緑
+					 (1.0, (0.1, 0.75, 0.1))])                # 離間側(透明化されるので色は緑のまま)
+			except Exception:
+				heatmap_cmap = 'RdYlGn'
+			# 不透明度の伝達関数: d<=0(接触・めり込み)=不透明, 0<d<band=徐々に透明, d>=band=透明
+			_xs = np.linspace(-pent_max, sep_band, 256)
+			_op = np.ones_like(_xs)
+			_far = _xs > 0.0
+			_op[_far] = np.clip(1.0 - _xs[_far] / sep_band, 0.0, 1.0)
+			heatmap_opacity = _op.tolist()
 
 			heatmap_actor = anim_plotter.add_mesh(
 				heatmap_mesh,
 				scalars='distance',
-				cmap='jet_r',  # 符号付き距離向けの発散カラーマップ
-				clim=[-5, 5],  # 0を中心に対称範囲
+				cmap=heatmap_cmap,     # めり込み=赤 → 接触=緑
+				clim=[-pent_max, sep_band],
+				opacity=heatmap_opacity,  # 離間(正)は透明→素のモデルが見える
 				show_edges=False,
-				opacity=1.0,  # 1.0にしてフィッティング側と合わせる
 				label='Heatmap',
 			)
 			
