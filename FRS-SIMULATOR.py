@@ -48,7 +48,7 @@ VERSION = "2.4"  # ここでバージョンを変更してください
 import sys
 import platform
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, colorchooser
+from tkinter import ttk, filedialog, messagebox, colorchooser, simpledialog
 from tkinter import font as tkfont
 import urllib.parse
 
@@ -329,11 +329,58 @@ class MainMenuGUI(_BaseWindow):
 		self.dist_offset_y = tk.DoubleVar(value=0.0)  # 遠位O' Y方向オフセット（mm）
 		self.dist_offset_z = tk.DoubleVar(value=0.0)  # 遠位O' Z方向オフセット（mm）
 
+		# ============================================================
+		# Variables (Knee Simulator / FRS-2015 ロボット準拠 膝関節)
+		# ------------------------------------------------------------
+		# 座標系定義: 木村圭 学位論文 第3章 / 木村・藤江 機械学会論文集 2015 /
+		#             藤江「動作原理と改良」2024。
+		#  - 大腿骨座標系 Cf: 原点=MCL/LCL付着部の中点, Z=LCL→MCL(右膝で外側正),
+		#    Y=大腿骨骨軸(≒基準座標系Coのy軸=L,M,N由来のCcl姿勢)をZ⊥面へ投影(近位正),
+		#    X=Y×Z
+		#  - 脛骨座標系 Ct: 伸展位でCfに一致。動物膝はCfをZ軸まわりに屈曲角φ(=W_scan)回転
+		# 特徴点(L,M,N,MCL,LCL)は「ロボット取付け初期状態(組立)3Dスキャン」上にある。
+		# 大腿骨/脛骨モデルは試験後の別スキャンで、ICP/RANSACで初期スキャンへ位置合わせする。
+		# ============================================================
+		self.knee_initial_scan_path = tk.StringVar(value="")   # 初期状態(組立)スキャン
+		self.knee_initial_pp_path = tk.StringVar(value="")     # 初期スキャン特徴点(L,M,N,MCL,LCL)
+		self.knee_femur_model_path = tk.StringVar(value="")    # 大腿骨モデル(試験後・別スキャン)
+		self.knee_tibia_model_path = tk.StringVar(value="")    # 脛骨モデル(試験後・別スキャン)
+		self.knee_transform_path = tk.StringVar(value="")      # 変位・姿勢変化データ(xlsx/kkr)
+		self.knee_side_var = tk.IntVar(value=1)                # 1: 右膝, 2: 左膝
+		self.knee_w_scan_deg = tk.DoubleVar(value=0.0)         # 伸展位屈曲角 φ (=スキャン時W軸角度, deg)
+		# ICP/RANSAC 位置合わせ用の領域(任意領域)ファイル
+		self.knee_reg_femur_src_path = tk.StringVar(value="")  # 大腿骨モデル側 位置合わせ領域
+		self.knee_reg_femur_tgt_path = tk.StringVar(value="")  # 初期スキャン側 大腿骨領域
+		self.knee_reg_tibia_src_path = tk.StringVar(value="")  # 脛骨モデル側 位置合わせ領域
+		self.knee_reg_tibia_tgt_path = tk.StringVar(value="")  # 初期スキャン側 脛骨領域
+		# 位置合わせ結果(4x4変換行列; 各モデル→初期スキャン座標系)。未計算はNone
+		self._knee_femur_reg_T = None
+		self._knee_tibia_reg_T = None
+		# 位置合わせパラメータ（大腿骨・脛骨で別々に保持。プリセットで保存/呼出可）
+		self.knee_reg_pvars = {}        # {bone: {key: tkVar}}
+		self.knee_reg_method_var = {}   # {bone: StringVar} "ransac"/"pca"/"manual"
+		self.knee_reg_scaling_var = {}  # {bone: BooleanVar}
+		self.knee_reg_preview_var = {}  # {bone: BooleanVar}
+		self.knee_preset_sel = {}       # {bone: StringVar} 選択中プリセット名
+		for bone in ("femur", "tibia"):
+			d = {}
+			for key, kind, default, _lbl in self._knee_param_spec():
+				d[key] = tk.IntVar(value=int(default)) if kind == "int" else tk.DoubleVar(value=float(default))
+			self.knee_reg_pvars[bone] = d
+			self.knee_reg_method_var[bone] = tk.StringVar(value="ransac")
+			self.knee_reg_scaling_var[bone] = tk.BooleanVar(value=False)
+			self.knee_reg_preview_var[bone] = tk.BooleanVar(value=True)
+			self.knee_preset_sel[bone] = tk.StringVar(value="")
+		self.knee_preset_combo = {}     # {bone: ttk.Combobox}（UI構築時に格納）
+		self._knee_presets = self._load_knee_presets()  # 名前→パラメータdict
+
 		# 関節種別ごとに切替えるUIウィジェットの参照（ラベル変更用）
 		self._joint_widgets = {}
 
 		# 状態復元（可能なら）
 		self._load_state()
+		# knee simulator の状態復元（hipの関節ラジオと独立）
+		self._load_knee_state()
 		# 直前の関節種別を記録（関節切替時の差分判定用）
 		self._prev_joint = self.joint_var.get()
 
@@ -367,9 +414,13 @@ class MainMenuGUI(_BaseWindow):
 		self.notebook = ttk.Notebook(main_container)
 		self.notebook.grid(row=1, column=0, sticky="nsew")
 
-		# タブ1: Simulator
+		# タブ1: hip simulator（旧「Simulator」。股関節用可視化）
 		self.simulator_tab = ttk.Frame(self.notebook, padding=12)
-		self.notebook.add(self.simulator_tab, text="Simulator")
+		self.notebook.add(self.simulator_tab, text="hip simulator")
+
+		# タブ1b: knee simulator（FRS-2015 ロボット準拠 膝関節用可視化）
+		self.knee_simulator_tab = ttk.Frame(self.notebook, padding=12)
+		self.notebook.add(self.knee_simulator_tab, text="knee simulator")
 
 		# タブ2: Cache Settings
 		self.cache_tab = ttk.Frame(self.notebook, padding=12)
@@ -432,8 +483,11 @@ class MainMenuGUI(_BaseWindow):
 		self.utilities_notebook.add(self.pp_merge_tab, text="pp merge")
 
 
-		# Simulatorタブのコンテンツを作成
+		# Simulatタブ (hip simulator) のコンテンツを作成
 		self._create_simulator_tab()
+
+		# knee simulatorタブのコンテンツを作成
+		self._create_knee_simulator_tab()
 
 		# Fittingタブのコンテンツを作成
 		self._create_fitting_tab()
@@ -729,6 +783,1048 @@ class MainMenuGUI(_BaseWindow):
 		# シミュレーション実行（ヒートマップ事前計算→アニメーション）
 		self.animate_button = ttk.Button(tf_frame, text="シミュレーション実行", command=self.on_animate)
 		self.animate_button.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
+
+	# region knee simulator (FRS-2015 ロボット準拠 膝関節)
+	def _create_knee_simulator_tab(self) -> None:
+		"""knee simulatorタブのUIを構築（FRS-2015 ロボット準拠 膝関節）。
+
+		座標系: 木村圭 学位論文 第3章 / 木村・藤江 機械学会論文集 2015 / 藤江「動作原理と改良」2024。
+		入力: 初期状態(組立)スキャン + 特徴点(L,M,N,MCL,LCL) / 大腿骨・脛骨モデル(試験後別スキャン) /
+		      左右・W_scan / 変位データ。大腿骨/脛骨モデルはICP/RANSACで初期スキャンへ位置合わせする。
+		"""
+		# スクロール可能なメインフレーム
+		canvas = tk.Canvas(self.knee_simulator_tab, highlightthickness=0)
+		scrollbar = ttk.Scrollbar(self.knee_simulator_tab, orient="vertical", command=canvas.yview)
+		scrollable_frame = ttk.Frame(canvas)
+		scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+		canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+		canvas.configure(yscrollcommand=scrollbar.set)
+		canvas.pack(side="left", fill="both", expand=True)
+		scrollbar.pack(side="right", fill="y")
+
+		def _on_mousewheel(event):
+			if hasattr(event, 'delta') and event.delta:
+				canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+			elif hasattr(event, 'num'):
+				if event.num == 4:
+					canvas.yview_scroll(-1, "units")
+				elif event.num == 5:
+					canvas.yview_scroll(1, "units")
+		canvas.bind("<Enter>", lambda e: (canvas.bind_all("<MouseWheel>", _on_mousewheel),
+		                                   canvas.bind_all("<Button-4>", _on_mousewheel),
+		                                   canvas.bind_all("<Button-5>", _on_mousewheel)))
+		canvas.bind("<Leave>", lambda e: (canvas.unbind_all("<MouseWheel>"),
+		                                   canvas.unbind_all("<Button-4>"),
+		                                   canvas.unbind_all("<Button-5>")))
+
+		container = scrollable_frame
+		container.columnconfigure(0, weight=1)
+
+		# タイトル
+		ttk.Label(container, text="knee simulator（FRS-2015 ロボット準拠 膝関節）",
+		          font=(self.ui_font_family, 12, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+		ttk.Label(container,
+		          text="大腿骨座標系Cf(木村論文): 原点=MCL/LCL付着部の中点, Z=LCL→MCL(右膝で外側+), "
+		               "Y=骨軸(L,M,N由来の基準方向)をZ⊥面へ投影(近位+), X=Y×Z。脛骨座標系Ctは伸展位でCfに一致。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 8))
+
+		# Section: 初期状態スキャン（座標系の基準）
+		init_frame = ttk.LabelFrame(container, text="① 初期状態スキャン（座標系の基準）", style="Bold.TLabelframe")
+		init_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+		for i in range(3):
+			init_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		self._add_file_row(init_frame, 0, "初期状態スキャン (STL/OBJ)", self.knee_initial_scan_path,
+		                   lambda: self._knee_choose(self.knee_initial_scan_path, "初期状態スキャンを選択", "model"))
+		self._add_file_row(init_frame, 1, "初期スキャン特徴点 (PP)", self.knee_initial_pp_path,
+		                   lambda: self._knee_choose(self.knee_initial_pp_path, "初期スキャン特徴点(L,M,N,MCL,LCL)を選択", "pp"))
+		ttk.Label(init_frame, text="特徴点ラベル: L, M, N (大腿骨クランプパネル頂点), MCL, LCL (側副靭帯 大腿骨付着部)",
+		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+		# 左右・W_scan
+		opt = ttk.Frame(init_frame)
+		opt.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 6))
+		ttk.Label(opt, text="関節側:").grid(row=0, column=0, sticky="w")
+		ttk.Radiobutton(opt, text="右膝", value=1, variable=self.knee_side_var).grid(row=0, column=1, sticky="w", padx=(6, 4))
+		ttk.Radiobutton(opt, text="左膝", value=2, variable=self.knee_side_var).grid(row=0, column=2, sticky="w", padx=(0, 16))
+		ttk.Label(opt, text="W_scan (伸展位屈曲角φ, deg):").grid(row=0, column=3, sticky="w")
+		ttk.Entry(opt, textvariable=self.knee_w_scan_deg, width=8).grid(row=0, column=4, sticky="w", padx=(6, 4))
+		ttk.Label(opt, text="ヒト膝=0 / 動物膝=実測(30〜40)", foreground="gray",
+		          font=(self.ui_font_family, 8)).grid(row=0, column=5, sticky="w")
+
+		ttk.Button(init_frame, text="特徴点/座標系を可視化", command=self.on_knee_visualize_coords
+		           ).grid(row=4, column=0, sticky="w", padx=12, pady=(0, 8))
+
+		# Section: 大腿骨・脛骨モデル（試験後スキャン）
+		model_frame = ttk.LabelFrame(container, text="② 大腿骨・脛骨モデル（試験後の別スキャン）", style="Bold.TLabelframe")
+		model_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+		for i in range(3):
+			model_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		self._add_file_row(model_frame, 0, "大腿骨モデル (STL/OBJ)", self.knee_femur_model_path,
+		                   lambda: self._knee_choose(self.knee_femur_model_path, "大腿骨モデルを選択", "model"))
+		self._add_file_row(model_frame, 1, "脛骨モデル (STL/OBJ)", self.knee_tibia_model_path,
+		                   lambda: self._knee_choose(self.knee_tibia_model_path, "脛骨モデルを選択", "model"))
+		ttk.Label(model_frame, text="※ これらのモデルには特徴点は不要（幾何のみ）。③の位置合わせで初期スキャン座標系へ整列します。",
+		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
+		# Section: 位置合わせ（大腿骨・脛骨を個別に）
+		reg_frame = ttk.LabelFrame(container, text="③ 位置合わせ（大腿骨・脛骨を個別に → 初期スキャン座標系へ）", style="Bold.TLabelframe")
+		reg_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+		reg_frame.columnconfigure(0, weight=1)
+		self._build_knee_reg_panel(
+			reg_frame, 0, "femur", "大腿骨",
+			self.knee_reg_femur_src_path, self.knee_reg_femur_tgt_path,
+			"大腿骨モデル側 位置合わせ領域を選択", "初期スキャンの大腿骨領域を選択")
+		self._build_knee_reg_panel(
+			reg_frame, 1, "tibia", "脛骨",
+			self.knee_reg_tibia_src_path, self.knee_reg_tibia_tgt_path,
+			"脛骨モデル側 位置合わせ領域を選択", "初期スキャンの脛骨領域を選択")
+		ttk.Button(reg_frame, text="位置合わせ結果を確認（大腿骨＋脛骨）", command=self.on_knee_preview_registration
+		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 6))
+		ttk.Label(reg_frame,
+		          text="※ 領域はモデル/初期スキャンから同一部位を切り出したもの。"
+		               "方式: RANSAC=特徴量 / 主軸PCA=向き粗合わせ / 手動3点=対応点クリック → いずれもICPで仕上げ。"
+		               "パラメータは骨ごとに設定・プリセット保存できます。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 6))
+		self._knee_refresh_preset_combos()
+
+		# Section: 変位データ・シミュレーション
+		sim_frame = ttk.LabelFrame(container, text="④ 変位・姿勢変化データ / シミュレーション", style="Bold.TLabelframe")
+		sim_frame.grid(row=5, column=0, sticky="nsew", pady=(0, 8))
+		for i in range(3):
+			sim_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		self._add_file_row(sim_frame, 0, "変位・姿勢変化データ (xlsx/kkr)", self.knee_transform_path,
+		                   lambda: self._knee_choose(self.knee_transform_path, "変位・姿勢変化データを選択", "transform"))
+		ttk.Button(sim_frame, text="関節全体を可視化", command=self.on_knee_visualize_all
+		           ).grid(row=1, column=0, sticky="w", padx=12, pady=(2, 4))
+		ttk.Button(sim_frame, text="シミュレーション実行", command=self.on_knee_animate
+		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 8))
+
+	def _knee_choose(self, var: tk.StringVar, title: str, kind: str) -> None:
+		"""knee simulator用の共通ファイル選択ダイアログ。kind: 'model' | 'pp' | 'transform'."""
+		if kind == "pp":
+			ft = [("特徴点ファイル", "*.pp"), ("すべてのファイル", "*.*")]
+		elif kind == "transform":
+			ft = [("変位データ", "*.xlsx *.kkr *.KKR"), ("Excelファイル", "*.xlsx"),
+			      ("KKRファイル", "*.KKR *.kkr"), ("すべてのファイル", "*.*")]
+		else:
+			ft = [("3Dモデル", "*.obj *.stl"), ("OBJ", "*.obj"), ("STL", "*.stl"), ("すべてのファイル", "*.*")]
+		path = filedialog.askopenfilename(title=title, filetypes=ft)
+		if path:
+			var.set(path)
+
+	# ----- Knee registration params / presets (骨ごと) -----
+	def _knee_param_spec(self):
+		"""位置合わせ数値パラメータの仕様: (key, kind, default, ラベル)。"""
+		return [
+			("ransac_distance", "float", 1.0, "RANSAC距離(mm)"),
+			("ransac_max_iter", "int", 1000, "RANSAC反復"),
+			("ransac_confidence", "float", 0.99, "RANSAC信頼度"),
+			("icp_threshold", "float", 5.0, "ICP距離(mm)"),
+			("icp_max_iter", "int", 2000, "ICP反復"),
+			("sample_points", "int", 100000, "サンプル点数"),
+			("voxel_size", "float", 0.0, "ボクセル(mm,0=自動)"),
+		]
+
+	def _knee_get_params(self, bone: str) -> dict:
+		"""指定した骨の現在の位置合わせパラメータを plain dict で返す。"""
+		p = {}
+		for key, kind, default, _lbl in self._knee_param_spec():
+			try:
+				v = self.knee_reg_pvars[bone][key].get()
+				p[key] = int(v) if kind == "int" else float(v)
+			except Exception:
+				p[key] = default
+		p["method"] = self.knee_reg_method_var[bone].get()
+		p["enable_scaling"] = bool(self.knee_reg_scaling_var[bone].get())
+		p["preview"] = bool(self.knee_reg_preview_var[bone].get())
+		return p
+
+	def _knee_set_params(self, bone: str, d: dict) -> None:
+		"""dict の値を指定した骨のパラメータUIに反映する。"""
+		for key, kind, default, _lbl in self._knee_param_spec():
+			if key in d:
+				try:
+					self.knee_reg_pvars[bone][key].set(int(d[key]) if kind == "int" else float(d[key]))
+				except Exception:
+					pass
+		if "method" in d:
+			self.knee_reg_method_var[bone].set(str(d["method"]))
+		if "enable_scaling" in d:
+			self.knee_reg_scaling_var[bone].set(bool(d["enable_scaling"]))
+		if "preview" in d:
+			self.knee_reg_preview_var[bone].set(bool(d["preview"]))
+
+	def _knee_presets_file(self) -> Path:
+		import platform
+		fn = "frs2015_knee_reg_presets.json"
+		if platform.system() == "Darwin":
+			dd = Path.home() / ".frs_simulator"
+			dd.mkdir(parents=True, exist_ok=True)
+			return dd / fn
+		return Path(__file__).with_name(fn)
+
+	def _load_knee_presets(self) -> dict:
+		try:
+			p = self._knee_presets_file()
+			if p.exists():
+				data = json.load(p.open("r", encoding="utf-8"))
+				if isinstance(data, dict):
+					return data
+		except Exception as e:
+			print(f"[knee preset] 読込失敗: {e}")
+		return {}
+
+	def _save_knee_presets(self) -> None:
+		try:
+			p = self._knee_presets_file()
+			with p.open("w", encoding="utf-8") as f:
+				json.dump(self._knee_presets, f, ensure_ascii=False, indent=2)
+		except Exception as e:
+			print(f"[knee preset] 保存失敗: {e}")
+
+	def _knee_refresh_preset_combos(self) -> None:
+		names = sorted(self._knee_presets.keys())
+		for bone, combo in self.knee_preset_combo.items():
+			try:
+				combo["values"] = names
+			except Exception:
+				pass
+
+	def on_knee_preset_apply(self, bone: str) -> None:
+		name = self.knee_preset_sel[bone].get().strip()
+		if not name or name not in self._knee_presets:
+			messagebox.showwarning("プリセット", "適用するプリセットを選択してください。")
+			return
+		self._knee_set_params(bone, self._knee_presets[name])
+		messagebox.showinfo("プリセット", f"『{name}』を{('大腿骨' if bone == 'femur' else '脛骨')}に適用しました。")
+
+	def on_knee_preset_save(self, bone: str) -> None:
+		default = self.knee_preset_sel[bone].get().strip() or "preset1"
+		name = simpledialog.askstring("プリセット保存", "プリセット名:", initialvalue=default, parent=self)
+		if name is None:
+			return
+		name = name.strip()
+		if not name:
+			return
+		if name in self._knee_presets and not messagebox.askyesno("上書き確認", f"『{name}』を上書きしますか？"):
+			return
+		self._knee_presets[name] = self._knee_get_params(bone)
+		self._save_knee_presets()
+		self._knee_refresh_preset_combos()
+		self.knee_preset_sel[bone].set(name)
+		messagebox.showinfo("プリセット", f"『{name}』を保存しました。")
+
+	def on_knee_preset_rename(self, bone: str) -> None:
+		old = self.knee_preset_sel[bone].get().strip()
+		if not old or old not in self._knee_presets:
+			messagebox.showwarning("プリセット", "名前を変更するプリセットを選択してください。")
+			return
+		new = simpledialog.askstring("名前変更", "新しい名前:", initialvalue=old, parent=self)
+		if new is None:
+			return
+		new = new.strip()
+		if not new or new == old:
+			return
+		if new in self._knee_presets and not messagebox.askyesno("上書き確認", f"『{new}』は既にあります。上書きしますか？"):
+			return
+		self._knee_presets[new] = self._knee_presets.pop(old)
+		self._save_knee_presets()
+		self._knee_refresh_preset_combos()
+		for b in ("femur", "tibia"):
+			if self.knee_preset_sel[b].get() == old:
+				self.knee_preset_sel[b].set(new)
+
+	def on_knee_preset_delete(self, bone: str) -> None:
+		name = self.knee_preset_sel[bone].get().strip()
+		if not name or name not in self._knee_presets:
+			messagebox.showwarning("プリセット", "削除するプリセットを選択してください。")
+			return
+		if not messagebox.askyesno("削除確認", f"プリセット『{name}』を削除しますか？"):
+			return
+		del self._knee_presets[name]
+		self._save_knee_presets()
+		self._knee_refresh_preset_combos()
+		for b in ("femur", "tibia"):
+			if self.knee_preset_sel[b].get() == name:
+				self.knee_preset_sel[b].set("")
+
+	def _build_knee_reg_panel(self, parent, row, bone, label, src_var, tgt_var, src_title, tgt_title) -> None:
+		"""1つの骨(大腿骨/脛骨)の位置合わせパネルを構築する。"""
+		panel = ttk.LabelFrame(parent, text=f"{label}の位置合わせ", style="Bold.TLabelframe")
+		panel.grid(row=row, column=0, sticky="nsew", padx=8, pady=(4, 4))
+		for i in range(3):
+			panel.columnconfigure(i, weight=[0, 1, 0][i])
+		# 領域
+		self._add_file_row(panel, 0, f"{label}: モデル側 領域", src_var,
+		                   lambda: self._knee_choose(src_var, src_title, "model"))
+		self._add_file_row(panel, 1, f"{label}: 初期スキャン側 領域", tgt_var,
+		                   lambda: self._knee_choose(tgt_var, tgt_title, "model"))
+		# 方式
+		mf = ttk.Frame(panel)
+		mf.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 0))
+		ttk.Label(mf, text="方式:").grid(row=0, column=0, sticky="w")
+		mv = self.knee_reg_method_var[bone]
+		ttk.Radiobutton(mf, text="RANSAC", value="ransac", variable=mv).grid(row=0, column=1, sticky="w", padx=(6, 6))
+		ttk.Radiobutton(mf, text="主軸PCA", value="pca", variable=mv).grid(row=0, column=2, sticky="w", padx=(0, 6))
+		ttk.Radiobutton(mf, text="手動3点", value="manual", variable=mv).grid(row=0, column=3, sticky="w", padx=(0, 6))
+		# パラメータ（3列レイアウト）
+		pf = ttk.Frame(panel)
+		pf.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 2))
+		pvars = self.knee_reg_pvars[bone]
+		col = 0
+		r = 0
+		for key, kind, default, lbl in self._knee_param_spec():
+			ttk.Label(pf, text=lbl + ":").grid(row=r, column=col * 2, sticky="w", pady=(2, 0))
+			ttk.Entry(pf, textvariable=pvars[key], width=8).grid(row=r, column=col * 2 + 1, sticky="w", padx=(4, 12), pady=(2, 0))
+			col += 1
+			if col >= 3:
+				col = 0
+				r += 1
+		# scaling / preview
+		cf = ttk.Frame(panel)
+		cf.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 0))
+		ttk.Checkbutton(cf, text="スケール補正", variable=self.knee_reg_scaling_var[bone]).grid(row=0, column=0, sticky="w", padx=(0, 12))
+		ttk.Checkbutton(cf, text="経過を表示", variable=self.knee_reg_preview_var[bone]).grid(row=0, column=1, sticky="w")
+		# プリセット
+		prf = ttk.Frame(panel)
+		prf.grid(row=5, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 2))
+		ttk.Label(prf, text="プリセット:").grid(row=0, column=0, sticky="w")
+		combo = ttk.Combobox(prf, textvariable=self.knee_preset_sel[bone], width=16, state="readonly")
+		combo.grid(row=0, column=1, sticky="w", padx=(4, 6))
+		self.knee_preset_combo[bone] = combo
+		ttk.Button(prf, text="適用", width=5, command=lambda b=bone: self.on_knee_preset_apply(b)).grid(row=0, column=2, padx=2)
+		ttk.Button(prf, text="保存", width=5, command=lambda b=bone: self.on_knee_preset_save(b)).grid(row=0, column=3, padx=2)
+		ttk.Button(prf, text="名前変更", width=8, command=lambda b=bone: self.on_knee_preset_rename(b)).grid(row=0, column=4, padx=2)
+		ttk.Button(prf, text="削除", width=5, command=lambda b=bone: self.on_knee_preset_delete(b)).grid(row=0, column=5, padx=2)
+		# 実行
+		ttk.Button(panel, text=f"{label}を位置合わせ", command=lambda b=bone: self.on_knee_register_bone(b)
+		           ).grid(row=6, column=0, sticky="w", padx=12, pady=(4, 6))
+
+	# ----- Knee coordinate system builders (木村論文準拠) -----
+	def _knee_named_points(self, points, labels) -> dict:
+		"""特徴点配列とラベルから {ラベル大文字: np.array([x,y,z])} を作る。"""
+		d = {}
+		for p, lab in zip(points, labels):
+			key = str(lab).strip().upper().replace(" ", "")
+			d[key] = np.asarray(p, dtype=float)
+		return d
+
+	def _knee_reference_shaft_dir(self, pts: dict) -> np.ndarray:
+		"""L, M, N クランプパネル頂点から、大腿骨骨軸(≒基準座標系Coのy軸=近位方向)の
+		参照方向ベクトルを求める。パネル面の法線を用い、原点→パネル重心の向き(近位)に符号を合わせる。
+		"""
+		L, M, N = pts["L"], pts["M"], pts["N"]
+		normal = np.cross(M - L, N - L)
+		nn = np.linalg.norm(normal)
+		if nn < 1e-9:
+			raise ValueError("L,M,N が同一直線上にあり、パネル法線を定義できません")
+		normal = normal / nn
+		# 近位方向のヒント: 膝(MCL/LCL中点)からクランプ重心(L,M,N重心=近位側)へ向かうベクトル
+		mcl = pts.get("MCL"); lcl = pts.get("LCL")
+		if mcl is not None and lcl is not None:
+			origin = (mcl + lcl) / 2.0
+			proximal_hint = (L + M + N) / 3.0 - origin
+			if np.dot(normal, proximal_hint) < 0:
+				normal = -normal
+		return normal
+
+	def _build_knee_femur_frame(self, points, labels, side: int):
+		"""大腿骨座標系 Cf を構築（木村論文 第3章）。
+
+		Returns: (origin, x_axis, y_axis, z_axis) すべて np.array。
+		side: 1=右膝(Z+=外側=LCL方向), 2=左膝(符号反転)。
+		"""
+		pts = self._knee_named_points(points, labels)
+		for k in ("MCL", "LCL", "L", "M", "N"):
+			if k not in pts:
+				raise ValueError(f"必要な特徴点が見つかりません: {k}（必要: L,M,N,MCL,LCL）")
+		MCL, LCL = pts["MCL"], pts["LCL"]
+		origin = (MCL + LCL) / 2.0
+		# Z軸: LCL→MCL を結ぶ直線。右膝でZ+=外側(=LCL方向)なので LCL-MCL 方向を正にとる
+		z = LCL - MCL
+		if np.linalg.norm(z) < 1e-9:
+			raise ValueError("MCL と LCL が一致しており、Z軸を定義できません")
+		z = z / np.linalg.norm(z)
+		if side == 2:  # 左膝は内外側の符号反転
+			z = -z
+		# 骨軸参照方向(近位)を Z⊥面へ投影して Y軸(近位+)
+		shaft = self._knee_reference_shaft_dir(pts)
+		y = shaft - np.dot(shaft, z) * z
+		if np.linalg.norm(y) < 1e-9:
+			raise ValueError("骨軸参照方向がZ軸と平行で、Y軸を定義できません")
+		y = y / np.linalg.norm(y)
+		# X軸 = Y×Z
+		x = np.cross(y, z)
+		x = x / np.linalg.norm(x)
+		return origin, x, y, z
+
+	def _build_knee_tibia_frame(self, cf_origin, cf_x, cf_y, cf_z, w_scan_deg: float):
+		"""脛骨座標系 Ct を構築。伸展位で Cf に一致。動物膝は Cf を Z軸まわりに屈曲角 φ 回転
+		(木村論文 3.1.2: 「Z軸の負方向に回転」)。φ=w_scan_deg。
+
+		Returns: (origin, x_axis, y_axis, z_axis)。
+		"""
+		phi = np.deg2rad(w_scan_deg)
+		# Cf の Z軸まわりに -φ 回転（ロドリゲス）
+		k = cf_z / np.linalg.norm(cf_z)
+		ang = -phi
+
+		def rot(v):
+			return (v * np.cos(ang)
+			        + np.cross(k, v) * np.sin(ang)
+			        + k * np.dot(k, v) * (1 - np.cos(ang)))
+
+		x = rot(cf_x); y = rot(cf_y); z = cf_z.copy()
+		return cf_origin.copy(), x, y, z
+
+	def on_knee_visualize_coords(self) -> None:
+		"""初期状態スキャン上に特徴点と大腿骨座標系Cf(・脛骨座標系Ct)を可視化する。"""
+		scan_path = self.knee_initial_scan_path.get().strip()
+		pp_path = self.knee_initial_pp_path.get().strip()
+		if not scan_path or not pp_path:
+			messagebox.showwarning("入力不足", "初期状態スキャンと特徴点(PP)を選択してください。")
+			return
+		try:
+			points, labels = self._parse_pp_file(pp_path)
+		except Exception as e:
+			messagebox.showerror("特徴点読み込み失敗", f"PPファイルの読み込みに失敗しました:\n{e}")
+			return
+		try:
+			origin, x_axis, y_axis, z_axis = self._build_knee_femur_frame(points, labels, self.knee_side_var.get())
+		except Exception as e:
+			messagebox.showerror("大腿骨座標系構築エラー", f"Cfの構築に失敗しました:\n{e}")
+			return
+		w_scan = 0.0
+		try:
+			w_scan = float(self.knee_w_scan_deg.get())
+		except Exception:
+			pass
+		t_origin, t_x, t_y, t_z = self._build_knee_tibia_frame(origin, x_axis, y_axis, z_axis, w_scan)
+
+		try:
+			mesh = pv.read(scan_path)
+		except Exception as e:
+			messagebox.showerror("読み込み失敗", f"初期状態スキャンの読み込みに失敗しました:\n{e}")
+			return
+
+		# 軸長: モデルサイズに応じて決定
+		try:
+			diag = float(np.linalg.norm(np.array(mesh.bounds[1::2]) - np.array(mesh.bounds[0::2])))
+			axis_len = max(diag * 0.15, 10.0)
+		except Exception:
+			axis_len = 40.0
+
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="knee: 特徴点/座標系の可視化",
+		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
+		plotter.set_background("white")
+		plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True, show_edges=False)
+
+		# 特徴点表示
+		pts_named = self._knee_named_points(points, labels)
+		colors = {"MCL": "red", "LCL": "blue", "L": "green", "M": "orange", "N": "purple"}
+		for name, col in colors.items():
+			if name in pts_named:
+				p = pts_named[name]
+				plotter.add_mesh(pv.Sphere(radius=max(axis_len * 0.05, 1.0), center=p), color=col)
+				plotter.add_point_labels([p], [name], font_size=14, text_color=col,
+				                         point_size=1, show_points=False, always_visible=True)
+
+		def draw_frame(o, ax, ay, az, prefix, solid=True):
+			specs = [(ax, "red", f"{prefix}X"), (ay, "green", f"{prefix}Y"), (az, "blue", f"{prefix}Z")]
+			for vec, col, name in specs:
+				end = o + vec * axis_len
+				plotter.add_mesh(pv.Line(o, end), color=col, line_width=(5 if solid else 2))
+				plotter.add_point_labels([end], [name], font_size=13, text_color=col,
+				                         point_size=1, show_points=False, always_visible=True)
+
+		# Cf（実線）
+		draw_frame(origin, x_axis, y_axis, z_axis, "Cf_", solid=True)
+		# Ct（W_scan≠0 のとき破線的に細く表示）
+		if abs(w_scan) > 1e-6:
+			draw_frame(t_origin, t_x, t_y, t_z, "Ct_", solid=False)
+
+		plotter.add_text("Cf: X=red Y=green Z=blue  | 点: MCL=red LCL=blue L=green M=orange N=purple",
+		                 position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	def _knee_load_o3d_pcd(self, path: str, n_points: int):
+		"""STL/OBJ/PLY を VTK/PyVista で読み込み、Open3D の点群として返す。
+
+		Open3D の read_triangle_mesh は Windows の非ASCII(日本語)パスや一部STLで
+		空メッシュを返すことがあるため、堅牢な VTK(pyvista) 経由で読み込んでから変換する。
+		面がある場合は表面から一様サンプリング、点群のみの場合は頂点をそのまま使う。
+		"""
+		try:
+			pm = pv.read(path)
+		except Exception as e:
+			raise ValueError(f"メッシュを読み込めません: {Path(path).name}\n{e}")
+		if pm is None or pm.n_points == 0:
+			raise ValueError(f"メッシュを読み込めません（頂点なし）: {Path(path).name}")
+
+		verts = np.asarray(pm.points, dtype=np.float64)
+		# 面(三角形)を取り出す
+		tris = None
+		try:
+			surf = pm
+			if not isinstance(surf, pv.PolyData):
+				surf = surf.extract_surface()
+			surf = surf.triangulate()
+			verts = np.asarray(surf.points, dtype=np.float64)
+			faces = np.asarray(surf.faces)
+			if faces.size >= 4:
+				tris = faces.reshape(-1, 4)[:, 1:4].astype(np.int32)
+		except Exception:
+			tris = None
+
+		if tris is not None and len(tris) > 0:
+			mesh = o3d.geometry.TriangleMesh()
+			mesh.vertices = o3d.utility.Vector3dVector(verts)
+			mesh.triangles = o3d.utility.Vector3iVector(tris)
+			pcd = mesh.sample_points_uniformly(number_of_points=max(int(n_points), 1000))
+		else:
+			# 面が無い（点群）場合は頂点をそのまま使用
+			pcd = o3d.geometry.PointCloud()
+			pcd.points = o3d.utility.Vector3dVector(verts)
+		if len(pcd.points) == 0:
+			raise ValueError(f"点群を生成できません: {Path(path).name}")
+		return pcd
+
+	def _rigid_from_correspondences(self, src, tgt, allow_scale: bool = False) -> np.ndarray:
+		"""対応点 src(n,3)→tgt(n,3) から剛体(必要ならスケール付)変換 4x4 を求める(Umeyama/Kabsch)。"""
+		src = np.asarray(src, dtype=float)
+		tgt = np.asarray(tgt, dtype=float)
+		sc = src.mean(axis=0)
+		tc = tgt.mean(axis=0)
+		S = src - sc
+		T = tgt - tc
+		H = S.T @ T
+		U, D, Vt = np.linalg.svd(H)
+		d = np.sign(np.linalg.det(Vt.T @ U.T))
+		Dd = np.diag([1.0, 1.0, d])
+		R = Vt.T @ Dd @ U.T
+		scale = 1.0
+		if allow_scale:
+			var = float((S ** 2).sum())
+			scale = float((D * np.array([1.0, 1.0, d])).sum() / var) if var > 1e-12 else 1.0
+		t = tc - scale * R @ sc
+		M = np.eye(4)
+		M[:3, :3] = scale * R
+		M[:3, 3] = t
+		return M
+
+	def _pca_frame(self, points):
+		"""点群の重心と主軸(固有値降順、右手系)を返す。columns=主軸。"""
+		points = np.asarray(points, dtype=float)
+		c = points.mean(axis=0)
+		X = points - c
+		cov = (X.T @ X) / max(len(X) - 1, 1)
+		w, V = np.linalg.eigh(cov)
+		order = np.argsort(w)[::-1]
+		R = V[:, order]
+		if np.linalg.det(R) < 0:
+			R[:, 2] *= -1.0
+		return c, R
+
+	def _pca_align_candidates(self, child_points, parent_points):
+		"""child→parent の主軸整列 4x4 候補を、主軸の符号反転4通り(右手系維持)で返す。"""
+		cc, Rc = self._pca_frame(child_points)
+		cp, Rp = self._pca_frame(parent_points)
+		flips = [np.diag([1.0, 1.0, 1.0]), np.diag([1.0, -1.0, -1.0]),
+		         np.diag([-1.0, 1.0, -1.0]), np.diag([-1.0, -1.0, 1.0])]
+		cands = []
+		for F in flips:
+			R = Rp @ F @ Rc.T
+			t = cp - R @ cc
+			M = np.eye(4)
+			M[:3, :3] = R
+			M[:3, 3] = t
+			cands.append(M)
+		return cands
+
+	def _knee_pick_points(self, mesh, n: int, title: str) -> np.ndarray:
+		"""PyVistaでメッシュ表面の点を n 個クリックさせ、(m,3) 配列で返す。"""
+		picked = []
+		try:
+			b = np.array(mesh.bounds).reshape(3, 2)
+			r = max(float(np.linalg.norm(b[:, 1] - b[:, 0])) * 0.02, 0.5)
+		except Exception:
+			r = 1.0
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		p = pv.Plotter(title=title, window_size=(int(sw * 0.7), int(sh * 0.7)))
+		p.set_background("white")
+		p.add_mesh(mesh, color="lightgray", show_edges=False)
+
+		def cb(pt, *args):
+			if pt is None or len(picked) >= n:
+				return
+			pt = np.asarray(pt, dtype=float)
+			picked.append(pt)
+			p.add_mesh(pv.Sphere(radius=r, center=pt), color="red")
+			p.add_point_labels([pt], [str(len(picked))], font_size=16, text_color="red",
+			                   show_points=False, always_visible=True)
+
+		p.add_text(f"{title}\n対応点を {n} 個、順番にクリック → ウィンドウを閉じる",
+		           position="upper_left", font_size=11, color="black")
+		try:
+			p.enable_surface_point_picking(callback=cb, show_point=False)
+		except Exception:
+			try:
+				p.enable_point_picking(callback=cb, use_picker=True, show_point=False)
+			except Exception as e:
+				print(f"[knee pick] 点ピッキング初期化に失敗: {e}")
+		p.show()
+		return np.array(picked) if picked else np.zeros((0, 3))
+
+	def _knee_register_region(self, src_path: str, tgt_path: str, label: str,
+	                          params: dict, manual_src_pts=None, manual_tgt_pts=None):
+		"""領域どうしを位置合わせし、src→tgt の4x4変換行列を返す。
+
+		params: 骨ごとのパラメータ dict（_knee_get_params 参照。method/enable_scaling/preview含む）。
+		src = 動かす側(モデル側 領域, child), tgt = 合わせる先(初期スキャン側 領域, parent)。
+		Returns: (transform 4x4 np.ndarray, fitness float, rmse float)
+		"""
+		method = params.get("method", "ransac")
+		n = max(int(params.get("sample_points", 100000)), 1000)
+		child_pcd = self._knee_load_o3d_pcd(src_path, n)
+		parent_pcd = self._knee_load_o3d_pcd(tgt_path, n)
+
+		# voxel_size: 手動指定(>0)があれば優先。0なら近傍距離の中央値から自動推定。
+		manual_voxel = 0.0
+		try:
+			manual_voxel = float(params.get("voxel_size", 0.0))
+		except Exception:
+			manual_voxel = 0.0
+		ransac_dist = float(params.get("ransac_distance", 1.0))
+		if manual_voxel > 1e-9:
+			voxel_size = manual_voxel
+		else:
+			try:
+				num_points = len(parent_pcd.points)
+				sample_n = min(500, max(10, num_points))
+				sample_indices = np.random.choice(num_points, sample_n, replace=False)
+				kdt = o3d.geometry.KDTreeFlann(parent_pcd)
+				nn_dists = []
+				for idx in sample_indices:
+					[_, idxs, dists] = kdt.search_knn_vector_3d(parent_pcd.points[idx], 2)
+					if len(dists) >= 2:
+						nn_dists.append(float(np.sqrt(dists[1])))
+				voxel_size = max(float(np.mean(nn_dists)) * 1.5, 1e-6) if nn_dists else max(ransac_dist, 1e-6)
+			except Exception:
+				voxel_size = max(ransac_dist, 1e-6)
+
+		parent_down = parent_pcd.voxel_down_sample(voxel_size)
+		child_down = child_pcd.voxel_down_sample(voxel_size)
+		print(f"[knee reg:{label}] サンプル={len(parent_pcd.points)}/{len(child_pcd.points)}点, "
+		      f"voxel={voxel_size:.4f}mm{'(手動)' if manual_voxel>1e-9 else '(自動)'}, "
+		      f"ダウンサンプル後={len(parent_down.points)}/{len(child_down.points)}点")
+		radius_normal = voxel_size * 2
+		parent_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+		child_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+		scaling = bool(params.get("enable_scaling", False))
+
+		# --- 初期変換の候補を方式ごとに用意 ---
+		init_transforms = []
+		if method == "manual":
+			if manual_src_pts is None or manual_tgt_pts is None or len(manual_src_pts) < 3 or len(manual_tgt_pts) < 3:
+				raise ValueError("手動位置合わせには、モデル側・初期スキャン側それぞれ3点以上の対応点が必要です。")
+			m = min(len(manual_src_pts), len(manual_tgt_pts))
+			init_transforms = [self._rigid_from_correspondences(
+				np.asarray(manual_src_pts)[:m], np.asarray(manual_tgt_pts)[:m], allow_scale=scaling)]
+			print(f"[knee reg:{label}] 手動3点対応から初期変換を計算")
+		elif method == "pca":
+			init_transforms = self._pca_align_candidates(np.asarray(child_down.points), np.asarray(parent_down.points))
+			print(f"[knee reg:{label}] 主軸(PCA)整列: {len(init_transforms)}候補")
+		else:  # ransac
+			radius_feature = voxel_size * 5
+			parent_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+				parent_down, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+			child_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+				child_down, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+			dist_ransac = ransac_dist
+			result_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+				child_down, parent_down, child_fpfh, parent_fpfh,
+				mutual_filter=True,
+				max_correspondence_distance=dist_ransac,
+				estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(scaling),
+				ransac_n=3,
+				checkers=[
+					o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+					o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(dist_ransac),
+				],
+				criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+					int(params.get("ransac_max_iter", 1000)), float(params.get("ransac_confidence", 0.99))),
+			)
+			print(f"[knee reg:{label}] RANSAC fitness={result_ransac.fitness:.6f}, RMSE={result_ransac.inlier_rmse:.6f}")
+			init_transforms = [np.array(result_ransac.transformation, dtype=float)]
+
+		# --- 各初期変換から ICP 精密化し、最良(fitness最大)を採用 ---
+		icp_thresh = float(params.get("icp_threshold", 5.0))
+		icp_iter = int(params.get("icp_max_iter", 2000))
+		best_fit = -1.0
+		best_rmse = float("inf")
+		T = np.eye(4)
+		for T0 in init_transforms:
+			res = o3d.pipelines.registration.registration_icp(
+				child_down, parent_down, icp_thresh, np.asarray(T0, dtype=float),
+				o3d.pipelines.registration.TransformationEstimationPointToPoint(scaling),
+				o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=icp_iter),
+			)
+			if res.fitness > best_fit:
+				best_fit = float(res.fitness)
+				best_rmse = float(res.inlier_rmse)
+				T = np.array(res.transformation, dtype=float)
+		print(f"[knee reg:{label}] ICP(最良) fitness={best_fit:.6f}, RMSE={best_rmse:.6f} "
+		      f"(method={method}, {len(init_transforms)}候補から採用)")
+
+		# 経過表示（任意）: 点群で重ね合わせを表示
+		if bool(params.get("preview", True)):
+			try:
+				r_parent = copy.deepcopy(parent_pcd); r_parent.paint_uniform_color([1.0, 0.0, 0.0])
+				r_child = copy.deepcopy(child_pcd); r_child.transform(T); r_child.paint_uniform_color([0.0, 1.0, 0.0])
+				o3d.visualization.draw_geometries(
+					[r_parent, r_child],
+					window_name=f"位置合わせ後 [{label}]: 初期スキャン領域(赤) + モデル領域(緑)")
+			except Exception as e:
+				print(f"[knee reg:{label}] 経過表示に失敗: {e}")
+
+		return T, best_fit, best_rmse
+
+	def on_knee_register_bone(self, bone: str) -> None:
+		"""指定した骨(大腿骨/脛骨)だけを、その骨のパラメータ・方式で位置合わせする。"""
+		if bone == "femur":
+			model = self.knee_femur_model_path.get().strip()
+			src = self.knee_reg_femur_src_path.get().strip()
+			tgt = self.knee_reg_femur_tgt_path.get().strip()
+			label = "大腿骨"
+		else:
+			model = self.knee_tibia_model_path.get().strip()
+			src = self.knee_reg_tibia_src_path.get().strip()
+			tgt = self.knee_reg_tibia_tgt_path.get().strip()
+			label = "脛骨"
+
+		if not (model and src and tgt):
+			messagebox.showwarning(
+				"入力不足",
+				f"{label}: モデルと位置合わせ領域（モデル側・初期スキャン側）を選択してください。")
+			return
+
+		p = self._knee_get_params(bone)
+		method = p.get("method", "ransac")
+		try:
+			if method == "manual":
+				messagebox.showinfo(
+					"手動3点位置合わせ",
+					f"[{label}] まず『モデル側 領域』で対応点を3つクリックし、ウィンドウを閉じてください。\n"
+					f"次に『初期スキャン側 領域』で、同じ順番・同じ部位の3点をクリックしてください。")
+				src_pts = self._knee_pick_points(pv.read(src), 3, f"{label}: モデル側 領域（対応点3つ）")
+				if len(src_pts) < 3:
+					raise ValueError(f"{label}: モデル側の対応点が3つ未満です（{len(src_pts)}点）。")
+				tgt_pts = self._knee_pick_points(pv.read(tgt), 3, f"{label}: 初期スキャン側 領域（同順で3つ）")
+				if len(tgt_pts) < 3:
+					raise ValueError(f"{label}: 初期スキャン側の対応点が3つ未満です（{len(tgt_pts)}点）。")
+				T, fit, rmse = self._knee_register_region(src, tgt, label, p,
+				                                          manual_src_pts=src_pts, manual_tgt_pts=tgt_pts)
+			else:
+				T, fit, rmse = self._knee_register_region(src, tgt, label, p)
+		except Exception as e:
+			messagebox.showerror("位置合わせエラー", f"{label}の位置合わせに失敗しました:\n{e}")
+			return
+
+		if bone == "femur":
+			self._knee_femur_reg_T = T
+		else:
+			self._knee_tibia_reg_T = T
+
+		messagebox.showinfo(
+			f"{label} 位置合わせ完了",
+			f"{label}の位置合わせが完了しました。\n\n"
+			f"fitness={fit:.4f}（1に近いほど良好）, RMSE={rmse:.4f} mm（小さいほど良好）\n\n"
+			"「位置合わせ結果を確認（大腿骨＋脛骨）」で重ね合わせを確認できます。")
+
+	def on_knee_preview_registration(self) -> None:
+		"""位置合わせ結果（初期スキャン＋整列済み大腿骨・脛骨モデル）を重ねて表示する。"""
+		scan_path = self.knee_initial_scan_path.get().strip()
+		if not scan_path:
+			messagebox.showwarning("入力不足", "初期状態スキャンを選択してください。")
+			return
+		if self._knee_femur_reg_T is None and self._knee_tibia_reg_T is None:
+			messagebox.showwarning("未実行", "先に「位置合わせ実行」を行ってください。")
+			return
+		try:
+			scan_mesh = pv.read(scan_path)
+		except Exception as e:
+			messagebox.showerror("読み込み失敗", f"初期状態スキャンの読み込みに失敗しました:\n{e}")
+			return
+
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="knee: 位置合わせ結果の確認", window_size=(int(sw * 0.9), int(sh * 0.9)))
+		plotter.set_background("white")
+		plotter.add_mesh(scan_mesh, color="lightgray", opacity=0.4, smooth_shading=True)
+
+		def add_registered(model_path, T, color):
+			if not model_path or T is None:
+				return
+			try:
+				m = pv.read(model_path)
+				pts = np.hstack([m.points, np.ones((m.points.shape[0], 1))])
+				m.points = (np.asarray(T) @ pts.T).T[:, :3]
+				plotter.add_mesh(m, color=color, opacity=1.0, smooth_shading=True)
+			except Exception as e:
+				print(f"[knee preview] {color} モデル表示失敗: {e}")
+
+		add_registered(self.knee_femur_model_path.get().strip(), self._knee_femur_reg_T, "burlywood")
+		add_registered(self.knee_tibia_model_path.get().strip(), self._knee_tibia_reg_T, "lightblue")
+		plotter.add_text("初期スキャン(灰) + 大腿骨(整列済,肌色) + 脛骨(整列済,水色)",
+		                 position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	def _knee_apply_T(self, mesh, T):
+		"""pvメッシュに4x4同次変換を適用（in-place）してメッシュを返す。"""
+		if mesh.n_points == 0:
+			return mesh
+		pts = np.hstack([mesh.points, np.ones((mesh.points.shape[0], 1))])
+		mesh.points = (np.asarray(T, dtype=float) @ pts.T).T[:, :3]
+		return mesh
+
+	def _knee_prepare_scene(self, require_models: bool = True) -> dict:
+		"""初期スキャン特徴点から Cf/Ct を構築し、ワールド座標系(Cf=原点)へ整列した
+		大腿骨・脛骨モデルと座標系を準備する。both 静的可視化 と アニメーション で共用。
+
+		Returns dict: A(Cf→world), w_scan, points_world, labels, cf_world, ct_world,
+		              femur_world, tibia_world (require_models=Trueのとき)。
+		エラーは ValueError(メッセージ) で送出。
+		"""
+		scan_path = self.knee_initial_scan_path.get().strip()
+		pp_path = self.knee_initial_pp_path.get().strip()
+		if not pp_path:
+			raise ValueError("初期スキャン特徴点(PP)を選択してください。")
+		points, labels = self._parse_pp_file(pp_path)
+		origin, cfx, cfy, cfz = self._build_knee_femur_frame(points, labels, self.knee_side_var.get())
+		try:
+			w_scan = float(self.knee_w_scan_deg.get())
+		except Exception:
+			w_scan = 0.0
+		t_o, t_x, t_y, t_z = self._build_knee_tibia_frame(origin, cfx, cfy, cfz, w_scan)
+
+		# A: Cf座標系 → ワールド座標系（Cfを原点・単位軸に整列）
+		Rf = np.column_stack([cfx, cfy, cfz])
+		A = np.eye(4)
+		A[:3, :3] = Rf.T
+		A[:3, 3] = -Rf.T @ origin
+
+		# 特徴点をワールドへ
+		pw = np.hstack([points, np.ones((points.shape[0], 1))])
+		points_world = (A @ pw.T).T[:, :3]
+
+		# Ct をワールドへ（原点=0、軸は回転のみ）
+		ct_axes_world = (Rf.T @ np.column_stack([t_x, t_y, t_z]))
+		ct_world = (np.array([0.0, 0.0, 0.0]), ct_axes_world[:, 0], ct_axes_world[:, 1], ct_axes_world[:, 2])
+		cf_world = (np.array([0.0, 0.0, 0.0]), np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0]))
+
+		result = {"A": A, "w_scan": w_scan, "points_world": points_world, "labels": labels,
+		          "cf_world": cf_world, "ct_world": ct_world}
+
+		if require_models:
+			femur_path = self.knee_femur_model_path.get().strip()
+			tibia_path = self.knee_tibia_model_path.get().strip()
+			if not femur_path or not tibia_path:
+				raise ValueError("大腿骨モデルと脛骨モデルを選択してください。")
+			if self._knee_femur_reg_T is None or self._knee_tibia_reg_T is None:
+				raise ValueError("先に③「位置合わせ実行」で大腿骨・脛骨を初期スキャンへ整列してください。")
+			femur = pv.read(femur_path)
+			tibia = pv.read(tibia_path)
+			# モデル → 初期スキャン座標系(reg) → ワールド(A)
+			self._knee_apply_T(femur, A @ np.asarray(self._knee_femur_reg_T))
+			self._knee_apply_T(tibia, A @ np.asarray(self._knee_tibia_reg_T))
+			result["femur_world"] = femur
+			result["tibia_world"] = tibia
+		return result
+
+	def _knee_draw_frame(self, plotter, o, ax, ay, az, prefix, axis_len, solid=True):
+		"""PyVistaに座標系(3軸)を描画する。"""
+		for vec, col, name in [(ax, "red", f"{prefix}X"), (ay, "green", f"{prefix}Y"), (az, "blue", f"{prefix}Z")]:
+			end = o + np.asarray(vec) * axis_len
+			plotter.add_mesh(pv.Line(o, end), color=col, line_width=(5 if solid else 2))
+			plotter.add_point_labels([end], [name], font_size=13, text_color=col,
+			                         point_size=1, show_points=False, always_visible=True)
+
+	def on_knee_visualize_all(self) -> None:
+		"""大腿骨・脛骨モデル（位置合わせ済み）と Cf/Ct を全体可視化する。"""
+		try:
+			scene = self._knee_prepare_scene(require_models=True)
+		except Exception as e:
+			messagebox.showwarning("全体可視化", str(e))
+			return
+
+		femur = scene["femur_world"]; tibia = scene["tibia_world"]
+		try:
+			b = np.array(femur.bounds).reshape(3, 2)
+			diag = float(np.linalg.norm(b[:, 1] - b[:, 0]))
+			axis_len = max(diag * 0.15, 10.0)
+		except Exception:
+			axis_len = 40.0
+
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="knee: 関節全体（位置合わせ済み + Cf/Ct）",
+		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
+		plotter.set_background("white")
+		plotter.add_mesh(femur, color="burlywood", opacity=1.0, smooth_shading=True, show_edges=False)
+		plotter.add_mesh(tibia, color="lightblue", opacity=1.0, smooth_shading=True, show_edges=False)
+
+		# 特徴点
+		named = self._knee_named_points(scene["points_world"], scene["labels"])
+		colors = {"MCL": "red", "LCL": "blue", "L": "green", "M": "orange", "N": "purple"}
+		for name, col in colors.items():
+			if name in named:
+				plotter.add_mesh(pv.Sphere(radius=max(axis_len * 0.04, 1.0), center=named[name]), color=col)
+
+		cfo, cfx, cfy, cfz = scene["cf_world"]
+		self._knee_draw_frame(plotter, cfo, cfx, cfy, cfz, "Cf_", axis_len, solid=True)
+		if abs(scene["w_scan"]) > 1e-6:
+			cto, ctx, cty, ctz = scene["ct_world"]
+			self._knee_draw_frame(plotter, cto, ctx, cty, ctz, "Ct_", axis_len, solid=False)
+
+		plotter.add_text("大腿骨(肌色) + 脛骨(水色) / Cf: X=red Y=green Z=blue（Ctは細線）",
+		                 position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	def on_knee_animate(self) -> None:
+		"""変位・姿勢変化データに沿って脛骨を動かすシミュレーション（共通コアを利用）。
+
+		大腿骨(Cf)固定・脛骨を fmTtb(Θ(t)) で駆動する。脛骨メッシュの初期配置からは
+		スキャン時屈曲 fmTtb(FE=W_scan) を差し引く（ヒト膝 W=0 で恒等）。
+		実際のアニメ/ヒートマップ描画は hip と共通の on_animate エンジンを再利用する。
+		"""
+		transform_path = self.knee_transform_path.get().strip()
+		if not transform_path:
+			messagebox.showwarning("シミュレーション", "変位・姿勢変化データ(xlsx/kkr)を選択してください。")
+			return
+		try:
+			scene = self._knee_prepare_scene(require_models=True)
+		except Exception as e:
+			messagebox.showwarning("シミュレーション", str(e))
+			return
+		try:
+			transform_data = self._load_transform_matrices(transform_path)
+			if not transform_data:
+				messagebox.showerror("エラー", "変位・姿勢変化データが空です。")
+				return
+		except Exception as e:
+			messagebox.showerror("読み込み失敗", f"変位・姿勢変化データの読み込みに失敗しました:\n{e}")
+			return
+
+		femur = scene["femur_world"]
+		tibia = scene["tibia_world"]
+
+		# 脛骨の初期配置から W_scan ぶんの屈曲を差し引く: fmTtb(FE=W_scan)^-1
+		# （transform_data の絶対屈曲 FE(t) がそのまま脛骨姿勢になる。ヒト膝 W=0 で恒等。
+		#   後で on_animate が同じ fmTtb を再適用するので符号規約に依存せず自己整合する）
+		w_scan = scene["w_scan"]
+		if abs(w_scan) > 1e-9:
+			T_wscan = self._build_transform_matrix(w_scan, 0.0, 0.0, 0.0, 0.0, 0.0)
+			self._knee_apply_T(tibia, np.linalg.inv(T_wscan))
+
+		# --- hip 共通の on_animate エンジンをそのまま再利用（アダプタ方式・hip側は無改変） ---
+		# ワールド整列済みの大腿骨(prox)/脛骨(dist)を一時STLに書き出し、hipの座標系ビルダーが
+		# 「単位座標系」を返す特徴点(pp)を合成して与える。こうすると on_animate 内の座標変換が
+		# 恒等になり、準備済みメッシュをそのまま変位データで動かせる（=同じ描画/ヒートマップ資産）。
+		import tempfile, shutil
+		tmpdir = Path(tempfile.mkdtemp(prefix="frs_knee_anim_"))
+
+		def _radius_of(mesh):
+			try:
+				b = np.array(mesh.bounds).reshape(3, 2)
+				return max(float(np.linalg.norm(b[:, 1] - b[:, 0])) * 0.5, 20.0)
+			except Exception:
+				return 60.0
+
+		try:
+			femur_stl = tmpdir / "femur_world.stl"
+			tibia_stl = tmpdir / "tibia_world.stl"
+			femur.triangulate().save(str(femur_stl))
+			tibia.triangulate().save(str(tibia_stl))
+			# 単位座標系を生む特徴点（hipビルダーで identity を返すことを検証済み）
+			prox_abcd = tmpdir / "prox_abcd.pp"; prox_olmn = tmpdir / "prox_olmn.pp"
+			dist_abc = tmpdir / "dist_abc.pp"; dist_olmn = tmpdir / "dist_olmn.pp"
+			self._knee_write_pp(prox_abcd, [((0, 0, 1), "A"), ((0, 0, 0), "B"), ((-1, 0, 0.5), "C"), ((-1, 0, 0.5), "D")])
+			self._knee_write_pp(prox_olmn, [((0, 0, 0), "O"), ((1, 0, 0), "L"), ((0, 1, 0), "M"), ((0, 0, 1), "N")])
+			self._knee_write_pp(dist_abc, [((0, -0.001, 1), "A"), ((0, -0.001, 0), "B")])
+			self._knee_write_pp(dist_olmn, [((0, 0, 0), "O"), ((1, 0, 0), "L"), ((0, 1, 0), "M"), ((0, 0, 1), "N")])
+		except Exception as e:
+			try:
+				shutil.rmtree(tmpdir)
+			except Exception:
+				pass
+			messagebox.showerror("準備失敗", f"アニメーション用データの準備に失敗しました:\n{e}")
+			return
+
+		# 現在の hip 側状態を退避（on_animate 実行中だけ差し替え、終了後に必ず復元）
+		saved = {}
+		save_names = (
+			"joint_var", "prox_model_path", "prox_pp_abcd_path", "prox_pp_olmn_path",
+			"dist_model_path", "dist_pp_abc_path", "dist_pp_olmn_path", "transform_group_path",
+			"prox_cartilage_model_path", "dist_cartilage_model_path",
+			"prox_offset_x", "prox_offset_y", "prox_offset_z",
+			"dist_offset_x", "dist_offset_y", "dist_offset_z",
+			"prox_radius", "dist_radius", "show_ao_angle",
+		)
+		for nm in save_names:
+			try:
+				saved[nm] = getattr(self, nm).get()
+			except Exception:
+				pass
+		saved_prox_color = getattr(self, "prox_color", None)
+		saved_dist_color = getattr(self, "dist_color", None)
+		try:
+			self.joint_var.set(1)  # hip 座標系ビルダーを使用
+			self.prox_model_path.set(str(femur_stl))
+			self.prox_pp_abcd_path.set(str(prox_abcd))
+			self.prox_pp_olmn_path.set(str(prox_olmn))
+			self.dist_model_path.set(str(tibia_stl))
+			self.dist_pp_abc_path.set(str(dist_abc))
+			self.dist_pp_olmn_path.set(str(dist_olmn))
+			self.transform_group_path.set(transform_path)
+			self.prox_cartilage_model_path.set("")
+			self.dist_cartilage_model_path.set("")
+			for v in (self.prox_offset_x, self.prox_offset_y, self.prox_offset_z,
+			          self.dist_offset_x, self.dist_offset_y, self.dist_offset_z):
+				v.set(0.0)
+			self.prox_radius.set(_radius_of(femur))
+			self.dist_radius.set(_radius_of(tibia))
+			self.show_ao_angle.set(False)
+			self.prox_color = "#DEB887"  # 大腿骨=肌色
+			self.dist_color = "#ADD8E6"  # 脛骨=水色
+			# hip 共通エンジンを起動（モーダル：ウィンドウを閉じるまでブロック）
+			self.on_animate()
+		finally:
+			for nm, val in saved.items():
+				try:
+					getattr(self, nm).set(val)
+				except Exception:
+					pass
+			if saved_prox_color is not None:
+				self.prox_color = saved_prox_color
+			if saved_dist_color is not None:
+				self.dist_color = saved_dist_color
+			try:
+				shutil.rmtree(tmpdir)
+			except Exception:
+				pass
+
+	def _knee_write_pp(self, path, entries) -> None:
+		"""特徴点を PickedPoints XML 形式で書き出す。entries: [((x,y,z), label), ...]。"""
+		root = ET.Element('PickedPoints')
+		for (x, y, z), lab in entries:
+			e = ET.SubElement(root, 'point')
+			e.set('x', f"{float(x):.8f}")
+			e.set('y', f"{float(y):.8f}")
+			e.set('z', f"{float(z):.8f}")
+			e.set('active', "1")
+			e.set('name', str(lab))
+		ET.ElementTree(root).write(str(path), encoding="utf-8", xml_declaration=True)
+	# endregion knee simulator
 
 	def _create_org_tab(self) -> None:
 		"""ORGタブのUIを構築"""
@@ -7786,6 +8882,9 @@ class MainMenuGUI(_BaseWindow):
 			command=skip_computation
 		)
 		skip_button.pack(side=tk.LEFT, padx=5)
+
+		# ウィンドウの×で閉じられた場合は「計算せずに進む」と同じ扱い（計算を始めない）
+		progress_window.protocol("WM_DELETE_WINDOW", skip_computation)
 		
 		# キャンセルボタン
 		def cancel_computation():
@@ -7818,9 +8917,11 @@ class MainMenuGUI(_BaseWindow):
 		y = (progress_window.winfo_screenheight() // 2) - (progress_window.winfo_height() // 2)
 		progress_window.geometry(f"+{x}+{y}")
 
-		# 自動スタート（ポップアップ表示後すぐに計算開始）
-		progress_window.after(200, start_computation)
-		
+		# ※ 自動スタートはしない。ユーザーが FEM/ヒートマップ等のオプションを設定してから
+		#   「計算開始」または「計算せずに進む」を押すまで待機する。
+		#   （以前はここで after(200, start_computation) により即時開始していたため、
+		#     FEM事前計算などをオフにできなかった。）
+
 		options_dict = {
 			'use_parallel': use_parallel_var,
 			'use_cache': use_cache_var,
@@ -11119,8 +12220,8 @@ class MainMenuGUI(_BaseWindow):
 			fem_pressure_precomputed = []  # FEM接触圧リスト
 			prox_fem_surface = None  # FEM近位表面メッシュ
 
-			if skip_var.get():
-				# 事前計算をスキップ
+			if skip_var.get() or not start_var.get():
+				# 事前計算をスキップ（「計算せずに進む」/×閉じ/未開始のいずれも計算しない）
 				try:
 					progress_window.destroy()
 				except:
@@ -13112,6 +14213,100 @@ class MainMenuGUI(_BaseWindow):
 		else:
 			return Path(__file__).with_name(filename)
 
+	# ----- knee simulator 専用の状態保存（hipの関節ラジオと独立） -----
+	def _knee_state_file_path(self) -> Path:
+		"""knee simulator タブ専用の状態ファイルパス。"""
+		import platform
+		filename = "frs2015_gui_state_knee_sim.json"
+		if platform.system() == "Darwin":
+			state_dir = Path.home() / ".frs_simulator"
+			state_dir.mkdir(parents=True, exist_ok=True)
+			return state_dir / filename
+		return Path(__file__).with_name(filename)
+
+	def _knee_state_vars(self) -> dict:
+		"""保存/復元する knee 変数を {キー: (var, 型)} で返す。"""
+		d = {
+			"knee_initial_scan": (self.knee_initial_scan_path, str),
+			"knee_initial_pp": (self.knee_initial_pp_path, str),
+			"knee_femur_model": (self.knee_femur_model_path, str),
+			"knee_tibia_model": (self.knee_tibia_model_path, str),
+			"knee_transform": (self.knee_transform_path, str),
+			"knee_reg_femur_src": (self.knee_reg_femur_src_path, str),
+			"knee_reg_femur_tgt": (self.knee_reg_femur_tgt_path, str),
+			"knee_reg_tibia_src": (self.knee_reg_tibia_src_path, str),
+			"knee_reg_tibia_tgt": (self.knee_reg_tibia_tgt_path, str),
+			"knee_side": (self.knee_side_var, int),
+			"knee_w_scan_deg": (self.knee_w_scan_deg, float),
+		}
+		# 骨ごとの位置合わせパラメータ・方式・プリセット選択
+		for bone in ("femur", "tibia"):
+			for key, kind, default, _lbl in self._knee_param_spec():
+				d[f"knee_{bone}_{key}"] = (self.knee_reg_pvars[bone][key], int if kind == "int" else float)
+			d[f"knee_{bone}_method"] = (self.knee_reg_method_var[bone], str)
+			d[f"knee_{bone}_scaling"] = (self.knee_reg_scaling_var[bone], bool)
+			d[f"knee_{bone}_preview"] = (self.knee_reg_preview_var[bone], bool)
+			d[f"knee_{bone}_preset_sel"] = (self.knee_preset_sel[bone], str)
+		return d
+
+	def _save_knee_state(self) -> None:
+		"""knee simulator の入力値・パラメータを専用ファイルへ保存する。"""
+		data = {}
+		for key, (var, _typ) in self._knee_state_vars().items():
+			try:
+				data[key] = var.get()
+			except Exception:
+				pass
+		# 位置合わせ結果(4x4変換行列)も保存し、次回起動時に再位置合わせ不要にする
+		try:
+			data["_femur_reg_T"] = self._knee_femur_reg_T.tolist() if self._knee_femur_reg_T is not None else None
+		except Exception:
+			data["_femur_reg_T"] = None
+		try:
+			data["_tibia_reg_T"] = self._knee_tibia_reg_T.tolist() if self._knee_tibia_reg_T is not None else None
+		except Exception:
+			data["_tibia_reg_T"] = None
+		try:
+			p = self._knee_state_file_path()
+			with p.open("w", encoding="utf-8") as f:
+				json.dump(data, f, ensure_ascii=False, indent=2)
+			print(f"[knee状態保存] {p}")
+		except Exception as e:
+			print(f"[knee状態保存] 失敗: {e}")
+
+	def _load_knee_state(self) -> None:
+		"""knee simulator の入力値・パラメータを専用ファイルから復元する。"""
+		try:
+			p = self._knee_state_file_path()
+			if not p.exists():
+				return
+			data = json.load(p.open("r", encoding="utf-8"))
+		except Exception as e:
+			print(f"[knee状態復元] 失敗: {e}")
+			return
+		for key, (var, typ) in self._knee_state_vars().items():
+			if key not in data:
+				continue
+			try:
+				val = data[key]
+				if typ is bool:
+					var.set(bool(val))
+				elif typ is int:
+					var.set(int(val))
+				elif typ is float:
+					var.set(float(val))
+				else:
+					var.set(str(val))
+			except Exception:
+				pass
+		# 位置合わせ結果(4x4変換行列)を復元
+		for key, attr in (("_femur_reg_T", "_knee_femur_reg_T"), ("_tibia_reg_T", "_knee_tibia_reg_T")):
+			if data.get(key) is not None:
+				try:
+					setattr(self, attr, np.array(data[key], dtype=float))
+				except Exception:
+					pass
+
 	# パス系（関節依存）の状態キー一覧
 	_JOINT_PATH_KEYS = (
 		"prox_model", "prox_pp_abcd", "prox_pp_olmn",
@@ -13622,6 +14817,7 @@ class MainMenuGUI(_BaseWindow):
 
 	def _on_close(self) -> None:
 		self._save_state()
+		self._save_knee_state()
 		self.destroy()
 	
 	def _save_initial_geometry(self) -> None:

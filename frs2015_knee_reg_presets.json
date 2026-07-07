@@ -1,0 +1,26 @@
+{
+  "preset1": {
+    "ransac_distance": 3.0,
+    "ransac_max_iter": 1000,
+    "ransac_confidence": 0.99,
+    "icp_threshold": 3.0,
+    "icp_max_iter": 2000,
+    "sample_points": 80000,
+    "voxel_size": 0.0,
+    "method": "pca",
+    "enable_scaling": false,
+    "preview": true
+  },
+  "preset2": {
+    "ransac_distance": 3.0,
+    "ransac_max_iter": 1000,
+    "ransac_confidence": 0.99,
+    "icp_threshold": 3.0,
+    "icp_max_iter": 2000,
+    "sample_points": 80000,
+    "voxel_size": 0.0,
+    "method": "pca",
+    "enable_scaling": false,
+    "preview": true
+  }
+}
