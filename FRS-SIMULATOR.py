@@ -900,6 +900,24 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(sim_frame, text="シミュレーション実行", command=self.on_knee_animate
 		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 8))
 
+		# Section: シーン共有（別PC＝解析サーバーで計算するため）
+		scene_frame = ttk.LabelFrame(container, text="⑤ シーン共有（サーバーで計算 → gitでキャッシュ共有）", style="Bold.TLabelframe")
+		scene_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
+		scene_frame.columnconfigure(0, weight=1)
+		sbtn = ttk.Frame(scene_frame)
+		sbtn.grid(row=0, column=0, sticky="w", padx=12, pady=(4, 2))
+		ttk.Button(sbtn, text="シーンを保存（reg_T等を書出し）", command=self.on_knee_scene_save
+		           ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+		ttk.Button(sbtn, text="シーンを読込（reg_T等を復元）", command=self.on_knee_scene_load
+		           ).grid(row=0, column=1, sticky="w")
+		ttk.Label(scene_frame,
+		          text="位置合わせ結果(reg_T)・W_scan・左右を cache/knee_scene.json に保存/復元します。\n"
+		               "運用: ①Windowsで位置合わせ→「シーンを保存」→git push ②サーバーで同じモデルを開き\n"
+		               "「シーンを読込」→シミュレーション実行(重い計算)→git push ③Windowsでpull→表示は\n"
+		               "キャッシュ即読込(再計算なし)。※両PCで同じモデル/特徴点ファイル(内容一致)が必要。",
+		          foreground="gray", font=(self.ui_font_family, 8), justify="left"
+		          ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+
 	def _knee_choose(self, var: tk.StringVar, title: str, kind: str) -> None:
 		"""knee simulator用の共通ファイル選択ダイアログ。kind: 'model' | 'pp' | 'transform'."""
 		if kind == "pp":
@@ -1579,6 +1597,113 @@ class MainMenuGUI(_BaseWindow):
 		plotter.add_text("初期スキャン(灰) + 大腿骨(整列済,肌色) + 脛骨(整列済,水色)",
 		                 position="upper_left", font_size=10, color="black")
 		plotter.show()
+
+	# ----- Knee scene sharing (別PC=解析サーバーとキャッシュ整合させるため) -----
+	def _knee_scene_file(self) -> Path:
+		"""シーン共有ファイル cache/knee_scene.json のパス（git追跡）。"""
+		d = Path(__file__).parent / "cache"
+		d.mkdir(parents=True, exist_ok=True)
+		return d / "knee_scene.json"
+
+	def _file_content_hash(self, path: str) -> str:
+		"""ファイル内容(バイト列)のSHA-256短縮ハッシュ。未存在/失敗は空文字。"""
+		try:
+			p = Path(path)
+			if not p.exists():
+				return ""
+			h = hashlib.sha256()
+			with p.open("rb") as f:
+				for chunk in iter(lambda: f.read(1 << 20), b""):
+					h.update(chunk)
+			return h.hexdigest()[:16]
+		except Exception:
+			return ""
+
+	def on_knee_scene_save(self) -> None:
+		"""位置合わせ結果(reg_T)・W_scan・左右をシーン共有ファイルへ書き出す。"""
+		if self._knee_femur_reg_T is None and self._knee_tibia_reg_T is None:
+			messagebox.showwarning("シーン保存", "先に位置合わせを行ってください（reg_Tがありません）。")
+			return
+		try:
+			w_scan = float(self.knee_w_scan_deg.get())
+		except Exception:
+			w_scan = 0.0
+		data = {
+			"version": 1,
+			"w_scan_deg": w_scan,
+			"side": int(self.knee_side_var.get()),
+			"femur_reg_T": self._knee_femur_reg_T.tolist() if self._knee_femur_reg_T is not None else None,
+			"tibia_reg_T": self._knee_tibia_reg_T.tolist() if self._knee_tibia_reg_T is not None else None,
+			# 内容一致確認用（別PCで同じモデル/特徴点かを警告するため。パスではなく中身のハッシュ）
+			"hash_initial_pp": self._file_content_hash(self.knee_initial_pp_path.get().strip()),
+			"hash_femur_model": self._file_content_hash(self.knee_femur_model_path.get().strip()),
+			"hash_tibia_model": self._file_content_hash(self.knee_tibia_model_path.get().strip()),
+			"saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+		}
+		try:
+			p = self._knee_scene_file()
+			with p.open("w", encoding="utf-8") as f:
+				json.dump(data, f, ensure_ascii=False, indent=2)
+		except Exception as e:
+			messagebox.showerror("シーン保存", f"保存に失敗しました:\n{e}")
+			return
+		messagebox.showinfo(
+			"シーン保存",
+			f"シーンを保存しました:\n{p}\n\n"
+			"このファイルを git commit/push すると、別PC(サーバー)で「シーンを読込」して\n"
+			"同じ位置合わせ結果で計算できます。")
+
+	def on_knee_scene_load(self) -> None:
+		"""シーン共有ファイルから reg_T・W_scan・左右を復元する（別PCでの計算整合用）。"""
+		p = self._knee_scene_file()
+		if not p.exists():
+			messagebox.showwarning("シーン読込", f"シーン共有ファイルが見つかりません:\n{p}\n\n"
+			                        "先に位置合わせ済みのPCで「シーンを保存」→git共有してください。")
+			return
+		try:
+			data = json.load(p.open("r", encoding="utf-8"))
+		except Exception as e:
+			messagebox.showerror("シーン読込", f"読み込みに失敗しました:\n{e}")
+			return
+		# reg_T / W_scan / side を復元
+		try:
+			self.knee_w_scan_deg.set(float(data.get("w_scan_deg", 0.0)))
+		except Exception:
+			pass
+		try:
+			s = int(data.get("side", 1))
+			if s in (1, 2):
+				self.knee_side_var.set(s)
+		except Exception:
+			pass
+		self._knee_femur_reg_T = np.array(data["femur_reg_T"], dtype=float) if data.get("femur_reg_T") is not None else None
+		self._knee_tibia_reg_T = np.array(data["tibia_reg_T"], dtype=float) if data.get("tibia_reg_T") is not None else None
+
+		# 内容一致チェック（別PCで違うモデル/特徴点を開いていないか警告）
+		warns = []
+		checks = [
+			("初期スキャン特徴点(PP)", "hash_initial_pp", self.knee_initial_pp_path.get().strip()),
+			("大腿骨モデル", "hash_femur_model", self.knee_femur_model_path.get().strip()),
+			("脛骨モデル", "hash_tibia_model", self.knee_tibia_model_path.get().strip()),
+		]
+		for name, key, path in checks:
+			saved_h = data.get(key, "")
+			if not saved_h:
+				continue
+			cur_h = self._file_content_hash(path) if path else ""
+			if not cur_h:
+				warns.append(f"・{name}: 未選択（同じファイルを選んでください）")
+			elif cur_h != saved_h:
+				warns.append(f"・{name}: 内容が保存時と異なります（別ファイルの可能性）")
+
+		msg = "シーンを読み込みました（reg_T・W_scan・左右を復元）。\n"
+		if warns:
+			msg += ("\n⚠ 以下は保存時と一致しません。キャッシュが当たらない/ズレる可能性があります:\n"
+			        + "\n".join(warns)
+			        + "\n\n両PCで同じ内容のモデル/特徴点ファイルを開いてください。")
+		else:
+			msg += "\nモデル/特徴点の内容一致を確認しました。このまま計算/表示できます。"
+		messagebox.showinfo("シーン読込", msg)
 
 	def _knee_apply_T(self, mesh, T):
 		"""pvメッシュに4x4同次変換を適用（in-place）してメッシュを返す。"""
@@ -8214,10 +8339,18 @@ class MainMenuGUI(_BaseWindow):
 				nas_file = scm._nas_dir / f"overlap_{cache_hash}.pkl"
 				return nas_file  # 存在有無にかかわらずNASパスを返す
 
-		# NAS未設定時はローカルキャッシュ
-		cache_dir = Path(__file__).parent / ".overlap_cache"
-		cache_dir.mkdir(exist_ok=True)
-		return cache_dir / f"overlap_{cache_hash}.pkl"
+		# NAS未設定時は git 管理下の共有キャッシュ（cache/overlap/）を使う。
+		# 内容ベースのハッシュキーなので、サーバーで計算→git push→他PCでpull すれば
+		# 同じデータに対して同じファイルが見つかり、再計算なしで表示できる。
+		cache_dir = Path(__file__).parent / "cache" / "overlap"
+		cache_dir.mkdir(parents=True, exist_ok=True)
+		new_path = cache_dir / f"overlap_{cache_hash}.pkl"
+		# 後方互換: 旧 .overlap_cache/ に既存キャッシュがあれば読めるようにする（保存は新フォルダ）
+		if not new_path.exists():
+			old_path = Path(__file__).parent / ".overlap_cache" / f"overlap_{cache_hash}.pkl"
+			if old_path.exists():
+				return old_path
+		return new_path
 
 	def _save_overlap_cache(self, cache_filepath, overlap_meshes, overlap_areas, overlap_depths, heatmap_meshes=None):
 		"""オーバーラップデータとヒートマップをキャッシュファイルに保存
@@ -8734,7 +8867,7 @@ class MainMenuGUI(_BaseWindow):
 		use_cache_var = tk.BooleanVar(value=True)
 		use_bbox_var = tk.BooleanVar(value=True)
 		use_simplify_var = tk.BooleanVar(value=True)
-		enable_fem_precompute_var = tk.BooleanVar(value=True if (_HAS_FEM and has_cartilage) else False)  # FEM事前計算
+		enable_fem_precompute_var = tk.BooleanVar(value=False)  # FEM事前計算（デフォルトOFF。必要時のみチェック）
 		
 		# タイトル
 		title_label = ttk.Label(
@@ -10238,7 +10371,31 @@ class MainMenuGUI(_BaseWindow):
 		"""
 		n_vertices = len(vertices)
 		print(f"  元の頂点数: {n_vertices}")
-		
+
+		# --- GPU一括計算パス（GPUがある場合のみ。厳密な点→三角形距離） ---
+		# GPUがあれば全頂点を一括計算（サンプリング/補間不要）。CPUのみの環境では
+		# 全対比較(O(N×M))は不利なので、従来のVTK逐次パスにフォールバックする。
+		try:
+			import frs_gpu
+			if frs_gpu.has_torch() and frs_gpu.get_device() in ("cuda", "mps"):
+				parent_tri = parent_mesh
+				if not isinstance(parent_tri, pv.PolyData):
+					parent_tri = parent_tri.extract_surface()
+				parent_tri = parent_tri.triangulate()
+				pverts = np.asarray(parent_tri.points, dtype=np.float64)
+				pfaces_raw = np.asarray(parent_tri.faces)
+				if pfaces_raw.size >= 4:
+					pfaces = pfaces_raw.reshape(-1, 4)[:, 1:4].astype(np.int64)
+					print(f"  [GPU] {frs_gpu.device_info()} で全{n_vertices}点を一括距離計算（三角形{len(pfaces)}）")
+					d_gpu = frs_gpu.point_to_mesh_distance(np.asarray(vertices, dtype=np.float64), pverts, pfaces, batch=1024)
+					if d_gpu is not None and len(d_gpu) == n_vertices:
+						if progress_callback:
+							progress_callback(100.0)
+						print("  ✓ GPU距離計算完了")
+						return d_gpu
+		except Exception as e:
+			print(f"  [GPU] 失敗のためCPUにフォールバック: {e}")
+
 		# サンプリング比率を計算
 		if n_vertices > max_sample_points:
 			sample_rate = max_sample_points / n_vertices

@@ -9,3 +9,9 @@ frs2015_gui_state.json
 .DS_Store
 .vscode/
 *.test_cache/
+
+# cache/ は git で共有する（サーバーで計算→push→他PCでpull して表示）ため無視しない。
+# 巨大になりやすいので、FEM/オーバーラップ事前計算はオフのまま（ヒートマップのみ）にして
+# 1データセットあたり数MB程度に収めることを推奨。必要なら Git LFS の利用を検討。
+!cache/
+!cache/**

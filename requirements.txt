@@ -18,3 +18,10 @@ matplotlib>=3.5
 
 # --- ドラッグ&ドロップ（任意。未導入でもファイル選択は可能） ---
 tkinterdnd2>=0.3.0
+
+# --- GPU高速化（任意。未導入ならCPUで従来どおり動作） ---
+# 解析サーバー(Ubuntu + NVIDIA)では CUDA版を入れると、ヒートマップ計算をGPUで高速化:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# CPUのみ(Windows/Mac ノート等)は不要（キャッシュ表示のみ）。入れる場合:
+#   pip install torch
+torch  # optional

@@ -3,7 +3,7 @@
   "knee_initial_pp": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/260703_knee_test/scan_picked_points.pp",
   "knee_femur_model": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/260703_femur/femur_for_view.stl",
   "knee_tibia_model": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/260703_tibia/tibia_for_view.stl",
-  "knee_transform": "",
+  "knee_transform": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/IE_FE30                       0000000005.KKR",
   "knee_reg_femur_src": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/260703_femur/femur_region.stl",
   "knee_reg_femur_tgt": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/260703_knee_test/scan_femur_region.stl",
   "knee_reg_tibia_src": "C:/Users/yutas/Box/【学外共有可能】21142114_坂本　悠太/1_Research/1-2_Experiments/260706_ブタ試験_可視化に向け1回目/260703_tibia/tibia_region.stl",
@@ -31,5 +31,57 @@
   "knee_tibia_method": "pca",
   "knee_tibia_scaling": false,
   "knee_tibia_preview": true,
-  "knee_tibia_preset_sel": "preset2"
+  "knee_tibia_preset_sel": "preset2",
+  "_femur_reg_T": [
+    [
+      0.04405618111498685,
+      -0.33082965101895473,
+      0.9426615484426264,
+      -443.4943539862303
+    ],
+    [
+      -0.7965585156598258,
+      0.5578544496573061,
+      0.23300846363890804,
+      -92.34362819375164
+    ],
+    [
+      -0.6029540480296856,
+      -0.761150546872447,
+      -0.23894823908200902,
+      667.8222939001588
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "_tibia_reg_T": [
+    [
+      0.856588123676772,
+      0.4955473203990061,
+      -0.14383893638821135,
+      -37.986082836465556
+    ],
+    [
+      0.36953960254901336,
+      -0.3945841449175478,
+      0.8412751242771983,
+      -512.6073418335458
+    ],
+    [
+      0.36013506983330695,
+      -0.7737804635845186,
+      -0.5211204521520012,
+      721.3203680708633
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ]
 }
