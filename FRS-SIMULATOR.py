@@ -12473,25 +12473,24 @@ class MainMenuGUI(_BaseWindow):
 								vtk_original_output = vtk.vtkOutputWindow.GetInstance()
 								vtk.vtkOutputWindow.SetInstance(vtk_error_output)
 
-								# --- GPUがある場合は符号付き距離を一括GPU計算（VTK implicit と一致・大幅高速化） ---
-								_use_gpu_heatmap = False
+								# --- 符号付き距離を Open3D BVH で一括高速計算（VTK implicit と一致・大幅高速化） ---
+								# BVHにより O(N log M)。GPU総当たりやVTK per-frame より桁違いに速く、追加ライブラリ不要。
+								_use_fast_heatmap = False
 								try:
-									import frs_gpu
-									if frs_gpu.has_torch() and frs_gpu.get_device() in ("cuda", "mps"):
-										print(f"[GPU] {frs_gpu.device_info()} でヒートマップ{len(transform_data)}フレームを一括計算します")
-										heatmap_precomputed = self._precompute_heatmaps_gpu(
-											prox_joint_region, dist_surface, prox_points, transform_data,
-											update_progress, cancel_var)
-										_use_gpu_heatmap = True
-										print(f"[GPU] ヒートマップ {len(heatmap_precomputed)}フレーム計算完了")
+									print(f"[高速] Open3D BVH でヒートマップ{len(transform_data)}フレームを一括計算します")
+									heatmap_precomputed = self._precompute_heatmaps_o3d(
+										prox_joint_region, dist_surface, prox_points, transform_data,
+										update_progress, cancel_var)
+									_use_fast_heatmap = True
+									print(f"[高速] ヒートマップ {len(heatmap_precomputed)}フレーム計算完了")
 								except Exception as e:
-									print(f"[GPU] ヒートマップGPU計算に失敗、CPUにフォールバック: {e}")
-									_use_gpu_heatmap = False
+									print(f"[高速] Open3D計算に失敗、CPU逐次にフォールバック: {e}")
+									_use_fast_heatmap = False
 									heatmap_precomputed = []
 
 								try:
-									if _use_gpu_heatmap:
-										pass  # 既にGPUで計算済み
+									if _use_fast_heatmap:
+										pass  # 既に高速パスで計算済み
 									elif use_parallel_heatmap:
 										# Phase 3: スレッド並列処理でヒートマップを計算（GIL制約あるが、I/O待機が多いため有効）
 										from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15222,6 +15221,62 @@ class MainMenuGUI(_BaseWindow):
 				fallback = pv.PolyData(np.array([[0.0, 0.0, 0.0]]))
 				fallback['distance'] = np.array([100.0])
 			return fallback
+
+	def _precompute_heatmaps_o3d(self, prox_joint_region, dist_surface, prox_points, transform_data,
+	                             update_progress, cancel_var):
+		"""全フレームの符号付き距離ヒートマップを Open3D の BVH(RaycastingScene) で高速計算する。
+
+		BVHにより O(N log M) で、GPU総当たり(O(N×M))やVTK per-frameより大幅に高速。
+		剛体不変性を利用し、遠位メッシュ(固定)にシーンを一度だけ構築し、近位点を各フレームの
+		inv(T_f) で逆変換してまとめて問い合わせる。値は VTK compute_implicit_distance と一致。
+
+		Returns: フレームごとの pv.PolyData(prox領域 + 'distance') のリスト。
+		"""
+		import open3d as o3d
+		# 遠位表面の三角形（固定・元姿勢）でシーンを1回だけ構築
+		dm = dist_surface
+		if not isinstance(dm, pv.PolyData):
+			dm = dm.extract_surface()
+		dm = dm.triangulate()
+		dverts = np.asarray(dm.points, dtype=np.float32)
+		dfaces_raw = np.asarray(dm.faces)
+		if dfaces_raw.size < 4:
+			raise ValueError("遠位メッシュに三角形がありません")
+		dfaces = dfaces_raw.reshape(-1, 4)[:, 1:4].astype(np.int32)
+		scene = o3d.t.geometry.RaycastingScene()
+		scene.add_triangles(o3d.t.geometry.TriangleMesh(
+			o3d.core.Tensor(dverts, o3d.core.float32),
+			o3d.core.Tensor(dfaces, o3d.core.int32)))
+
+		pts = np.asarray(prox_points) if prox_points is not None else np.asarray(prox_joint_region.points)
+		n_pts = len(pts)
+		if n_pts == 0:
+			return []
+		homog = np.hstack([pts, np.ones((n_pts, 1))]).astype(np.float64)  # (P,4)
+		same_struct = (prox_points is None or n_pts == prox_joint_region.n_points)
+
+		n_frames = len(transform_data)
+		results = [None] * n_frames
+		# 近位点を逆変換して複数フレームをまとめて問い合わせ（目安: 約800万点/チャンク）
+		frames_per_chunk = max(1, min(256, max(1, 8_000_000 // max(n_pts, 1))))
+		for start in range(0, n_frames, frames_per_chunk):
+			if cancel_var.get():
+				break
+			chunk = transform_data[start:start + frames_per_chunk]
+			big = np.empty((len(chunk) * n_pts, 3), dtype=np.float32)
+			for k, tf in enumerate(chunk):
+				Tinv = np.linalg.inv(np.asarray(tf['matrix'], dtype=float))
+				big[k * n_pts:(k + 1) * n_pts] = (Tinv @ homog.T).T[:, :3].astype(np.float32)
+			sd = scene.compute_signed_distance(o3d.core.Tensor(big, o3d.core.float32)).numpy()
+			for k in range(len(chunk)):
+				d = sd[k * n_pts:(k + 1) * n_pts]
+				hm = prox_joint_region.copy(deep=False) if same_struct else pv.PolyData(pts)
+				hm['distance'] = np.asarray(d, dtype=float)
+				results[start + k] = hm
+			done = min(start + len(chunk), n_frames)
+			if not update_progress(done, n_frames, f"[高速] ヒートマップ計算中: {done}/{n_frames}"):
+				break
+		return [h for h in results if h is not None]
 
 	def _precompute_heatmaps_gpu(self, prox_joint_region, dist_surface, prox_points, transform_data,
 	                             update_progress, cancel_var):

@@ -15,3 +15,5 @@ frs2015_gui_state.json
 # 1データセットあたり数MB程度に収めることを推奨。必要なら Git LFS の利用を検討。
 !cache/
 !cache/**
+cache/
+*.pkl
