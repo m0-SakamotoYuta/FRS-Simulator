@@ -129,6 +129,44 @@ def save_child_pp_file(save_path: str, points: np.ndarray, labels: list) -> None
 # endregion グローバルヘルパー関数
 
 
+class _LazyHeatmapList:
+	"""ヒートマップ(全フレーム同一形状・距離のみ異なる)の遅延生成リスト。
+
+	全フレームが共通ジオメトリ(base)を持ち、距離配列だけがフレームごとに異なる場合、
+	19000超のPolyDataを先に全部生成すると読込後に十数秒待たされる。本クラスは
+	__getitem__ で必要になったフレームのメッシュだけをその場で生成し、この待ちを無くす。
+	距離配列は self.distances で直接参照でき、最小距離などはメッシュ生成なしで計算できる。
+	"""
+
+	def __init__(self, base_mesh, distances):
+		self._base = base_mesh            # pv.PolyData or None（共通ジオメトリ）
+		self.distances = list(distances)  # list[np.ndarray | None]
+
+	def __len__(self):
+		return len(self.distances)
+
+	def __getitem__(self, i):
+		d = self.distances[i]
+		if self._base is None or d is None:
+			return pv.PolyData()
+		m = self._base.copy(deep=False)
+		m['distance'] = np.asarray(d)
+		return m
+
+	def __iter__(self):
+		for i in range(len(self.distances)):
+			yield self[i]
+
+	def min_distance(self):
+		"""全フレームの距離最小値(=最深めり込み, 負)。メッシュ生成なしで計算。"""
+		m = None
+		for d in self.distances:
+			if d is not None and len(d):
+				dm = float(np.nanmin(d))
+				m = dm if m is None else min(m, dm)
+		return m if m is not None else -1.0
+
+
 # region MainMenuGUIクラス
 # tkinterdnd2がある場合はTkinterDnD.Tkを基底に、なければtk.Tkを使用
 _BaseWindow = TkinterDnD.Tk if _HAS_DND else tk.Tk
@@ -348,6 +386,9 @@ class MainMenuGUI(_BaseWindow):
 		self.knee_transform_path = tk.StringVar(value="")      # 変位・姿勢変化データ(xlsx/kkr)
 		self.knee_side_var = tk.IntVar(value=1)                # 1: 右膝, 2: 左膝
 		self.knee_w_scan_deg = tk.DoubleVar(value=0.0)         # 伸展位屈曲角 φ (=スキャン時W軸角度, deg)
+		# 表示色（hipの可視化オプションとは独立。タブごとにスナップショット保存される）
+		self.knee_femur_color_var = tk.StringVar(value="#DEB887")  # 大腿骨: 既定=肌色
+		self.knee_tibia_color_var = tk.StringVar(value="#ADD8E6")  # 脛骨: 既定=水色
 		# ICP/RANSAC 位置合わせ用の領域(任意領域)ファイル
 		self.knee_reg_femur_src_path = tk.StringVar(value="")  # 大腿骨モデル側 位置合わせ領域
 		self.knee_reg_femur_tgt_path = tk.StringVar(value="")  # 初期スキャン側 大腿骨領域
@@ -373,6 +414,14 @@ class MainMenuGUI(_BaseWindow):
 			self.knee_preset_sel[bone] = tk.StringVar(value="")
 		self.knee_preset_combo = {}     # {bone: ttk.Combobox}（UI構築時に格納）
 		self._knee_presets = self._load_knee_presets()  # 名前→パラメータdict
+
+		# 複数「試験」タブ（各タブ=独立した状態スナップショット。UI/コードは共通で全タブに反映）
+		self._knee_default_snap = self._knee_snapshot_current()  # 既定値スナップショット（新規タブ用）
+		self._knee_tabs = []            # [{'name': str, 'snapshot': dict}]
+		self._knee_active_tab = 0
+		self._knee_tabbar_frame = None  # UI構築時に格納
+		self._knee_tab_buttons = []     # タブバー上のボタン（並び順=タブ順、ドラッグ入替の座標判定用）
+		self._knee_tab_drag = None      # ドラッグ中の入替情報 {'from', 'x', 'moved'}
 
 		# 関節種別ごとに切替えるUIウィジェットの参照（ラベル変更用）
 		self._joint_widgets = {}
@@ -792,6 +841,13 @@ class MainMenuGUI(_BaseWindow):
 		入力: 初期状態(組立)スキャン + 特徴点(L,M,N,MCL,LCL) / 大腿骨・脛骨モデル(試験後別スキャン) /
 		      左右・W_scan / 変位データ。大腿骨/脛骨モデルはICP/RANSACで初期スキャンへ位置合わせする。
 		"""
+		# 試験タブバー（スクロール外・常時表示）: 各タブ=独立した試験の状態。＋で追加/右クリックで削除・改名
+		tabbar_row = tk.Frame(self.knee_simulator_tab)
+		tabbar_row.pack(side="top", fill="x", padx=4, pady=(4, 0))
+		tk.Label(tabbar_row, text="試験タブ:", font=(self.ui_font_family, 9)).pack(side="left", padx=(0, 4))
+		self._knee_tabbar_frame = tk.Frame(tabbar_row)
+		self._knee_tabbar_frame.pack(side="left", fill="x")
+
 		# スクロール可能なメインフレーム
 		canvas = tk.Canvas(self.knee_simulator_tab, highlightthickness=0)
 		scrollbar = ttk.Scrollbar(self.knee_simulator_tab, orient="vertical", command=canvas.yview)
@@ -895,28 +951,51 @@ class MainMenuGUI(_BaseWindow):
 			sim_frame.columnconfigure(i, weight=[0, 1, 0][i])
 		self._add_file_row(sim_frame, 0, "変位・姿勢変化データ (xlsx/kkr)", self.knee_transform_path,
 		                   lambda: self._knee_choose(self.knee_transform_path, "変位・姿勢変化データを選択", "transform"))
+		# 表示色（hipの可視化オプションとは独立。タブごとに保存され、可視化/シミュレーションに反映）
+		colf = ttk.Frame(sim_frame)
+		colf.grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 2))
+		ttk.Label(colf, text="表示色:").grid(row=0, column=0, sticky="w")
+		ttk.Label(colf, text="大腿骨").grid(row=0, column=1, sticky="w", padx=(8, 2))
+		self.knee_femur_color_btn = tk.Button(colf, width=3, relief="ridge",
+		                                      command=lambda: self._knee_choose_color("femur"))
+		self.knee_femur_color_btn.grid(row=0, column=2, sticky="w")
+		ttk.Label(colf, text="脛骨").grid(row=0, column=3, sticky="w", padx=(12, 2))
+		self.knee_tibia_color_btn = tk.Button(colf, width=3, relief="ridge",
+		                                      command=lambda: self._knee_choose_color("tibia"))
+		self.knee_tibia_color_btn.grid(row=0, column=4, sticky="w")
+		ttk.Label(colf, text="（試験タブごとに保存。hip simulatorの可視化オプションとは独立）",
+		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=0, column=5, sticky="w", padx=(10, 0))
+		self._knee_update_color_buttons()
 		ttk.Button(sim_frame, text="関節全体を可視化", command=self.on_knee_visualize_all
-		           ).grid(row=1, column=0, sticky="w", padx=12, pady=(2, 4))
+		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 4))
 		ttk.Button(sim_frame, text="シミュレーション実行", command=self.on_knee_animate
-		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 8))
+		           ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 8))
 
-		# Section: シーン共有（別PC＝解析サーバーで計算するため）
-		scene_frame = ttk.LabelFrame(container, text="⑤ シーン共有（サーバーで計算 → gitでキャッシュ共有）", style="Bold.TLabelframe")
+		# Section: シーン共有（別PC・別OS＝解析サーバーやMacで計算/再現するため）
+		scene_frame = ttk.LabelFrame(container, text="⑤ シーン共有（別PC・別OSで計算/動作再現）", style="Bold.TLabelframe")
 		scene_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
 		scene_frame.columnconfigure(0, weight=1)
 		sbtn = ttk.Frame(scene_frame)
 		sbtn.grid(row=0, column=0, sticky="w", padx=12, pady=(4, 2))
-		ttk.Button(sbtn, text="シーンを保存（reg_T等を書出し）", command=self.on_knee_scene_save
+		ttk.Button(sbtn, text="このタブのシーンを保存", command=self.on_knee_scene_save
 		           ).grid(row=0, column=0, sticky="w", padx=(0, 8))
-		ttk.Button(sbtn, text="シーンを読込（reg_T等を復元）", command=self.on_knee_scene_load
-		           ).grid(row=0, column=1, sticky="w")
+		ttk.Button(sbtn, text="全タブのシーンを保存", command=self.on_knee_scene_save_all
+		           ).grid(row=0, column=1, sticky="w", padx=(0, 8))
+		ttk.Button(sbtn, text="シーンを読込（タブ名で同期）", command=self.on_knee_scene_load
+		           ).grid(row=0, column=2, sticky="w")
 		ttk.Label(scene_frame,
-		          text="位置合わせ結果(reg_T)・W_scan・左右を cache/knee_scene.json に保存/復元します。\n"
-		               "運用: ①Windowsで位置合わせ→「シーンを保存」→git push ②サーバーで同じモデルを開き\n"
-		               "「シーンを読込」→シミュレーション実行(重い計算)→git push ③Windowsでpull→表示は\n"
-		               "キャッシュ即読込(再計算なし)。※両PCで同じモデル/特徴点ファイル(内容一致)が必要。",
+		          text="試験タブ名ごとに 位置合わせ(reg_T)・W_scan・左右・ファイル内容ハッシュを cache/knee_scene.json へ保存します\n"
+		               "（小さいのでgit共有可）。読込はタブ名で同期: 同名タブは更新・無ければ新規作成＝タブ名も別PCへ引き継げます。\n"
+		               "運用A（サーバーで計算）: Windowsで位置合わせ→保存→push → サーバーでpull→読込→シミュレーション実行。\n"
+		               "運用B（Mac等で動作再現）: シーンは git pull、キャッシュ(cache/overlap/*.pkl)は大容量のためgit対象外\n"
+		               "　→ Box/USB等でコピーして配置。同じ内容のモデル/変位データを選んで実行するとキャッシュが即ヒットし、\n"
+		               "　再計算なしで動作再現できます（キャッシュは内容ハッシュ方式・OS非依存）。\n"
+		               "※ファイルパス自体は引き継がれません。各PCで同内容のファイルを選び直してください（一致は読込時に自動チェック）。",
 		          foreground="gray", font=(self.ui_font_family, 8), justify="left"
 		          ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+
+		# 試験タブを初期化（未初期化なら現状態を試験1として作成）してタブバーを描画
+		self._knee_init_tabs()
 
 	def _knee_choose(self, var: tk.StringVar, title: str, kind: str) -> None:
 		"""knee simulator用の共通ファイル選択ダイアログ。kind: 'model' | 'pp' | 'transform'."""
@@ -930,6 +1009,264 @@ class MainMenuGUI(_BaseWindow):
 		path = filedialog.askopenfilename(title=title, filetypes=ft)
 		if path:
 			var.set(path)
+
+	# ----- Knee simulator 表示色（hipの可視化オプションとは独立・タブごとに保存） -----
+	def _knee_color(self, bone: str) -> str:
+		"""kneeの表示色（femur/tibia）を返す。不正値は既定色にフォールバック。"""
+		var = self.knee_femur_color_var if bone == "femur" else self.knee_tibia_color_var
+		default = "#DEB887" if bone == "femur" else "#ADD8E6"
+		try:
+			c = str(var.get()).strip()
+		except Exception:
+			return default
+		if len(c) == 7 and c[0] == "#" and all(ch in "0123456789abcdefABCDEF" for ch in c[1:]):
+			return c
+		return default
+
+	def _knee_choose_color(self, bone: str) -> None:
+		"""④の表示色（大腿骨/脛骨）をカラーピッカーで変更する。"""
+		var = self.knee_femur_color_var if bone == "femur" else self.knee_tibia_color_var
+		title = "大腿骨の表示色を選択" if bone == "femur" else "脛骨の表示色を選択"
+		color = colorchooser.askcolor(initialcolor=self._knee_color(bone), title=title)
+		if color and color[1]:
+			var.set(color[1])
+			self._knee_update_color_buttons()
+
+	def _knee_update_color_buttons(self) -> None:
+		"""④の色見本ボタンの背景を現在の設定色に合わせる（タブ切替・シーン読込時にも呼ぶ）。"""
+		for bone, btn_name in (("femur", "knee_femur_color_btn"), ("tibia", "knee_tibia_color_btn")):
+			btn = getattr(self, btn_name, None)
+			if btn is None:
+				continue
+			try:
+				c = self._knee_color(bone)
+				btn.configure(bg=c, activebackground=c)
+			except Exception:
+				pass
+
+	# ----- Knee simulator 複数タブ（各タブ=独立スナップショット、UI/コードは共通） -----
+	def _knee_snapshot_current(self) -> dict:
+		"""現在の knee 状態（全入力・パラメータ・位置合わせ結果）をdictに保存する。"""
+		snap = {}
+		for key, (var, _t) in self._knee_state_vars().items():
+			try:
+				snap[key] = var.get()
+			except Exception:
+				pass
+		snap['_femur_reg_T'] = self._knee_femur_reg_T.tolist() if self._knee_femur_reg_T is not None else None
+		snap['_tibia_reg_T'] = self._knee_tibia_reg_T.tolist() if self._knee_tibia_reg_T is not None else None
+		return snap
+
+	def _knee_restore_snapshot(self, snap: dict) -> None:
+		"""dict の状態を現在の knee UI（ライブ変数）へ反映する。
+		スナップショットに無いキーは既定値へ戻す（後から追加した変数が旧タブに残留しないように）。"""
+		if not isinstance(snap, dict):
+			return
+		default = self._knee_default_snap if isinstance(getattr(self, "_knee_default_snap", None), dict) else {}
+		for key, (var, typ) in self._knee_state_vars().items():
+			if key in snap:
+				v = snap[key]
+			elif key in default:
+				v = default[key]
+			else:
+				continue
+			try:
+				if typ is bool:
+					var.set(bool(v))
+				elif typ is int:
+					var.set(int(v))
+				elif typ is float:
+					var.set(float(v))
+				else:
+					var.set(str(v))
+			except Exception:
+				pass
+		self._knee_femur_reg_T = np.array(snap['_femur_reg_T'], dtype=float) if snap.get('_femur_reg_T') is not None else None
+		self._knee_tibia_reg_T = np.array(snap['_tibia_reg_T'], dtype=float) if snap.get('_tibia_reg_T') is not None else None
+		self._knee_update_color_buttons()
+
+	def _knee_rebuild_tabbar(self) -> None:
+		"""タブバー（試験ごとのボタン＋「＋」）を再描画する。"""
+		fr = self._knee_tabbar_frame
+		if fr is None:
+			return
+		for w in fr.winfo_children():
+			w.destroy()
+		self._knee_tab_buttons = []
+		for i, tab in enumerate(self._knee_tabs):
+			active = (i == self._knee_active_tab)
+			b = tk.Button(
+				fr, text=tab.get('name', f"試験{i+1}"),
+				relief=('sunken' if active else 'raised'),
+				bg=('#cfe3ff' if active else '#f0f0f0'),
+				font=(self.ui_font_family, 9, 'bold' if active else 'normal'),
+				command=lambda i=i: self.on_knee_tab_select(i), padx=8, pady=2)
+			b.pack(side='left', padx=2)
+			b.bind("<Button-3>", lambda e, i=i: self._knee_tab_context_menu(e, i))
+			# ドラッグで並べ替え（クリック=切替はしきい値未満のときだけ Button の command に任せる）
+			b.bind("<ButtonPress-1>", lambda e, i=i: self._knee_tab_drag_start(e, i))
+			b.bind("<B1-Motion>", self._knee_tab_drag_motion)
+			b.bind("<ButtonRelease-1>", self._knee_tab_drag_release)
+			self._knee_tab_buttons.append(b)
+		plus = tk.Button(fr, text="＋", command=self.on_knee_tab_add, padx=6, pady=2)
+		plus.pack(side='left', padx=(8, 2))
+
+	def _knee_tab_context_menu(self, event, i: int) -> None:
+		menu = tk.Menu(self, tearoff=0)
+		menu.add_command(label="名前変更", command=lambda: self.on_knee_tab_rename(i))
+		menu.add_command(label="削除", command=lambda: self.on_knee_tab_delete(i))
+		menu.add_separator()
+		menu.add_command(label="← 左へ移動", command=lambda: self._knee_tab_move(i, i - 1),
+		                 state=("normal" if i > 0 else "disabled"))
+		menu.add_command(label="→ 右へ移動", command=lambda: self._knee_tab_move(i, i + 1),
+		                 state=("normal" if i < len(self._knee_tabs) - 1 else "disabled"))
+		try:
+			menu.tk_popup(event.x_root, event.y_root)
+		finally:
+			menu.grab_release()
+
+	# ----- 試験タブの並べ替え（ドラッグ＆右クリックメニュー） -----
+	def _knee_tab_move(self, i: int, j: int) -> None:
+		"""試験タブ i を位置 j へ移動する（アクティブタブは移動に追従）。"""
+		n = len(self._knee_tabs)
+		if not (0 <= i < n and 0 <= j < n) or i == j:
+			return
+		tab = self._knee_tabs.pop(i)
+		self._knee_tabs.insert(j, tab)
+		a = self._knee_active_tab
+		if a == i:
+			a = j
+		else:
+			if a > i:
+				a -= 1
+			if a >= j:
+				a += 1
+		self._knee_active_tab = a
+		self._knee_rebuild_tabbar()
+
+	def _knee_tab_drag_start(self, event, i: int) -> None:
+		self._knee_tab_drag = {"from": i, "x": event.x_root, "moved": False}
+
+	def _knee_tab_drag_motion(self, event) -> None:
+		d = self._knee_tab_drag
+		if d is None:
+			return
+		if not d["moved"] and abs(event.x_root - d["x"]) > 12:
+			d["moved"] = True
+			try:
+				event.widget.configure(cursor="sb_h_double_arrow")
+			except Exception:
+				pass
+
+	def _knee_tab_drag_release(self, event):
+		d = self._knee_tab_drag
+		self._knee_tab_drag = None
+		if not d or not d["moved"]:
+			return None  # ただのクリック → Button の command（タブ切替）に任せる
+		try:
+			event.widget.configure(cursor="")
+		except Exception:
+			pass
+		j = self._knee_tab_index_at(event.x_root)
+		if j is None or j == d["from"]:
+			return None
+		self._knee_tab_move(d["from"], j)
+		return "break"  # 並べ替えた場合はクリック（タブ切替）を発火させない
+
+	def _knee_tab_index_at(self, x_root: int):
+		"""タブバー上の x_root 座標に対応する試験タブのindexを返す（隙間は左隣、範囲外は端）。"""
+		btns = self._knee_tab_buttons
+		if not btns:
+			return None
+		best = 0
+		for idx, b in enumerate(btns):
+			try:
+				bx = b.winfo_rootx()
+				bw = b.winfo_width()
+			except Exception:
+				continue
+			if x_root >= bx:
+				best = idx
+			if bx <= x_root < bx + bw:
+				return idx
+		return best
+
+	def on_knee_tab_select(self, i: int) -> None:
+		if i < 0 or i >= len(self._knee_tabs) or i == self._knee_active_tab:
+			return
+		# 現在のタブへ保存してから切替
+		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
+		self._knee_active_tab = i
+		self._knee_restore_snapshot(self._knee_tabs[i]['snapshot'])
+		self._knee_rebuild_tabbar()
+
+	# ④（変位・姿勢変化データ）に属するキー。タブ追加時の複製から除外する
+	_KNEE_TAB_NO_COPY_KEYS = ("knee_transform",)
+
+	def on_knee_tab_add(self) -> None:
+		"""タブ追加: 一つ左（末尾）のタブを複製する（④変位データのみ既定値に戻す）。"""
+		if self._knee_tabs:
+			self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
+			# 新タブの一つ左＝現在の末尾タブを複製（モデルパス・位置合わせ結果reg_T等を引き継ぐ）
+			snap = copy.deepcopy(self._knee_tabs[-1].get('snapshot') or {})
+			for key in self._KNEE_TAB_NO_COPY_KEYS:
+				if isinstance(self._knee_default_snap, dict) and key in self._knee_default_snap:
+					snap[key] = self._knee_default_snap[key]
+				else:
+					snap.pop(key, None)
+		else:
+			snap = copy.deepcopy(self._knee_default_snap or {})
+		self._knee_tabs.append({'name': self._knee_unique_tab_name(), 'snapshot': snap})
+		self._knee_active_tab = len(self._knee_tabs) - 1
+		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
+		self._knee_rebuild_tabbar()
+
+	def _knee_unique_tab_name(self, base: str = "試験") -> str:
+		"""既存タブと重複しない「試験N」を返す（シーン共有がタブ名キーのため重複回避）。"""
+		names = {t.get('name', '') for t in self._knee_tabs}
+		n = len(self._knee_tabs) + 1
+		while f"{base}{n}" in names:
+			n += 1
+		return f"{base}{n}"
+
+	def on_knee_tab_delete(self, i: int) -> None:
+		if len(self._knee_tabs) <= 1:
+			messagebox.showinfo("タブ削除", "最後のタブは削除できません。")
+			return
+		if not messagebox.askyesno("タブ削除", f"タブ「{self._knee_tabs[i].get('name','')}」を削除しますか？"):
+			return
+		# 現在のアクティブ状態を保存してから削除
+		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
+		del self._knee_tabs[i]
+		if self._knee_active_tab == i:
+			self._knee_active_tab = min(i, len(self._knee_tabs) - 1)
+		elif self._knee_active_tab > i:
+			self._knee_active_tab -= 1
+		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
+		self._knee_rebuild_tabbar()
+
+	def on_knee_tab_rename(self, i: int) -> None:
+		cur = self._knee_tabs[i].get('name', '')
+		new = simpledialog.askstring("タブ名変更", "タブ名:", initialvalue=cur, parent=self)
+		if new and new.strip():
+			new = new.strip()
+			others = {t.get('name', '') for k, t in enumerate(self._knee_tabs) if k != i}
+			if new in others:
+				messagebox.showwarning("タブ名変更",
+					f"「{new}」は既に存在します。シーン共有はタブ名で対応付けるため、別の名前にしてください。")
+				return
+			self._knee_tabs[i]['name'] = new
+			self._knee_rebuild_tabbar()
+
+	def _knee_init_tabs(self) -> None:
+		"""UI構築後: タブが未初期化なら現在の状態を試験1として1つ作る。"""
+		if not self._knee_tabs:
+			self._knee_tabs = [{'name': '試験1', 'snapshot': self._knee_snapshot_current()}]
+			self._knee_active_tab = 0
+		if self._knee_active_tab >= len(self._knee_tabs):
+			self._knee_active_tab = 0
+		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
+		self._knee_rebuild_tabbar()
 
 	# ----- Knee registration params / presets (骨ごと) -----
 	def _knee_param_spec(self):
@@ -1619,90 +1956,196 @@ class MainMenuGUI(_BaseWindow):
 		except Exception:
 			return ""
 
+	def _knee_read_scene_file(self) -> dict:
+		"""シーン共有ファイルを読み {タブ名: シーン} に正規化して返す（旧v1単一形式も互換）。"""
+		p = self._knee_scene_file()
+		if not p.exists():
+			return {}
+		data = json.load(p.open("r", encoding="utf-8"))
+		if isinstance(data, dict) and isinstance(data.get("scenes"), dict):
+			return data["scenes"]
+		if isinstance(data, dict) and ("femur_reg_T" in data or "tibia_reg_T" in data):
+			return {"旧シーン": data}  # v1（単一シーン・名前なし）→ 名前付きへ移行
+		return {}
+
+	def _knee_write_scene_file(self, scenes: dict) -> Path:
+		p = self._knee_scene_file()
+		with p.open("w", encoding="utf-8") as f:
+			json.dump({"version": 2, "scenes": scenes}, f, ensure_ascii=False, indent=2)
+		return p
+
+	def _knee_scene_for_tab(self, snap: dict) -> dict:
+		"""タブのスナップショットからシーン共有エントリを作る（パス非依存・内容ハッシュ＋ファイル名ヒント）。"""
+		def h(key):
+			return self._file_content_hash(str(snap.get(key, "")).strip())
+		def bn(key):
+			pth = str(snap.get(key, "")).strip()
+			return Path(pth).name if pth else ""
+		return {
+			"w_scan_deg": float(snap.get("knee_w_scan_deg", 0.0) or 0.0),
+			"side": int(snap.get("knee_side", 1) or 1),
+			"femur_reg_T": snap.get("_femur_reg_T"),
+			"tibia_reg_T": snap.get("_tibia_reg_T"),
+			"femur_color": str(snap.get("knee_femur_color", "") or ""),
+			"tibia_color": str(snap.get("knee_tibia_color", "") or ""),
+			# 内容一致確認用（別PCで同じファイルかを警告するため。パスではなく中身のハッシュ）
+			"hash_initial_pp": h("knee_initial_pp"),
+			"hash_femur_model": h("knee_femur_model"),
+			"hash_tibia_model": h("knee_tibia_model"),
+			"hash_transform": h("knee_transform"),
+			# 別PCでファイルを選び直す際のヒント（ファイル名のみ）
+			"file_hints": {
+				"initial_scan": bn("knee_initial_scan"),
+				"initial_pp": bn("knee_initial_pp"),
+				"femur_model": bn("knee_femur_model"),
+				"tibia_model": bn("knee_tibia_model"),
+				"transform": bn("knee_transform"),
+			},
+			"saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+		}
+
+	def _knee_apply_scene_to_snap(self, snap: dict, sc: dict) -> None:
+		"""シーンエントリ（reg_T・W_scan・左右）をタブのスナップショットへ反映する。"""
+		try:
+			snap["knee_w_scan_deg"] = float(sc.get("w_scan_deg", snap.get("knee_w_scan_deg", 0.0)))
+		except Exception:
+			pass
+		s = sc.get("side")
+		if s in (1, 2):
+			snap["knee_side"] = int(s)
+		for ckey, skey in (("femur_color", "knee_femur_color"), ("tibia_color", "knee_tibia_color")):
+			c = sc.get(ckey)
+			if c:
+				snap[skey] = str(c)
+		# 厳密再現のため無条件で同期（保存側で未登録ならNoneになる）
+		snap["_femur_reg_T"] = sc.get("femur_reg_T")
+		snap["_tibia_reg_T"] = sc.get("tibia_reg_T")
+
+	def _knee_scene_check_files(self, snap: dict, sc: dict) -> list:
+		"""タブのファイル内容とシーンの内容ハッシュを照合し、警告文リストを返す。"""
+		hints = sc.get("file_hints") or {}
+		out = []
+		for label, hkey, pkey, hintkey in (
+			("特徴点PP", "hash_initial_pp", "knee_initial_pp", "initial_pp"),
+			("大腿骨", "hash_femur_model", "knee_femur_model", "femur_model"),
+			("脛骨", "hash_tibia_model", "knee_tibia_model", "tibia_model"),
+			("変位データ", "hash_transform", "knee_transform", "transform"),
+		):
+			saved_h = sc.get(hkey, "")
+			if not saved_h:
+				continue
+			path = str(snap.get(pkey, "")).strip()
+			cur_h = self._file_content_hash(path) if path else ""
+			if not cur_h:
+				hint = hints.get(hintkey, "")
+				out.append(f"{label}: 未選択" + (f"（→ {hint}）" if hint else ""))
+			elif cur_h != saved_h:
+				out.append(f"{label}: 内容不一致")
+		return out
+
 	def on_knee_scene_save(self) -> None:
-		"""位置合わせ結果(reg_T)・W_scan・左右をシーン共有ファイルへ書き出す。"""
+		"""アクティブな試験タブのシーンを、タブ名をキーに共有ファイルへ書き出す。"""
 		if self._knee_femur_reg_T is None and self._knee_tibia_reg_T is None:
 			messagebox.showwarning("シーン保存", "先に位置合わせを行ってください（reg_Tがありません）。")
 			return
+		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
+		name = self._knee_tabs[self._knee_active_tab].get('name', '試験1')
 		try:
-			w_scan = float(self.knee_w_scan_deg.get())
+			scenes = self._knee_read_scene_file()
 		except Exception:
-			w_scan = 0.0
-		data = {
-			"version": 1,
-			"w_scan_deg": w_scan,
-			"side": int(self.knee_side_var.get()),
-			"femur_reg_T": self._knee_femur_reg_T.tolist() if self._knee_femur_reg_T is not None else None,
-			"tibia_reg_T": self._knee_tibia_reg_T.tolist() if self._knee_tibia_reg_T is not None else None,
-			# 内容一致確認用（別PCで同じモデル/特徴点かを警告するため。パスではなく中身のハッシュ）
-			"hash_initial_pp": self._file_content_hash(self.knee_initial_pp_path.get().strip()),
-			"hash_femur_model": self._file_content_hash(self.knee_femur_model_path.get().strip()),
-			"hash_tibia_model": self._file_content_hash(self.knee_tibia_model_path.get().strip()),
-			"saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-		}
+			scenes = {}
+		scenes[name] = self._knee_scene_for_tab(self._knee_tabs[self._knee_active_tab]['snapshot'])
 		try:
-			p = self._knee_scene_file()
-			with p.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
+			p = self._knee_write_scene_file(scenes)
 		except Exception as e:
 			messagebox.showerror("シーン保存", f"保存に失敗しました:\n{e}")
 			return
 		messagebox.showinfo(
 			"シーン保存",
-			f"シーンを保存しました:\n{p}\n\n"
-			"このファイルを git commit/push すると、別PC(サーバー)で「シーンを読込」して\n"
-			"同じ位置合わせ結果で計算できます。")
+			f"シーン「{name}」を保存しました:\n{p}\n\n"
+			"このファイルを git commit/push すると、別PC（サーバー/Mac等）で「シーンを読込」して\n"
+			"同じタブ名・同じ位置合わせ結果で計算/再現できます。")
+
+	def on_knee_scene_save_all(self) -> None:
+		"""全試験タブのシーンをまとめて共有ファイルへ書き出す（位置合わせ未実施のタブはスキップ）。"""
+		if self._knee_tabs:
+			self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
+		try:
+			scenes = self._knee_read_scene_file()
+		except Exception:
+			scenes = {}
+		saved, skipped = [], []
+		for t in self._knee_tabs:
+			snap = t.get('snapshot') or {}
+			name = t.get('name', '?')
+			if snap.get('_femur_reg_T') is None and snap.get('_tibia_reg_T') is None:
+				skipped.append(name)
+				continue
+			scenes[name] = self._knee_scene_for_tab(snap)
+			saved.append(name)
+		if not saved:
+			messagebox.showwarning("シーン保存", "reg_T を持つタブがありません。先に位置合わせを行ってください。")
+			return
+		try:
+			p = self._knee_write_scene_file(scenes)
+		except Exception as e:
+			messagebox.showerror("シーン保存", f"保存に失敗しました:\n{e}")
+			return
+		msg = f"{len(saved)}タブのシーンを保存しました: {', '.join(saved)}\n{p}"
+		if skipped:
+			msg += f"\n（位置合わせ未実施のためスキップ: {', '.join(skipped)}）"
+		msg += "\n\ngit commit/push すると別PCで「シーンを読込」でき、タブ名ごと引き継がれます。"
+		messagebox.showinfo("シーン保存", msg)
 
 	def on_knee_scene_load(self) -> None:
-		"""シーン共有ファイルから reg_T・W_scan・左右を復元する（別PCでの計算整合用）。"""
+		"""シーン共有ファイルをタブ名で同期する（同名タブ=reg_T等を更新 / 無ければ新規タブ作成）。"""
 		p = self._knee_scene_file()
 		if not p.exists():
 			messagebox.showwarning("シーン読込", f"シーン共有ファイルが見つかりません:\n{p}\n\n"
 			                        "先に位置合わせ済みのPCで「シーンを保存」→git共有してください。")
 			return
 		try:
-			data = json.load(p.open("r", encoding="utf-8"))
+			scenes = self._knee_read_scene_file()
 		except Exception as e:
 			messagebox.showerror("シーン読込", f"読み込みに失敗しました:\n{e}")
 			return
-		# reg_T / W_scan / side を復元
-		try:
-			self.knee_w_scan_deg.set(float(data.get("w_scan_deg", 0.0)))
-		except Exception:
-			pass
-		try:
-			s = int(data.get("side", 1))
-			if s in (1, 2):
-				self.knee_side_var.set(s)
-		except Exception:
-			pass
-		self._knee_femur_reg_T = np.array(data["femur_reg_T"], dtype=float) if data.get("femur_reg_T") is not None else None
-		self._knee_tibia_reg_T = np.array(data["tibia_reg_T"], dtype=float) if data.get("tibia_reg_T") is not None else None
-
-		# 内容一致チェック（別PCで違うモデル/特徴点を開いていないか警告）
-		warns = []
-		checks = [
-			("初期スキャン特徴点(PP)", "hash_initial_pp", self.knee_initial_pp_path.get().strip()),
-			("大腿骨モデル", "hash_femur_model", self.knee_femur_model_path.get().strip()),
-			("脛骨モデル", "hash_tibia_model", self.knee_tibia_model_path.get().strip()),
-		]
-		for name, key, path in checks:
-			saved_h = data.get(key, "")
-			if not saved_h:
+		if not scenes:
+			messagebox.showwarning("シーン読込", "シーン共有ファイルに有効なシーンがありません。")
+			return
+		# アクティブタブの現状を保存してから同期
+		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
+		updated, created, warn_lines = [], [], []
+		for name, sc in scenes.items():
+			if not isinstance(sc, dict):
 				continue
-			cur_h = self._file_content_hash(path) if path else ""
-			if not cur_h:
-				warns.append(f"・{name}: 未選択（同じファイルを選んでください）")
-			elif cur_h != saved_h:
-				warns.append(f"・{name}: 内容が保存時と異なります（別ファイルの可能性）")
-
-		msg = "シーンを読み込みました（reg_T・W_scan・左右を復元）。\n"
-		if warns:
-			msg += ("\n⚠ 以下は保存時と一致しません。キャッシュが当たらない/ズレる可能性があります:\n"
-			        + "\n".join(warns)
-			        + "\n\n両PCで同じ内容のモデル/特徴点ファイルを開いてください。")
+			idx = next((k for k, t in enumerate(self._knee_tabs) if t.get('name') == name), None)
+			if idx is None:
+				snap = copy.deepcopy(self._knee_default_snap or {})
+				self._knee_apply_scene_to_snap(snap, sc)
+				self._knee_tabs.append({'name': name, 'snapshot': snap})
+				created.append(name)
+			else:
+				snap = self._knee_tabs[idx].get('snapshot') or {}
+				self._knee_apply_scene_to_snap(snap, sc)
+				self._knee_tabs[idx]['snapshot'] = snap
+				updated.append(name)
+			ws = self._knee_scene_check_files(snap, sc)
+			if ws:
+				warn_lines.append(f"・{name}: " + " / ".join(ws))
+		# アクティブタブへ反映（同期で変わった可能性があるため）
+		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
+		self._knee_rebuild_tabbar()
+		msg = "シーンを読み込みました（タブ名で同期）。\n"
+		if updated:
+			msg += f"更新: {', '.join(updated)}\n"
+		if created:
+			msg += f"新規タブ: {', '.join(created)}\n"
+		if warn_lines:
+			msg += ("\n⚠ ファイル内容が保存時と一致しない/未選択のタブがあります"
+			        "（キャッシュが当たらない可能性）:\n" + "\n".join(warn_lines)
+			        + "\n\n各タブで同じ内容のファイルを選択してください（→はファイル名ヒント）。")
 		else:
-			msg += "\nモデル/特徴点の内容一致を確認しました。このまま計算/表示できます。"
+			msg += "\nモデル/変位データの内容一致を確認しました。このまま計算/表示できます。"
 		messagebox.showinfo("シーン読込", msg)
 
 	def _knee_apply_T(self, mesh, T):
@@ -1795,8 +2238,8 @@ class MainMenuGUI(_BaseWindow):
 		plotter = pv.Plotter(title="knee: 関節全体（位置合わせ済み + Cf/Ct）",
 		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
 		plotter.set_background("white")
-		plotter.add_mesh(femur, color="burlywood", opacity=1.0, smooth_shading=True, show_edges=False)
-		plotter.add_mesh(tibia, color="lightblue", opacity=1.0, smooth_shading=True, show_edges=False)
+		plotter.add_mesh(femur, color=self._knee_color("femur"), opacity=1.0, smooth_shading=True, show_edges=False)
+		plotter.add_mesh(tibia, color=self._knee_color("tibia"), opacity=1.0, smooth_shading=True, show_edges=False)
 
 		# 特徴点
 		named = self._knee_named_points(scene["points_world"], scene["labels"])
@@ -1811,7 +2254,7 @@ class MainMenuGUI(_BaseWindow):
 			cto, ctx, cty, ctz = scene["ct_world"]
 			self._knee_draw_frame(plotter, cto, ctx, cty, ctz, "Ct_", axis_len, solid=False)
 
-		plotter.add_text("大腿骨(肌色) + 脛骨(水色) / Cf: X=red Y=green Z=blue（Ctは細線）",
+		plotter.add_text("大腿骨 + 脛骨（色は④の表示色設定） / Cf: X=red Y=green Z=blue（Ctは細線）",
 		                 position="upper_left", font_size=10, color="black")
 		plotter.show()
 
@@ -1919,8 +2362,8 @@ class MainMenuGUI(_BaseWindow):
 			self.prox_radius.set(_radius_of(femur))
 			self.dist_radius.set(_radius_of(tibia))
 			self.show_ao_angle.set(False)
-			self.prox_color = "#DEB887"  # 大腿骨=肌色
-			self.dist_color = "#ADD8E6"  # 脛骨=水色
+			self.prox_color = self._knee_color("femur")  # 大腿骨（④の表示色設定、既定=肌色）
+			self.dist_color = self._knee_color("tibia")  # 脛骨（④の表示色設定、既定=水色）
 			# hip 共通エンジンを起動（モーダル：ウィンドウを閉じるまでブロック）
 			self.on_animate()
 		finally:
@@ -8388,7 +8831,21 @@ class MainMenuGUI(_BaseWindow):
 					cache_data['overlap'].append(None)
 			
 			# ヒートマップデータ（最適化：共通ジオメトリを抽出）
-			if heatmap_meshes is not None:
+			if isinstance(heatmap_meshes, _LazyHeatmapList):
+				# 遅延リストは base + 距離配列を直接保存（メッシュ再生成なし＝高速・省メモリ）
+				base = heatmap_meshes._base
+				if base is not None and base.n_points > 0:
+					cache_data['heatmap_base'] = {
+						'n_points': base.n_points, 'n_faces': base.n_cells,
+						'points': base.points, 'faces': base.faces,
+					}
+					print(f"[キャッシュ] ヒートマップ共通ジオメトリを抽出: {base.n_points}点, {base.n_cells}面")
+				for d in heatmap_meshes.distances:
+					if d is None:
+						cache_data['heatmap'].append(None)
+					else:
+						cache_data['heatmap'].append({'type': 'ref', 'distance': np.asarray(d, dtype=np.float32)})
+			elif heatmap_meshes is not None:
 				# ベースメッシュを探す（最初の非空メッシュ）
 				base_mesh_info = None
 				for mesh in heatmap_meshes:
@@ -8420,18 +8877,20 @@ class MainMenuGUI(_BaseWindow):
 							heatmap_dict['points'] = mesh.points
 							heatmap_dict['faces'] = mesh.faces if mesh.faces is not None and len(mesh.faces) > 0 else None
 						
-						# スカラーデータ（distance）を保存
+						# スカラーデータ（distance）を保存（float32でファイル容量・時間を半減）
 						if 'distance' in mesh.array_names:
-							heatmap_dict['distance'] = mesh['distance']
-							
+							heatmap_dict['distance'] = np.asarray(mesh['distance'], dtype=np.float32)
+
 						cache_data['heatmap'].append(heatmap_dict)
 					else:
 						cache_data['heatmap'].append(None)
 			
-			# ファイルに保存
-			with open(cache_filepath, 'wb') as f:
-				pickle.dump(cache_data, f)
-			
+			# ファイルに保存（アトミック: 一時ファイルへ書いてから置換。中断時の破損を防ぐ）
+			tmp_path = Path(str(cache_filepath) + ".tmp")
+			with open(tmp_path, 'wb') as f:
+				pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+			os.replace(str(tmp_path), str(cache_filepath))
+
 			print(f"[キャッシュ] 保存完了: {cache_filepath}")
 			if heatmap_meshes is not None:
 				print(f"[キャッシュ] ヒートマップデータも保存: {len(heatmap_meshes)}フレーム")
@@ -8546,46 +9005,48 @@ class MainMenuGUI(_BaseWindow):
 					except Exception as e:
 						print(f"[キャッシュ] 共通ジオメトリ復元失敗: {e}")
 
-				print(f"[キャッシュ] ヒートマップ再構築開始: {total_frames}フレーム")
-				
-				for i, data in enumerate(heatmap_data):
-					# キャンセルチェック
-					if cancel_var.get():
-						progress_window.destroy()
-						print("[キャッシュ] 読み込みがキャンセルされました")
-						return None
-					
-					if data is None:
-						heatmap_meshes.append(pv.PolyData())
-					else:
-						mesh = None
-						
-						# 新形式（最適化版）対応: 共通ジオメトリ利用
-						if 'type' in data and data['type'] == 'ref' and base_mesh_cache is not None:
-							# ベースメッシュの形状を再利用（メモリ効率・速度向上）
-							# deep=Falseでポイント配列を共有、ただしスカラーは別
-							mesh = base_mesh_cache.copy(deep=False)
-						else:
-							# 従来形式または個別保持（full）
-							if 'faces' in data and data['faces'] is not None:
-								mesh = pv.PolyData(data['points'], data['faces'])
-							elif 'points' in data:
-								mesh = pv.PolyData(data['points'])
-						
-						if mesh:
-							# スカラーデータ（distance）も復元
-							if 'distance' in data:
-								mesh['distance'] = data['distance']
-							heatmap_meshes.append(mesh)
-						else:
+				print(f"[キャッシュ] ヒートマップを遅延復元（メッシュは再生時に必要分だけ生成）: {total_frames}フレーム")
+
+				# 全フレーム同一形状(base)で距離のみ異なる典型ケースは、遅延リストで即時復元する
+				# （19000超のPolyDataを先に全部作らないので、読込後の待ちが大幅に短縮）。
+				all_ref = (base_mesh_cache is not None) and all(
+					(d is None) or (d.get('type') == 'ref') for d in heatmap_data)
+
+				if all_ref:
+					distances = [None if d is None else d.get('distance') for d in heatmap_data]
+					heatmap_meshes = _LazyHeatmapList(base_mesh_cache, distances)
+					progress_bar['value'] = total_frames
+					progress_label.config(text=f"{total_frames} / {total_frames} フレーム (100%)")
+					progress_window.update()
+				else:
+					# 形状がフレームごとに異なる場合は従来どおり個別復元
+					for i, data in enumerate(heatmap_data):
+						if cancel_var.get():
+							progress_window.destroy()
+							print("[キャッシュ] 読み込みがキャンセルされました")
+							return None
+						if data is None:
 							heatmap_meshes.append(pv.PolyData())
-					
-					# 100フレームごとに進捗更新（UI応答性確保）
-					if i % 100 == 0 or i == total_frames - 1:
-						progress_bar['value'] = i + 1
-						progress_label.config(text=f"{i + 1} / {total_frames} フレーム ({(i+1)/total_frames*100:.1f}%)")
-						progress_window.update()
-				
+						else:
+							mesh = None
+							if 'type' in data and data['type'] == 'ref' and base_mesh_cache is not None:
+								mesh = base_mesh_cache.copy(deep=False)
+							else:
+								if 'faces' in data and data['faces'] is not None:
+									mesh = pv.PolyData(data['points'], data['faces'])
+								elif 'points' in data:
+									mesh = pv.PolyData(data['points'])
+							if mesh:
+								if 'distance' in data:
+									mesh['distance'] = data['distance']
+								heatmap_meshes.append(mesh)
+							else:
+								heatmap_meshes.append(pv.PolyData())
+						if i % 100 == 0 or i == total_frames - 1:
+							progress_bar['value'] = i + 1
+							progress_label.config(text=f"{i + 1} / {total_frames} フレーム ({(i+1)/total_frames*100:.1f}%)")
+							progress_window.update()
+
 				progress_window.destroy()
 				
 				print(f"[キャッシュ] 読み込み完了: {cache_filepath}")
@@ -12619,12 +13080,24 @@ class MainMenuGUI(_BaseWindow):
 							overlap_depths_precomputed = []
 							heatmap_precomputed = []
 						else:
-							# ヒートマップも含めてキャッシュに保存（新規計算した場合のみ）
+							# ヒートマップも含めてキャッシュに保存（新規計算した場合のみ）。
+							# 大量フレームだと保存に時間がかかるため、バックグラウンドで書き出し、
+							# アニメーションは待たずに先に表示する（保存は継続・完了時にログ表示）。
 							if use_cache and heatmap_newly_computed and heatmap_precomputed:
 								cache_hash = self._get_cache_hash(prox_mesh, dist_mesh, transform_data, use_simplify)
 								cache_filepath = self._get_cache_filepath(cache_hash)
-								print(f"[キャッシュ] 新規計算したヒートマップをキャッシュに保存します...")
-								self._save_overlap_cache(cache_filepath, overlap_precomputed, overlap_areas_precomputed, overlap_depths_precomputed, heatmap_precomputed)
+								print(f"[キャッシュ] ヒートマップをバックグラウンドで保存します（アニメは先に表示）...")
+
+								def _bg_save_cache(cf=cache_filepath, ov=overlap_precomputed,
+								                   oa=overlap_areas_precomputed, od=overlap_depths_precomputed,
+								                   hm=heatmap_precomputed):
+									try:
+										self._save_overlap_cache(cf, ov, oa, od, hm)
+										print(f"[キャッシュ] ★バックグラウンド保存 完了: {cf}")
+									except Exception as _e:
+										print(f"[キャッシュ] バックグラウンド保存エラー: {_e}")
+
+								threading.Thread(target=_bg_save_cache, daemon=True).start()
 							
 							print(f"[事前計算] 完了: {len(overlap_precomputed)}フレーム分のオーバーラップ, {len(heatmap_precomputed)}フレーム分のヒートマップ")
 
@@ -12819,51 +13292,36 @@ class MainMenuGUI(_BaseWindow):
 				heatmap_mesh['distance'] = np.array([0.0])
 				print(f"[デバッグ] ヒートマップメッシュをダミーで初期化（データなし）")
 			
-			# カラースケール: 接触=緑, めり込み(負)=赤(深いほど濃い), 離間(正)=透明(素のモデルを見せる)
-			# 全フレームの最深めり込み量からスケールを決定
-			pent_max = 5.0
-			if len(heatmap_precomputed) > 0 and 'distance' in heatmap_precomputed[0].array_names:
-				try:
-					mins = []
-					for hm in heatmap_precomputed:
-						if hm is not None and hm.n_points > 0 and 'distance' in hm.array_names:
-							d = np.asarray(hm['distance'])
-							if d.size:
-								mins.append(np.nanmin(d))
-					deepest = np.nanmin(mins) if mins else -1.0
-					pent_max = max(float(-deepest), 1.0)  # 最深めり込み量(正の数)。最低1mm
-				except Exception:
-					pent_max = 5.0
-
-			sep_band = 1.0  # これ以上離れたら透明（素のモデルを見せる）[mm]
-			# カラーマップ: めり込み(負)=赤 → 接触(0付近)=緑
+			# カラースケール: 範囲 [-10, 0] mm 固定。めり込み(負)=赤(深いほど濃い) → 接触(0)=緑。
+			# 離間(正=範囲外)は透明にして素のモデルを見せる（above-range透明）。
+			CLIM_LO, CLIM_HI = -10.0, 0.0
+			heatmap_cmap = 'RdYlGn'
 			try:
 				from matplotlib.colors import LinearSegmentedColormap
-				t0 = pent_max / (pent_max + sep_band)  # 距離0(接触)の正規化位置
 				heatmap_cmap = LinearSegmentedColormap.from_list(
 					'contact_pen',
-					[(0.0, (0.75, 0.0, 0.0)),                 # 最深めり込み: 濃い赤
-					 (max(t0 * 0.5, 0.01), (1.0, 0.6, 0.0)),  # 浅いめり込み: オレンジ
-					 (t0, (0.1, 0.75, 0.1)),                  # 接触(0mm): 緑
-					 (1.0, (0.1, 0.75, 0.1))])                # 離間側(透明化されるので色は緑のまま)
+					[(0.0, (0.75, 0.0, 0.0)),   # -10mm: 濃い赤
+					 (0.5, (1.0, 0.6, 0.0)),    # -5mm:  オレンジ
+					 (1.0, (0.1, 0.75, 0.1))])  # 0mm(接触): 緑
 			except Exception:
 				heatmap_cmap = 'RdYlGn'
-			# 不透明度の伝達関数: d<=0(接触・めり込み)=不透明, 0<d<band=徐々に透明, d>=band=透明
-			_xs = np.linspace(-pent_max, sep_band, 256)
-			_op = np.ones_like(_xs)
-			_far = _xs > 0.0
-			_op[_far] = np.clip(1.0 - _xs[_far] / sep_band, 0.0, 1.0)
-			heatmap_opacity = _op.tolist()
 
 			heatmap_actor = anim_plotter.add_mesh(
 				heatmap_mesh,
 				scalars='distance',
-				cmap=heatmap_cmap,     # めり込み=赤 → 接触=緑
-				clim=[-pent_max, sep_band],
-				opacity=heatmap_opacity,  # 離間(正)は透明→素のモデルが見える
+				cmap=heatmap_cmap,     # -10mm=赤 → 0mm=緑
+				clim=[CLIM_LO, CLIM_HI],
+				opacity=1.0,           # 全体不透明度（Heatmapスライダーで調整）
 				show_edges=False,
 				label='Heatmap',
 			)
+			# 範囲外(離間 >0mm)は透明 → 素のモデルを見せる
+			try:
+				_hm_lut = heatmap_actor.GetMapper().GetLookupTable()
+				_hm_lut.SetUseAboveRangeColor(True)
+				_hm_lut.SetAboveRangeColor(0.0, 0.0, 0.0, 0.0)
+			except Exception:
+				pass
 			
 			# Z-fighting対策：マッパーの設定でPolygonOffsetを有効化
 			heatmap_mapper = heatmap_actor.GetMapper()
@@ -14426,6 +14884,8 @@ class MainMenuGUI(_BaseWindow):
 			"knee_reg_tibia_tgt": (self.knee_reg_tibia_tgt_path, str),
 			"knee_side": (self.knee_side_var, int),
 			"knee_w_scan_deg": (self.knee_w_scan_deg, float),
+			"knee_femur_color": (self.knee_femur_color_var, str),
+			"knee_tibia_color": (self.knee_tibia_color_var, str),
 		}
 		# 骨ごとの位置合わせパラメータ・方式・プリセット選択
 		for bone in ("femur", "tibia"):
@@ -14438,32 +14898,27 @@ class MainMenuGUI(_BaseWindow):
 		return d
 
 	def _save_knee_state(self) -> None:
-		"""knee simulator の入力値・パラメータを専用ファイルへ保存する。"""
-		data = {}
-		for key, (var, _typ) in self._knee_state_vars().items():
-			try:
-				data[key] = var.get()
-			except Exception:
-				pass
-		# 位置合わせ結果(4x4変換行列)も保存し、次回起動時に再位置合わせ不要にする
+		"""knee simulator の全「試験タブ」を専用ファイルへ保存する。"""
+		# アクティブタブを最新状態に更新
 		try:
-			data["_femur_reg_T"] = self._knee_femur_reg_T.tolist() if self._knee_femur_reg_T is not None else None
+			if getattr(self, "_knee_tabs", None):
+				self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
 		except Exception:
-			data["_femur_reg_T"] = None
-		try:
-			data["_tibia_reg_T"] = self._knee_tibia_reg_T.tolist() if self._knee_tibia_reg_T is not None else None
-		except Exception:
-			data["_tibia_reg_T"] = None
+			pass
+		data = {
+			"tabs": getattr(self, "_knee_tabs", []),
+			"active": getattr(self, "_knee_active_tab", 0),
+		}
 		try:
 			p = self._knee_state_file_path()
 			with p.open("w", encoding="utf-8") as f:
 				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[knee状態保存] {p}")
+			print(f"[knee状態保存] {p}（{len(data['tabs'])}タブ）")
 		except Exception as e:
 			print(f"[knee状態保存] 失敗: {e}")
 
 	def _load_knee_state(self) -> None:
-		"""knee simulator の入力値・パラメータを専用ファイルから復元する。"""
+		"""knee simulator の状態を専用ファイルから復元する（複数タブ対応・旧形式互換）。"""
 		try:
 			p = self._knee_state_file_path()
 			if not p.exists():
@@ -14472,6 +14927,21 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			print(f"[knee状態復元] 失敗: {e}")
 			return
+
+		# 新形式: 複数タブ
+		if isinstance(data, dict) and isinstance(data.get("tabs"), list) and data["tabs"]:
+			self._knee_tabs = data["tabs"]
+			try:
+				self._knee_active_tab = int(data.get("active", 0))
+			except Exception:
+				self._knee_active_tab = 0
+			if self._knee_active_tab < 0 or self._knee_active_tab >= len(self._knee_tabs):
+				self._knee_active_tab = 0
+			# アクティブタブの状態をライブ変数へ反映（UI構築は後段だが変数は既に存在）
+			self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab].get("snapshot", {}))
+			return
+
+		# 旧形式(フラット): ライブ変数へ復元（後段の _knee_init_tabs が「試験1」化する）
 		for key, (var, typ) in self._knee_state_vars().items():
 			if key not in data:
 				continue
@@ -14487,7 +14957,6 @@ class MainMenuGUI(_BaseWindow):
 					var.set(str(val))
 			except Exception:
 				pass
-		# 位置合わせ結果(4x4変換行列)を復元
 		for key, attr in (("_femur_reg_T", "_knee_femur_reg_T"), ("_tibia_reg_T", "_knee_tibia_reg_T")):
 			if data.get(key) is not None:
 				try:
@@ -15270,7 +15739,8 @@ class MainMenuGUI(_BaseWindow):
 		same_struct = (prox_points is None or n_pts == prox_joint_region.n_points)
 
 		n_frames = len(transform_data)
-		results = [None] * n_frames
+		# 距離配列だけを貯める（メッシュは作らない）。全フレーム同一形状なので遅延リストで返す。
+		results_d = [None] * n_frames
 		# 近位点を逆変換して複数フレームをまとめて問い合わせ（目安: 約800万点/チャンク）
 		frames_per_chunk = max(1, min(256, max(1, 8_000_000 // max(n_pts, 1))))
 		for start in range(0, n_frames, frames_per_chunk):
@@ -15283,14 +15753,15 @@ class MainMenuGUI(_BaseWindow):
 				big[k * n_pts:(k + 1) * n_pts] = (Tinv @ homog.T).T[:, :3].astype(np.float32)
 			sd = scene.compute_signed_distance(o3d.core.Tensor(big, o3d.core.float32)).numpy()
 			for k in range(len(chunk)):
-				d = sd[k * n_pts:(k + 1) * n_pts]
-				hm = prox_joint_region.copy(deep=False) if same_struct else pv.PolyData(pts)
-				hm['distance'] = np.asarray(d, dtype=float)
-				results[start + k] = hm
+				# float32で保持（可視化には十分。容量・保存/読込時間を半減）。viewでなくcopyで独立化
+				results_d[start + k] = np.array(sd[k * n_pts:(k + 1) * n_pts], dtype=np.float32)
 			done = min(start + len(chunk), n_frames)
 			if not update_progress(done, n_frames, f"[高速] ヒートマップ計算中: {done}/{n_frames}"):
 				break
-		return [h for h in results if h is not None]
+		# 共通ジオメトリ（近位領域メッシュ）＋各フレーム距離配列 の遅延リストを返す
+		base_mesh = prox_joint_region if same_struct else pv.PolyData(pts)
+		distances = [d for d in results_d if d is not None]
+		return _LazyHeatmapList(base_mesh, distances)
 
 	def _precompute_heatmaps_gpu(self, prox_joint_region, dist_surface, prox_points, transform_data,
 	                             update_progress, cancel_var):

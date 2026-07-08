@@ -6,14 +6,15 @@ __pycache__/
 
 # PC固有・OS固有ファイル（各PCで自動生成されるため同期対象外）
 frs2015_gui_state.json
+frs2015_gui_state_knee.json
+frs2015_gui_state_knee_sim.json
 .DS_Store
 .vscode/
 *.test_cache/
 
-# cache/ は git で共有する（サーバーで計算→push→他PCでpull して表示）ため無視しない。
-# 巨大になりやすいので、FEM/オーバーラップ事前計算はオフのまま（ヒートマップのみ）にして
-# 1データセットあたり数MB程度に収めることを推奨。必要なら Git LFS の利用を検討。
-!cache/
-!cache/**
-cache/
+# cache/ 配下: 事前計算キャッシュ(pkl)は大容量のため git 共有しない
+# （別PCへは Box/USB 等で cache/overlap/ をコピーする。内容ハッシュ方式なのでOS非依存で当たる）。
+# シーン共有ファイル knee_scene.json（小さい・パス非依存）だけ git で共有する。
+cache/*
+!cache/knee_scene.json
 *.pkl
