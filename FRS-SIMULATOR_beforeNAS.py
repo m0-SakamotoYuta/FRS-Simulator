@@ -30,6 +30,17 @@ VERSION = "2.4"  # ここでバージョンを変更してください
 #       3.10 ボタン状態管理                           (行 6753-6845)
 #       3.11 状態保存・復元                           (行 6846-7045)
 #       3.12 座標系・幾何処理                         (行 7045-7440)
+#       3.13 並列処理ヘルパー                         (行 7441-7850)
+#       3.14 その他ユーティリティ                     (行 7851-7950)
+#   4. main()エントリーポイント                       (行 7952-7960)
+#
+# ■ 重要メソッド一覧（改修頻度が高い箇所）
+#   - on_animate():               シミュレーションのメインループ（行 5279）
+#   - on_fitting_execute():       RANSAC/ICPフィッティング（行 3043）
+#   - on_visualize_all():         関節全体の可視化（行 1382）
+#   - _compute_distance_heatmap(): ヒートマップ計算（行 7070）
+#   - _load_transform_matrices():  Excelデータ読み込み（行 2121）
+#   - _build_coordinate_system():  座標系構築（近位）（行 7249）
 #
 # ■ VSCode region/endregion マーカー
 #   このファイルはVSCodeのregion/endregion機能に対応しています。
@@ -48,7 +59,7 @@ VERSION = "2.4"  # ここでバージョンを変更してください
 import sys
 import platform
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, colorchooser, simpledialog
+from tkinter import ttk, filedialog, messagebox, colorchooser
 from tkinter import font as tkfont
 import urllib.parse
 
@@ -57,38 +68,11 @@ IS_WINDOWS = sys.platform == 'win32'
 IS_MACOS = sys.platform == 'darwin'
 IS_LINUX = sys.platform.startswith('linux')
 
-
-def _mousewheel_units(event) -> int:
-	"""<MouseWheel>/<Button-4/5> イベントを yview_scroll("units") 用の行数に変換する。
-
-	Windows/Linux(X11): event.delta は ±120 の倍数 → /120 で行数
-	macOS(Aqua):        event.delta は ±1..±数 の小さい生の値 → そのまま行数として扱う
-	X11 の物理ホイール: <Button-4> = 上, <Button-5> = 下
-	戻り値は yview_scroll に渡す符号付き行数（上方向がマイナス）。
-	"""
-	num = getattr(event, 'num', 0)
-	if num == 4:
-		return -1
-	if num == 5:
-		return 1
-	delta = getattr(event, 'delta', 0) or 0
-	if not delta:
-		return 0
-	if IS_MACOS:
-		# Aqua の delta は既に「行に近い単位」。0にならないよう符号を保つ。
-		step = -int(delta) if int(delta) != 0 else (-1 if delta > 0 else 1)
-		return step
-	# Windows / X11(<MouseWheel>): 120 単位
-	step = int(-delta / 120)
-	if step == 0:
-		step = -1 if delta > 0 else 1
-	return step
-
 # ドラッグ&ドロップ対応（tkinterdnd2）
 try:
 	from tkinterdnd2 import TkinterDnD, DND_FILES
 	_HAS_DND = True
-except ImportError:	
+except ImportError:
 	_HAS_DND = False
 import json
 from pathlib import Path
@@ -99,7 +83,6 @@ import open3d as o3d # type: ignore
 import traceback
 import threading
 import time
-import datetime
 from multiprocessing import Pool, cpu_count
 import os
 import pickle
@@ -126,13 +109,6 @@ try:
 except ImportError:
 	_HAS_REPORT = False
 
-# 共有キャッシュマネージャ（NAS + ローカル2層キャッシュ）
-try:
-	from shared_cache_manager import SharedCacheManager, compute_content_hash
-	_HAS_SHARED_CACHE = True
-except ImportError:
-	_HAS_SHARED_CACHE = False
-
 # Open3Dの警告を抑制
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 # endregion インポートと初期設定
@@ -154,44 +130,6 @@ def save_child_pp_file(save_path: str, points: np.ndarray, labels: list) -> None
 	tree = ET.ElementTree(root)
 	tree.write(save_path, encoding="utf-8", xml_declaration=True)
 # endregion グローバルヘルパー関数
-
-
-class _LazyHeatmapList:
-	"""ヒートマップ(全フレーム同一形状・距離のみ異なる)の遅延生成リスト。
-
-	全フレームが共通ジオメトリ(base)を持ち、距離配列だけがフレームごとに異なる場合、
-	19000超のPolyDataを先に全部生成すると読込後に十数秒待たされる。本クラスは
-	__getitem__ で必要になったフレームのメッシュだけをその場で生成し、この待ちを無くす。
-	距離配列は self.distances で直接参照でき、最小距離などはメッシュ生成なしで計算できる。
-	"""
-
-	def __init__(self, base_mesh, distances):
-		self._base = base_mesh            # pv.PolyData or None（共通ジオメトリ）
-		self.distances = list(distances)  # list[np.ndarray | None]
-
-	def __len__(self):
-		return len(self.distances)
-
-	def __getitem__(self, i):
-		d = self.distances[i]
-		if self._base is None or d is None:
-			return pv.PolyData()
-		m = self._base.copy(deep=False)
-		m['distance'] = np.asarray(d)
-		return m
-
-	def __iter__(self):
-		for i in range(len(self.distances)):
-			yield self[i]
-
-	def min_distance(self):
-		"""全フレームの距離最小値(=最深めり込み, 負)。メッシュ生成なしで計算。"""
-		m = None
-		for d in self.distances:
-			if d is not None and len(d):
-				dm = float(np.nanmin(d))
-				m = dm if m is None else min(m, dm)
-		return m if m is not None else -1.0
 
 
 # region MainMenuGUIクラス
@@ -249,13 +187,6 @@ class MainMenuGUI(_BaseWindow):
 		
 		# 可視化オプション
 		self.show_ao_angle = tk.BooleanVar(value=True) # 骨盤A-O線と大腿骨A-O線の表示
-		# 「関節全体モデル/特徴点を可視化」ウィンドウの表示/非表示チェックボックス（永続化）
-		self.viz_show_prox_model = tk.BooleanVar(value=True)
-		self.viz_show_prox_pp    = tk.BooleanVar(value=True)
-		self.viz_show_prox_axes  = tk.BooleanVar(value=True)
-		self.viz_show_dist_model = tk.BooleanVar(value=True)
-		self.viz_show_dist_pp    = tk.BooleanVar(value=True)
-		self.viz_show_dist_axes  = tk.BooleanVar(value=True)
 
 		# Variables (Fitting)
 		self.fitting_parent_model_path = tk.StringVar(value="")
@@ -359,13 +290,6 @@ class MainMenuGUI(_BaseWindow):
 		self.fem_last_dist_bone_mesh = None
 		self.fem_is_running = False
 
-		# 共有キャッシュ設定（NAS + ローカル2層）
-		self.cache_nas_path = tk.StringVar(value="")  # NASキャッシュパス（空=NAS無効）
-		self.cache_enabled = tk.BooleanVar(value=True)  # キャッシュ有効/無効
-		self._shared_fem_cache = None       # FEM用SharedCacheManager
-		self._shared_overlap_cache = None   # Overlap/Heatmap用SharedCacheManager
-		# ※ _init_shared_cache() は _load_state() でNASパスを復元した後に呼ぶ
-
 		# Fittingパラメータ
 		# RANSACパラメータ
 		self.ransac_distance_threshold = tk.DoubleVar(value=1.0)  # 距離閾値 (mm)
@@ -394,77 +318,8 @@ class MainMenuGUI(_BaseWindow):
 		self.dist_offset_y = tk.DoubleVar(value=0.0)  # 遠位O' Y方向オフセット（mm）
 		self.dist_offset_z = tk.DoubleVar(value=0.0)  # 遠位O' Z方向オフセット（mm）
 
-		# ============================================================
-		# Variables (Knee Simulator / FRS-2015 ロボット準拠 膝関節)
-		# ------------------------------------------------------------
-		# 座標系定義: 木村圭 学位論文 第3章 / 木村・藤江 機械学会論文集 2015 /
-		#             藤江「動作原理と改良」2024。
-		#  - 大腿骨座標系 Cf: 原点=MCL/LCL付着部の中点, Z=LCL→MCL(右膝で外側正),
-		#    Y=大腿骨骨軸(≒基準座標系Coのy軸=L,M,N由来のCcl姿勢)をZ⊥面へ投影(近位正),
-		#    X=Y×Z
-		#  - 脛骨座標系 Ct: 伸展位でCfに一致。動物膝はCfをZ軸まわりに屈曲角φ(=W_scan)回転
-		# 特徴点(L,M,N,MCL,LCL)は「ロボット取付け初期状態(組立)3Dスキャン」上にある。
-		# 大腿骨/脛骨モデルは試験後の別スキャンで、ICP/RANSACで初期スキャンへ位置合わせする。
-		# ============================================================
-		self.knee_initial_scan_path = tk.StringVar(value="")   # 初期状態(組立)スキャン
-		self.knee_initial_pp_path = tk.StringVar(value="")     # 初期スキャン特徴点(L,M,N,MCL,LCL)
-		self.knee_femur_model_path = tk.StringVar(value="")    # 大腿骨モデル(試験後・別スキャン)
-		self.knee_tibia_model_path = tk.StringVar(value="")    # 脛骨モデル(試験後・別スキャン)
-		self.knee_transform_path = tk.StringVar(value="")      # 変位・姿勢変化データ(xlsx/kkr)
-		self.knee_side_var = tk.IntVar(value=1)                # 1: 右膝, 2: 左膝
-		self.knee_w_scan_deg = tk.DoubleVar(value=0.0)         # 伸展位屈曲角 φ (=スキャン時W軸角度, deg)
-		# 表示色（hipの可視化オプションとは独立。タブごとにスナップショット保存される）
-		self.knee_femur_color_var = tk.StringVar(value="#DEB887")  # 大腿骨: 既定=肌色
-		self.knee_tibia_color_var = tk.StringVar(value="#ADD8E6")  # 脛骨: 既定=水色
-		# ICP/RANSAC 位置合わせ用の領域(任意領域)ファイル
-		self.knee_reg_femur_src_path = tk.StringVar(value="")  # 大腿骨モデル側 位置合わせ領域
-		self.knee_reg_femur_tgt_path = tk.StringVar(value="")  # 初期スキャン側 大腿骨領域
-		self.knee_reg_tibia_src_path = tk.StringVar(value="")  # 脛骨モデル側 位置合わせ領域
-		self.knee_reg_tibia_tgt_path = tk.StringVar(value="")  # 初期スキャン側 脛骨領域
-		# 位置合わせ結果(4x4変換行列; 各モデル→初期スキャン座標系)。未計算はNone
-		self._knee_femur_reg_T = None
-		self._knee_tibia_reg_T = None
-		# 位置合わせパラメータ（大腿骨・脛骨で別々に保持。プリセットで保存/呼出可）
-		self.knee_reg_pvars = {}        # {bone: {key: tkVar}}
-		self.knee_reg_method_var = {}   # {bone: StringVar} "ransac"/"pca"/"manual"
-		self.knee_reg_scaling_var = {}  # {bone: BooleanVar}
-		self.knee_reg_preview_var = {}  # {bone: BooleanVar}
-		self.knee_preset_sel = {}       # {bone: StringVar} 選択中プリセット名
-		for bone in ("femur", "tibia"):
-			d = {}
-			for key, kind, default, _lbl in self._knee_param_spec():
-				d[key] = tk.IntVar(value=int(default)) if kind == "int" else tk.DoubleVar(value=float(default))
-			self.knee_reg_pvars[bone] = d
-			self.knee_reg_method_var[bone] = tk.StringVar(value="ransac")
-			self.knee_reg_scaling_var[bone] = tk.BooleanVar(value=False)
-			self.knee_reg_preview_var[bone] = tk.BooleanVar(value=True)
-			self.knee_preset_sel[bone] = tk.StringVar(value="")
-		self.knee_preset_combo = {}     # {bone: ttk.Combobox}（UI構築時に格納）
-		self._knee_presets = self._load_knee_presets()  # 名前→パラメータdict
-
-		# 複数「試験」タブ（各タブ=独立した状態スナップショット。UI/コードは共通で全タブに反映）
-		self._knee_default_snap = self._knee_snapshot_current()  # 既定値スナップショット（新規タブ用）
-		self._knee_tabs = []            # [{'name': str, 'snapshot': dict}]
-		self._knee_active_tab = 0
-		self._knee_tabbar_frame = None  # UI構築時に格納
-		self._knee_tab_buttons = []     # タブバー上のボタン（並び順=タブ順、ドラッグ入替の座標判定用）
-		self._knee_tab_drag = None      # ドラッグ中の入替情報 {'from', 'x', 'moved'}
-
-		# 関節種別ごとに切替えるUIウィジェットの参照（ラベル変更用）
-		self._joint_widgets = {}
-
 		# 状態復元（可能なら）
 		self._load_state()
-		# knee simulator の状態復元（hipの関節ラジオと独立）
-		self._load_knee_state()
-		# 直前の関節種別を記録（関節切替時の差分判定用）
-		self._prev_joint = self.joint_var.get()
-
-		# 可視化チェックボックスの状態は、可視化ウィンドウを閉じる時に _save_state で
-		# 永続化する（trace_add で即時保存すると VTK のcallback 内で再入が起きて
-		# PyVista ウィンドウが落ちることがあるため）。
-		# NASパスを含む状態復元後にキャッシュを初期化
-		self._init_shared_cache()
 
 		# スタイル設定（LabelFrameのタイトルを太字に）
 		style = ttk.Style()
@@ -490,31 +345,23 @@ class MainMenuGUI(_BaseWindow):
 		self.notebook = ttk.Notebook(main_container)
 		self.notebook.grid(row=1, column=0, sticky="nsew")
 
-		# タブ1: hip simulator（旧「Simulator」。股関節用可視化）
+		# タブ1: Simulator
 		self.simulator_tab = ttk.Frame(self.notebook, padding=12)
-		self.notebook.add(self.simulator_tab, text="hip simulator")
+		self.notebook.add(self.simulator_tab, text="Simulator")
 
-		# タブ1b: knee simulator（FRS-2015 ロボット準拠 膝関節用可視化）
-		self.knee_simulator_tab = ttk.Frame(self.notebook, padding=12)
-		self.notebook.add(self.knee_simulator_tab, text="knee simulator")
-
-		# タブ2: Cache Settings
-		self.cache_tab = ttk.Frame(self.notebook, padding=12)
-		self.notebook.add(self.cache_tab, text="Cache Settings")
-
-		# タブ3: Fitting
+		# タブ2: Fitting
 		self.fitting_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.fitting_tab, text="Fitting")
 
-		# タブ4: 軟骨分離 (Cartilage Separation)
+		# タブ3: 軟骨分離 (Cartilage Separation)
 		self.cartilage_sep_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.cartilage_sep_tab, text="軟骨分離")
 
-		# タブ5: FEM解析
+		# タブ4: FEM解析
 		self.fem_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.fem_tab, text="FEM解析")
 
-		# タブ6: Utilities (サブタブを含むコンテナ)
+		# タブ5: Utilities (サブタブを含むコンテナ)
 		self.utilities_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.utilities_tab, text="Utilities")
 		
@@ -558,12 +405,8 @@ class MainMenuGUI(_BaseWindow):
 		self.pp_merge_tab = ttk.Frame(self.utilities_notebook, padding=12)
 		self.utilities_notebook.add(self.pp_merge_tab, text="pp merge")
 
-
-		# Simulatタブ (hip simulator) のコンテンツを作成
+		# Simulatorタブのコンテンツを作成
 		self._create_simulator_tab()
-
-		# knee simulatorタブのコンテンツを作成
-		self._create_knee_simulator_tab()
 
 		# Fittingタブのコンテンツを作成
 		self._create_fitting_tab()
@@ -602,9 +445,6 @@ class MainMenuGUI(_BaseWindow):
 		# pp mergeタブのコンテンツを作成
 		self._create_pp_merge_tab()
 
-		# Cache Settingsタブのコンテンツを作成
-		self._create_cache_tab()
-
 		# 初期状態のボタン活性制御
 		self.update_button_states()
 
@@ -624,89 +464,10 @@ class MainMenuGUI(_BaseWindow):
 		self.after(100, self._save_initial_geometry)
 	# endregion 初期化とUI構築
 
-	# region 共有キャッシュ初期化
-	def _init_shared_cache(self) -> None:
-		"""SharedCacheManagerを初期化する。
-
-		NASパスが設定されていればNAS+ローカル2層、
-		未設定ならローカルのみのキャッシュを構築。
-		"""
-		try:
-			nas_path = self.cache_nas_path.get().strip() or None
-			base_dir = Path(__file__).parent
-
-			# FEM用キャッシュ
-			self._shared_fem_cache = SharedCacheManager(
-				nas_dir=nas_path + "/fem_cache" if nas_path else None,
-				namespace="fem",
-				max_nas_gb=10.0,
-			)
-
-			# Overlap/Heatmap用キャッシュ
-			self._shared_overlap_cache = SharedCacheManager(
-				nas_dir=nas_path + "/overlap_cache" if nas_path else None,
-				namespace="overlap",
-				max_nas_gb=10.0,
-			)
-
-			if nas_path:
-				print(f"[SharedCache] NASパス設定: {nas_path}")
-				# NAS接続チェック（ログ目的のみ）をバックグラウンドで実行（UIをブロックしない）
-				fem_cache_ref = self._shared_fem_cache
-				overlap_cache_ref = self._shared_overlap_cache
-
-				def _check_nas_log():
-					if fem_cache_ref.is_nas_available():
-						print("[SharedCache] NAS接続OK (FEM)")
-					else:
-						print("[SharedCache] NAS接続失敗 → ローカルフォールバック (FEM)")
-					if overlap_cache_ref.is_nas_available():
-						print("[SharedCache] NAS接続OK (Overlap)")
-					else:
-						print("[SharedCache] NAS接続失敗 → ローカルフォールバック (Overlap)")
-
-				threading.Thread(target=_check_nas_log, daemon=True).start()
-			else:
-				print("[SharedCache] NAS未設定 → ローカルキャッシュのみ")
-		except Exception as e:
-			print(f"[SharedCache] 初期化エラー: {e}")
-			self._shared_fem_cache = None
-			self._shared_overlap_cache = None
-
-	def _reinit_shared_cache(self) -> None:
-		"""NASパス変更時にキャッシュを再初期化する"""
-		self._init_shared_cache()
-	# endregion 共有キャッシュ初期化
-
 	# region UI構築メソッド
 	def _create_simulator_tab(self) -> None:
 		"""Simulatorタブのコンテンツを作成"""
-		# スクロール可能なメインフレーム
-		canvas = tk.Canvas(self.simulator_tab, highlightthickness=0)
-		scrollbar = ttk.Scrollbar(self.simulator_tab, orient="vertical", command=canvas.yview)
-		scrollable_frame = ttk.Frame(canvas)
-
-		scrollable_frame.bind(
-			"<Configure>",
-			lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-		)
-
-		canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-		canvas.configure(yscrollcommand=scrollbar.set)
-
-		canvas.pack(side="left", fill="both", expand=True)
-		scrollbar.pack(side="right", fill="y")
-
-		# マウスホイールでスクロール（Mac/Windows/Linux 両対応）
-		def _on_mousewheel(event):
-			step = _mousewheel_units(event)
-			if step:
-				canvas.yview_scroll(step, "units")
-		canvas.bind_all("<MouseWheel>", _on_mousewheel)
-		canvas.bind_all("<Button-4>", _on_mousewheel)
-		canvas.bind_all("<Button-5>", _on_mousewheel)
-
-		container = scrollable_frame
+		container = self.simulator_tab
 		container.columnconfigure(0, weight=1)
 
 		# Section: 使用する関節
@@ -715,18 +476,17 @@ class MainMenuGUI(_BaseWindow):
 		joint_frame.columnconfigure(0, weight=1)
 
 		rb1 = ttk.Radiobutton(
-			joint_frame, text="1. 股関節", value=1, variable=self.joint_var, command=self._on_joint_changed
+			joint_frame, text="1. 股関節", value=1, variable=self.joint_var, command=self.update_button_states
 		)
 		rb2 = ttk.Radiobutton(
-			joint_frame, text="2. 膝関節 (ISB仕様)", value=2, variable=self.joint_var, command=self._on_joint_changed
+			joint_frame, text="2. 膝関節 (未実装)", value=2, variable=self.joint_var, command=self.update_button_states, state="disabled"
 		)
 		# 左詰め・上下配置
 		rb1.grid(row=0, column=0, sticky="w", padx=12, pady=6)
 		rb2.grid(row=1, column=0, sticky="w", padx=12, pady=6)
 
 		# Section: 近位ファイル選択
-		prox_file_frame = ttk.LabelFrame(container, text=self._joint_label("prox_file_frame"), style="Bold.TLabelframe")
-		self._joint_widgets["prox_file_frame"] = prox_file_frame
+		prox_file_frame = ttk.LabelFrame(container, text="近位ファイル選択（寛骨臼側）", style="Bold.TLabelframe")
 		prox_file_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
 		for i in range(3):
 			prox_file_frame.columnconfigure(i, weight=1)
@@ -741,19 +501,19 @@ class MainMenuGUI(_BaseWindow):
 		)
 
 		# 近位特徴点ABCD (PP)
-		self._joint_widgets["prox_pp_abcd_label"] = self._add_file_row(
+		self._add_file_row(
 			parent=prox_file_frame,
 			row=1,
-			label_text=self._joint_label("prox_pp_abcd_label"),
+			label_text="近位特徴点 ABCD (PP)",
 			textvariable=self.prox_pp_abcd_path,
 			command=self.choose_prox_pp_abcd,
 		)
 
 		# 近位特徴点OLMN (PP)
-		self._joint_widgets["prox_pp_olmn_label"] = self._add_file_row(
+		self._add_file_row(
 			parent=prox_file_frame,
 			row=2,
-			label_text=self._joint_label("prox_pp_olmn_label"),
+			label_text="近位特徴点 OLMN (PP)",
 			textvariable=self.prox_pp_olmn_path,
 			command=self.choose_prox_pp_olmn,
 		)
@@ -767,14 +527,8 @@ class MainMenuGUI(_BaseWindow):
 			command=self.choose_prox_cartilage_model,
 		)
 
-		# 特徴点の意味を表示する小ラベル
-		prox_legend = ttk.Label(prox_file_frame, text=self._joint_label("prox_legend"), foreground="gray", font=(self.ui_font_family, 8))
-		prox_legend.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 6))
-		self._joint_widgets["prox_legend"] = prox_legend
-
 		# Section: 遠位ファイル選択
-		dist_file_frame = ttk.LabelFrame(container, text=self._joint_label("dist_file_frame"), style="Bold.TLabelframe")
-		self._joint_widgets["dist_file_frame"] = dist_file_frame
+		dist_file_frame = ttk.LabelFrame(container, text="遠位ファイル選択（大腿骨側）", style="Bold.TLabelframe")
 		dist_file_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
 		for i in range(3):
 			dist_file_frame.columnconfigure(i, weight=1)
@@ -788,20 +542,20 @@ class MainMenuGUI(_BaseWindow):
 			command=self.choose_dist_model,
 		)
 
-		# 遠位特徴点ABC/ABCD (PP) - 関節種別でラベル切替
-		self._joint_widgets["dist_pp_abc_label"] = self._add_file_row(
+		# 遠位特徴点ABC (PP)
+		self._add_file_row(
 			parent=dist_file_frame,
 			row=1,
-			label_text=self._joint_label("dist_pp_abc_label"),
+			label_text="遠位特徴点 ABC (PP)",
 			textvariable=self.dist_pp_abc_path,
 			command=self.choose_dist_pp_abc,
 		)
 
 		# 遠位特徴点OLMN (PP)
-		self._joint_widgets["dist_pp_olmn_label"] = self._add_file_row(
+		self._add_file_row(
 			parent=dist_file_frame,
 			row=2,
-			label_text=self._joint_label("dist_pp_olmn_label"),
+			label_text="遠位特徴点 OLMN (PP)",
 			textvariable=self.dist_pp_olmn_path,
 			command=self.choose_dist_pp_olmn,
 		)
@@ -814,11 +568,6 @@ class MainMenuGUI(_BaseWindow):
 			textvariable=self.dist_cartilage_model_path,
 			command=self.choose_dist_cartilage_model,
 		)
-
-		# 特徴点の意味を表示する小ラベル
-		dist_legend = ttk.Label(dist_file_frame, text=self._joint_label("dist_legend"), foreground="gray", font=(self.ui_font_family, 8))
-		dist_legend.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 6))
-		self._joint_widgets["dist_legend"] = dist_legend
 
 		# 操作ボタン段（可視化）
 		action_frame = ttk.Frame(container)
@@ -855,1563 +604,6 @@ class MainMenuGUI(_BaseWindow):
 		# シミュレーション実行（ヒートマップ事前計算→アニメーション）
 		self.animate_button = ttk.Button(tf_frame, text="シミュレーション実行", command=self.on_animate)
 		self.animate_button.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
-
-	# region knee simulator (FRS-2015 ロボット準拠 膝関節)
-	def _create_knee_simulator_tab(self) -> None:
-		"""knee simulatorタブのUIを構築（FRS-2015 ロボット準拠 膝関節）。
-
-		座標系: 木村圭 学位論文 第3章 / 木村・藤江 機械学会論文集 2015 / 藤江「動作原理と改良」2024。
-		入力: 初期状態(組立)スキャン + 特徴点(L,M,N,MCL,LCL) / 大腿骨・脛骨モデル(試験後別スキャン) /
-		      左右・W_scan / 変位データ。大腿骨/脛骨モデルはICP/RANSACで初期スキャンへ位置合わせする。
-		"""
-		# 試験タブバー（スクロール外・常時表示）: 各タブ=独立した試験の状態。＋で追加/右クリックで削除・改名
-		tabbar_row = tk.Frame(self.knee_simulator_tab)
-		tabbar_row.pack(side="top", fill="x", padx=4, pady=(4, 0))
-		tk.Label(tabbar_row, text="試験タブ:", font=(self.ui_font_family, 9)).pack(side="left", padx=(0, 4))
-		self._knee_tabbar_frame = tk.Frame(tabbar_row)
-		self._knee_tabbar_frame.pack(side="left", fill="x")
-
-		# スクロール可能なメインフレーム
-		canvas = tk.Canvas(self.knee_simulator_tab, highlightthickness=0)
-		scrollbar = ttk.Scrollbar(self.knee_simulator_tab, orient="vertical", command=canvas.yview)
-		scrollable_frame = ttk.Frame(canvas)
-		scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-		canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-		canvas.configure(yscrollcommand=scrollbar.set)
-		canvas.pack(side="left", fill="both", expand=True)
-		scrollbar.pack(side="right", fill="y")
-
-		def _on_mousewheel(event):
-			step = _mousewheel_units(event)
-			if step:
-				canvas.yview_scroll(step, "units")
-		canvas.bind("<Enter>", lambda e: (canvas.bind_all("<MouseWheel>", _on_mousewheel),
-		                                   canvas.bind_all("<Button-4>", _on_mousewheel),
-		                                   canvas.bind_all("<Button-5>", _on_mousewheel)))
-		canvas.bind("<Leave>", lambda e: (canvas.unbind_all("<MouseWheel>"),
-		                                   canvas.unbind_all("<Button-4>"),
-		                                   canvas.unbind_all("<Button-5>")))
-
-		container = scrollable_frame
-		container.columnconfigure(0, weight=1)
-
-		# タイトル
-		ttk.Label(container, text="knee simulator（FRS-2015 ロボット準拠 膝関節）",
-		          font=(self.ui_font_family, 12, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
-		ttk.Label(container,
-		          text="大腿骨座標系Cf(木村論文): 原点=MCL/LCL付着部の中点, Z=LCL→MCL(右膝で外側+), "
-		               "Y=骨軸(L,M,N由来の基準方向)をZ⊥面へ投影(近位+), X=Y×Z。脛骨座標系Ctは伸展位でCfに一致。",
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 8))
-
-		# Section: 初期状態スキャン（座標系の基準）
-		init_frame = ttk.LabelFrame(container, text="① 初期状態スキャン（座標系の基準）", style="Bold.TLabelframe")
-		init_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
-		for i in range(3):
-			init_frame.columnconfigure(i, weight=[0, 1, 0][i])
-		self._add_file_row(init_frame, 0, "初期状態スキャン (STL/OBJ)", self.knee_initial_scan_path,
-		                   lambda: self._knee_choose(self.knee_initial_scan_path, "初期状態スキャンを選択", "model"))
-		self._add_file_row(init_frame, 1, "初期スキャン特徴点 (PP)", self.knee_initial_pp_path,
-		                   lambda: self._knee_choose(self.knee_initial_pp_path, "初期スキャン特徴点(L,M,N,MCL,LCL)を選択", "pp"))
-		ttk.Label(init_frame, text="特徴点ラベル: L, M, N (大腿骨クランプパネル頂点), MCL, LCL (側副靭帯 大腿骨付着部)",
-		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
-		# 左右・W_scan
-		opt = ttk.Frame(init_frame)
-		opt.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 6))
-		ttk.Label(opt, text="関節側:").grid(row=0, column=0, sticky="w")
-		ttk.Radiobutton(opt, text="右膝", value=1, variable=self.knee_side_var).grid(row=0, column=1, sticky="w", padx=(6, 4))
-		ttk.Radiobutton(opt, text="左膝", value=2, variable=self.knee_side_var).grid(row=0, column=2, sticky="w", padx=(0, 16))
-		ttk.Label(opt, text="W_scan (伸展位屈曲角φ, deg):").grid(row=0, column=3, sticky="w")
-		ttk.Entry(opt, textvariable=self.knee_w_scan_deg, width=8).grid(row=0, column=4, sticky="w", padx=(6, 4))
-		ttk.Label(opt, text="ヒト膝=0 / 動物膝=実測(30〜40)", foreground="gray",
-		          font=(self.ui_font_family, 8)).grid(row=0, column=5, sticky="w")
-
-		ttk.Button(init_frame, text="特徴点/座標系を可視化", command=self.on_knee_visualize_coords
-		           ).grid(row=4, column=0, sticky="w", padx=12, pady=(0, 8))
-
-		# Section: 大腿骨・脛骨モデル（試験後スキャン）
-		model_frame = ttk.LabelFrame(container, text="② 大腿骨・脛骨モデル（試験後の別スキャン）", style="Bold.TLabelframe")
-		model_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
-		for i in range(3):
-			model_frame.columnconfigure(i, weight=[0, 1, 0][i])
-		self._add_file_row(model_frame, 0, "大腿骨モデル (STL/OBJ)", self.knee_femur_model_path,
-		                   lambda: self._knee_choose(self.knee_femur_model_path, "大腿骨モデルを選択", "model"))
-		self._add_file_row(model_frame, 1, "脛骨モデル (STL/OBJ)", self.knee_tibia_model_path,
-		                   lambda: self._knee_choose(self.knee_tibia_model_path, "脛骨モデルを選択", "model"))
-		ttk.Label(model_frame, text="※ これらのモデルには特徴点は不要（幾何のみ）。③の位置合わせで初期スキャン座標系へ整列します。",
-		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
-
-		# Section: 位置合わせ（大腿骨・脛骨を個別に）
-		reg_frame = ttk.LabelFrame(container, text="③ 位置合わせ（大腿骨・脛骨を個別に → 初期スキャン座標系へ）", style="Bold.TLabelframe")
-		reg_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
-		reg_frame.columnconfigure(0, weight=1)
-		self._build_knee_reg_panel(
-			reg_frame, 0, "femur", "大腿骨",
-			self.knee_reg_femur_src_path, self.knee_reg_femur_tgt_path,
-			"大腿骨モデル側 位置合わせ領域を選択", "初期スキャンの大腿骨領域を選択")
-		self._build_knee_reg_panel(
-			reg_frame, 1, "tibia", "脛骨",
-			self.knee_reg_tibia_src_path, self.knee_reg_tibia_tgt_path,
-			"脛骨モデル側 位置合わせ領域を選択", "初期スキャンの脛骨領域を選択")
-		ttk.Button(reg_frame, text="位置合わせ結果を確認（大腿骨＋脛骨）", command=self.on_knee_preview_registration
-		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 6))
-		ttk.Label(reg_frame,
-		          text="※ 領域はモデル/初期スキャンから同一部位を切り出したもの。"
-		               "方式: RANSAC=特徴量 / 主軸PCA=向き粗合わせ / 手動3点=対応点クリック → いずれもICPで仕上げ。"
-		               "パラメータは骨ごとに設定・プリセット保存できます。",
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 6))
-		self._knee_refresh_preset_combos()
-
-		# Section: 変位データ・シミュレーション
-		sim_frame = ttk.LabelFrame(container, text="④ 変位・姿勢変化データ / シミュレーション", style="Bold.TLabelframe")
-		sim_frame.grid(row=5, column=0, sticky="nsew", pady=(0, 8))
-		for i in range(3):
-			sim_frame.columnconfigure(i, weight=[0, 1, 0][i])
-		self._add_file_row(sim_frame, 0, "変位・姿勢変化データ (xlsx/kkr)", self.knee_transform_path,
-		                   lambda: self._knee_choose(self.knee_transform_path, "変位・姿勢変化データを選択", "transform"))
-		# 表示色（hipの可視化オプションとは独立。タブごとに保存され、可視化/シミュレーションに反映）
-		colf = ttk.Frame(sim_frame)
-		colf.grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 2))
-		ttk.Label(colf, text="表示色:").grid(row=0, column=0, sticky="w")
-		ttk.Label(colf, text="大腿骨").grid(row=0, column=1, sticky="w", padx=(8, 2))
-		self.knee_femur_color_btn = tk.Button(colf, width=3, relief="ridge",
-		                                      command=lambda: self._knee_choose_color("femur"))
-		self.knee_femur_color_btn.grid(row=0, column=2, sticky="w")
-		ttk.Label(colf, text="脛骨").grid(row=0, column=3, sticky="w", padx=(12, 2))
-		self.knee_tibia_color_btn = tk.Button(colf, width=3, relief="ridge",
-		                                      command=lambda: self._knee_choose_color("tibia"))
-		self.knee_tibia_color_btn.grid(row=0, column=4, sticky="w")
-		ttk.Label(colf, text="（試験タブごとに保存。hip simulatorの可視化オプションとは独立）",
-		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=0, column=5, sticky="w", padx=(10, 0))
-		self._knee_update_color_buttons()
-		ttk.Button(sim_frame, text="関節全体を可視化", command=self.on_knee_visualize_all
-		           ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 4))
-		ttk.Button(sim_frame, text="シミュレーション実行", command=self.on_knee_animate
-		           ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 8))
-
-		# Section: シーン共有（別PC・別OS＝解析サーバーやMacで計算/再現するため）
-		scene_frame = ttk.LabelFrame(container, text="⑤ シーン共有（別PC・別OSで計算/動作再現）", style="Bold.TLabelframe")
-		scene_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
-		scene_frame.columnconfigure(0, weight=1)
-		sbtn = ttk.Frame(scene_frame)
-		sbtn.grid(row=0, column=0, sticky="w", padx=12, pady=(4, 2))
-		ttk.Button(sbtn, text="このタブのシーンを保存", command=self.on_knee_scene_save
-		           ).grid(row=0, column=0, sticky="w", padx=(0, 8))
-		ttk.Button(sbtn, text="全タブのシーンを保存", command=self.on_knee_scene_save_all
-		           ).grid(row=0, column=1, sticky="w", padx=(0, 8))
-		ttk.Button(sbtn, text="シーンを読込（タブ名で同期）", command=self.on_knee_scene_load
-		           ).grid(row=0, column=2, sticky="w")
-		ttk.Label(scene_frame,
-		          text="試験タブ名ごとに 位置合わせ(reg_T)・W_scan・左右・ファイル内容ハッシュを cache/knee_scene.json へ保存します\n"
-		               "（小さいのでgit共有可）。読込はタブ名で同期: 同名タブは更新・無ければ新規作成＝タブ名も別PCへ引き継げます。\n"
-		               "運用A（サーバーで計算）: Windowsで位置合わせ→保存→push → サーバーでpull→読込→シミュレーション実行。\n"
-		               "運用B（Mac等で動作再現）: シーンは git pull、キャッシュ(cache/overlap/*.pkl)は大容量のためgit対象外\n"
-		               "　→ Box/USB等でコピーして配置。同じ内容のモデル/変位データを選んで実行するとキャッシュが即ヒットし、\n"
-		               "　再計算なしで動作再現できます（キャッシュは内容ハッシュ方式・OS非依存）。\n"
-		               "※ファイルパス自体は引き継がれません。各PCで同内容のファイルを選び直してください（一致は読込時に自動チェック）。",
-		          foreground="gray", font=(self.ui_font_family, 8), justify="left"
-		          ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
-
-		# 試験タブを初期化（未初期化なら現状態を試験1として作成）してタブバーを描画
-		self._knee_init_tabs()
-
-	def _knee_choose(self, var: tk.StringVar, title: str, kind: str) -> None:
-		"""knee simulator用の共通ファイル選択ダイアログ。kind: 'model' | 'pp' | 'transform'."""
-		if kind == "pp":
-			ft = [("特徴点ファイル", "*.pp"), ("すべてのファイル", "*.*")]
-		elif kind == "transform":
-			ft = [("変位データ", "*.xlsx *.kkr *.KKR"), ("Excelファイル", "*.xlsx"),
-			      ("KKRファイル", "*.KKR *.kkr"), ("すべてのファイル", "*.*")]
-		else:
-			ft = [("3Dモデル", "*.obj *.stl"), ("OBJ", "*.obj"), ("STL", "*.stl"), ("すべてのファイル", "*.*")]
-		path = filedialog.askopenfilename(title=title, filetypes=ft)
-		if path:
-			var.set(path)
-
-	# ----- Knee simulator 表示色（hipの可視化オプションとは独立・タブごとに保存） -----
-	def _knee_color(self, bone: str) -> str:
-		"""kneeの表示色（femur/tibia）を返す。不正値は既定色にフォールバック。"""
-		var = self.knee_femur_color_var if bone == "femur" else self.knee_tibia_color_var
-		default = "#DEB887" if bone == "femur" else "#ADD8E6"
-		try:
-			c = str(var.get()).strip()
-		except Exception:
-			return default
-		if len(c) == 7 and c[0] == "#" and all(ch in "0123456789abcdefABCDEF" for ch in c[1:]):
-			return c
-		return default
-
-	def _knee_choose_color(self, bone: str) -> None:
-		"""④の表示色（大腿骨/脛骨）をカラーピッカーで変更する。"""
-		var = self.knee_femur_color_var if bone == "femur" else self.knee_tibia_color_var
-		title = "大腿骨の表示色を選択" if bone == "femur" else "脛骨の表示色を選択"
-		color = colorchooser.askcolor(initialcolor=self._knee_color(bone), title=title)
-		if color and color[1]:
-			var.set(color[1])
-			self._knee_update_color_buttons()
-
-	def _knee_update_color_buttons(self) -> None:
-		"""④の色見本ボタンの背景を現在の設定色に合わせる（タブ切替・シーン読込時にも呼ぶ）。"""
-		for bone, btn_name in (("femur", "knee_femur_color_btn"), ("tibia", "knee_tibia_color_btn")):
-			btn = getattr(self, btn_name, None)
-			if btn is None:
-				continue
-			try:
-				c = self._knee_color(bone)
-				btn.configure(bg=c, activebackground=c)
-			except Exception:
-				pass
-
-	# ----- Knee simulator 複数タブ（各タブ=独立スナップショット、UI/コードは共通） -----
-	def _knee_snapshot_current(self) -> dict:
-		"""現在の knee 状態（全入力・パラメータ・位置合わせ結果）をdictに保存する。"""
-		snap = {}
-		for key, (var, _t) in self._knee_state_vars().items():
-			try:
-				snap[key] = var.get()
-			except Exception:
-				pass
-		snap['_femur_reg_T'] = self._knee_femur_reg_T.tolist() if self._knee_femur_reg_T is not None else None
-		snap['_tibia_reg_T'] = self._knee_tibia_reg_T.tolist() if self._knee_tibia_reg_T is not None else None
-		return snap
-
-	def _knee_restore_snapshot(self, snap: dict) -> None:
-		"""dict の状態を現在の knee UI（ライブ変数）へ反映する。
-		スナップショットに無いキーは既定値へ戻す（後から追加した変数が旧タブに残留しないように）。"""
-		if not isinstance(snap, dict):
-			return
-		default = self._knee_default_snap if isinstance(getattr(self, "_knee_default_snap", None), dict) else {}
-		for key, (var, typ) in self._knee_state_vars().items():
-			if key in snap:
-				v = snap[key]
-			elif key in default:
-				v = default[key]
-			else:
-				continue
-			try:
-				if typ is bool:
-					var.set(bool(v))
-				elif typ is int:
-					var.set(int(v))
-				elif typ is float:
-					var.set(float(v))
-				else:
-					var.set(str(v))
-			except Exception:
-				pass
-		self._knee_femur_reg_T = np.array(snap['_femur_reg_T'], dtype=float) if snap.get('_femur_reg_T') is not None else None
-		self._knee_tibia_reg_T = np.array(snap['_tibia_reg_T'], dtype=float) if snap.get('_tibia_reg_T') is not None else None
-		self._knee_update_color_buttons()
-
-	def _knee_rebuild_tabbar(self) -> None:
-		"""タブバー（試験ごとのボタン＋「＋」）を再描画する。"""
-		fr = self._knee_tabbar_frame
-		if fr is None:
-			return
-		for w in fr.winfo_children():
-			w.destroy()
-		self._knee_tab_buttons = []
-		for i, tab in enumerate(self._knee_tabs):
-			active = (i == self._knee_active_tab)
-			b = tk.Button(
-				fr, text=tab.get('name', f"試験{i+1}"),
-				relief=('sunken' if active else 'raised'),
-				bg=('#cfe3ff' if active else '#f0f0f0'),
-				font=(self.ui_font_family, 9, 'bold' if active else 'normal'),
-				command=lambda i=i: self.on_knee_tab_select(i), padx=8, pady=2)
-			b.pack(side='left', padx=2)
-			b.bind("<Button-3>", lambda e, i=i: self._knee_tab_context_menu(e, i))
-			# ドラッグで並べ替え（クリック=切替はしきい値未満のときだけ Button の command に任せる）
-			b.bind("<ButtonPress-1>", lambda e, i=i: self._knee_tab_drag_start(e, i))
-			b.bind("<B1-Motion>", self._knee_tab_drag_motion)
-			b.bind("<ButtonRelease-1>", self._knee_tab_drag_release)
-			self._knee_tab_buttons.append(b)
-		plus = tk.Button(fr, text="＋", command=self.on_knee_tab_add, padx=6, pady=2)
-		plus.pack(side='left', padx=(8, 2))
-
-	def _knee_tab_context_menu(self, event, i: int) -> None:
-		menu = tk.Menu(self, tearoff=0)
-		menu.add_command(label="名前変更", command=lambda: self.on_knee_tab_rename(i))
-		menu.add_command(label="削除", command=lambda: self.on_knee_tab_delete(i))
-		menu.add_separator()
-		menu.add_command(label="← 左へ移動", command=lambda: self._knee_tab_move(i, i - 1),
-		                 state=("normal" if i > 0 else "disabled"))
-		menu.add_command(label="→ 右へ移動", command=lambda: self._knee_tab_move(i, i + 1),
-		                 state=("normal" if i < len(self._knee_tabs) - 1 else "disabled"))
-		try:
-			menu.tk_popup(event.x_root, event.y_root)
-		finally:
-			menu.grab_release()
-
-	# ----- 試験タブの並べ替え（ドラッグ＆右クリックメニュー） -----
-	def _knee_tab_move(self, i: int, j: int) -> None:
-		"""試験タブ i を位置 j へ移動する（アクティブタブは移動に追従）。"""
-		n = len(self._knee_tabs)
-		if not (0 <= i < n and 0 <= j < n) or i == j:
-			return
-		tab = self._knee_tabs.pop(i)
-		self._knee_tabs.insert(j, tab)
-		a = self._knee_active_tab
-		if a == i:
-			a = j
-		else:
-			if a > i:
-				a -= 1
-			if a >= j:
-				a += 1
-		self._knee_active_tab = a
-		self._knee_rebuild_tabbar()
-
-	def _knee_tab_drag_start(self, event, i: int) -> None:
-		self._knee_tab_drag = {"from": i, "x": event.x_root, "moved": False}
-
-	def _knee_tab_drag_motion(self, event) -> None:
-		d = self._knee_tab_drag
-		if d is None:
-			return
-		if not d["moved"] and abs(event.x_root - d["x"]) > 12:
-			d["moved"] = True
-			try:
-				event.widget.configure(cursor="sb_h_double_arrow")
-			except Exception:
-				pass
-
-	def _knee_tab_drag_release(self, event):
-		d = self._knee_tab_drag
-		self._knee_tab_drag = None
-		if not d or not d["moved"]:
-			return None  # ただのクリック → Button の command（タブ切替）に任せる
-		try:
-			event.widget.configure(cursor="")
-		except Exception:
-			pass
-		j = self._knee_tab_index_at(event.x_root)
-		if j is None or j == d["from"]:
-			return None
-		self._knee_tab_move(d["from"], j)
-		return "break"  # 並べ替えた場合はクリック（タブ切替）を発火させない
-
-	def _knee_tab_index_at(self, x_root: int):
-		"""タブバー上の x_root 座標に対応する試験タブのindexを返す（隙間は左隣、範囲外は端）。"""
-		btns = self._knee_tab_buttons
-		if not btns:
-			return None
-		best = 0
-		for idx, b in enumerate(btns):
-			try:
-				bx = b.winfo_rootx()
-				bw = b.winfo_width()
-			except Exception:
-				continue
-			if x_root >= bx:
-				best = idx
-			if bx <= x_root < bx + bw:
-				return idx
-		return best
-
-	def on_knee_tab_select(self, i: int) -> None:
-		if i < 0 or i >= len(self._knee_tabs) or i == self._knee_active_tab:
-			return
-		# 現在のタブへ保存してから切替
-		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-		self._knee_active_tab = i
-		self._knee_restore_snapshot(self._knee_tabs[i]['snapshot'])
-		self._knee_rebuild_tabbar()
-
-	# ④（変位・姿勢変化データ）に属するキー。タブ追加時の複製から除外する
-	_KNEE_TAB_NO_COPY_KEYS = ("knee_transform",)
-
-	def on_knee_tab_add(self) -> None:
-		"""タブ追加: 一つ左（末尾）のタブを複製する（④変位データのみ既定値に戻す）。"""
-		if self._knee_tabs:
-			self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-			# 新タブの一つ左＝現在の末尾タブを複製（モデルパス・位置合わせ結果reg_T等を引き継ぐ）
-			snap = copy.deepcopy(self._knee_tabs[-1].get('snapshot') or {})
-			for key in self._KNEE_TAB_NO_COPY_KEYS:
-				if isinstance(self._knee_default_snap, dict) and key in self._knee_default_snap:
-					snap[key] = self._knee_default_snap[key]
-				else:
-					snap.pop(key, None)
-		else:
-			snap = copy.deepcopy(self._knee_default_snap or {})
-		self._knee_tabs.append({'name': self._knee_unique_tab_name(), 'snapshot': snap})
-		self._knee_active_tab = len(self._knee_tabs) - 1
-		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
-		self._knee_rebuild_tabbar()
-
-	def _knee_unique_tab_name(self, base: str = "試験") -> str:
-		"""既存タブと重複しない「試験N」を返す（シーン共有がタブ名キーのため重複回避）。"""
-		names = {t.get('name', '') for t in self._knee_tabs}
-		n = len(self._knee_tabs) + 1
-		while f"{base}{n}" in names:
-			n += 1
-		return f"{base}{n}"
-
-	def on_knee_tab_delete(self, i: int) -> None:
-		if len(self._knee_tabs) <= 1:
-			messagebox.showinfo("タブ削除", "最後のタブは削除できません。")
-			return
-		if not messagebox.askyesno("タブ削除", f"タブ「{self._knee_tabs[i].get('name','')}」を削除しますか？"):
-			return
-		# 現在のアクティブ状態を保存してから削除
-		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-		del self._knee_tabs[i]
-		if self._knee_active_tab == i:
-			self._knee_active_tab = min(i, len(self._knee_tabs) - 1)
-		elif self._knee_active_tab > i:
-			self._knee_active_tab -= 1
-		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
-		self._knee_rebuild_tabbar()
-
-	def on_knee_tab_rename(self, i: int) -> None:
-		cur = self._knee_tabs[i].get('name', '')
-		new = simpledialog.askstring("タブ名変更", "タブ名:", initialvalue=cur, parent=self)
-		if new and new.strip():
-			new = new.strip()
-			others = {t.get('name', '') for k, t in enumerate(self._knee_tabs) if k != i}
-			if new in others:
-				messagebox.showwarning("タブ名変更",
-					f"「{new}」は既に存在します。シーン共有はタブ名で対応付けるため、別の名前にしてください。")
-				return
-			self._knee_tabs[i]['name'] = new
-			self._knee_rebuild_tabbar()
-
-	def _knee_init_tabs(self) -> None:
-		"""UI構築後: タブが未初期化なら現在の状態を試験1として1つ作る。"""
-		if not self._knee_tabs:
-			self._knee_tabs = [{'name': '試験1', 'snapshot': self._knee_snapshot_current()}]
-			self._knee_active_tab = 0
-		if self._knee_active_tab >= len(self._knee_tabs):
-			self._knee_active_tab = 0
-		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
-		self._knee_rebuild_tabbar()
-
-	# ----- Knee registration params / presets (骨ごと) -----
-	def _knee_param_spec(self):
-		"""位置合わせ数値パラメータの仕様: (key, kind, default, ラベル)。"""
-		return [
-			("ransac_distance", "float", 1.0, "RANSAC距離(mm)"),
-			("ransac_max_iter", "int", 1000, "RANSAC反復"),
-			("ransac_confidence", "float", 0.99, "RANSAC信頼度"),
-			("icp_threshold", "float", 5.0, "ICP距離(mm)"),
-			("icp_max_iter", "int", 2000, "ICP反復"),
-			("sample_points", "int", 100000, "サンプル点数"),
-			("voxel_size", "float", 0.0, "ボクセル(mm,0=自動)"),
-		]
-
-	def _knee_get_params(self, bone: str) -> dict:
-		"""指定した骨の現在の位置合わせパラメータを plain dict で返す。"""
-		p = {}
-		for key, kind, default, _lbl in self._knee_param_spec():
-			try:
-				v = self.knee_reg_pvars[bone][key].get()
-				p[key] = int(v) if kind == "int" else float(v)
-			except Exception:
-				p[key] = default
-		p["method"] = self.knee_reg_method_var[bone].get()
-		p["enable_scaling"] = bool(self.knee_reg_scaling_var[bone].get())
-		p["preview"] = bool(self.knee_reg_preview_var[bone].get())
-		return p
-
-	def _knee_set_params(self, bone: str, d: dict) -> None:
-		"""dict の値を指定した骨のパラメータUIに反映する。"""
-		for key, kind, default, _lbl in self._knee_param_spec():
-			if key in d:
-				try:
-					self.knee_reg_pvars[bone][key].set(int(d[key]) if kind == "int" else float(d[key]))
-				except Exception:
-					pass
-		if "method" in d:
-			self.knee_reg_method_var[bone].set(str(d["method"]))
-		if "enable_scaling" in d:
-			self.knee_reg_scaling_var[bone].set(bool(d["enable_scaling"]))
-		if "preview" in d:
-			self.knee_reg_preview_var[bone].set(bool(d["preview"]))
-
-	def _knee_presets_file(self) -> Path:
-		import platform
-		fn = "frs2015_knee_reg_presets.json"
-		if platform.system() == "Darwin":
-			dd = Path.home() / ".frs_simulator"
-			dd.mkdir(parents=True, exist_ok=True)
-			return dd / fn
-		return Path(__file__).with_name(fn)
-
-	def _load_knee_presets(self) -> dict:
-		try:
-			p = self._knee_presets_file()
-			if p.exists():
-				data = json.load(p.open("r", encoding="utf-8"))
-				if isinstance(data, dict):
-					return data
-		except Exception as e:
-			print(f"[knee preset] 読込失敗: {e}")
-		return {}
-
-	def _save_knee_presets(self) -> None:
-		try:
-			p = self._knee_presets_file()
-			with p.open("w", encoding="utf-8") as f:
-				json.dump(self._knee_presets, f, ensure_ascii=False, indent=2)
-		except Exception as e:
-			print(f"[knee preset] 保存失敗: {e}")
-
-	def _knee_refresh_preset_combos(self) -> None:
-		names = sorted(self._knee_presets.keys())
-		for bone, combo in self.knee_preset_combo.items():
-			try:
-				combo["values"] = names
-			except Exception:
-				pass
-
-	def on_knee_preset_apply(self, bone: str) -> None:
-		name = self.knee_preset_sel[bone].get().strip()
-		if not name or name not in self._knee_presets:
-			messagebox.showwarning("プリセット", "適用するプリセットを選択してください。")
-			return
-		self._knee_set_params(bone, self._knee_presets[name])
-		messagebox.showinfo("プリセット", f"『{name}』を{('大腿骨' if bone == 'femur' else '脛骨')}に適用しました。")
-
-	def on_knee_preset_save(self, bone: str) -> None:
-		default = self.knee_preset_sel[bone].get().strip() or "preset1"
-		name = simpledialog.askstring("プリセット保存", "プリセット名:", initialvalue=default, parent=self)
-		if name is None:
-			return
-		name = name.strip()
-		if not name:
-			return
-		if name in self._knee_presets and not messagebox.askyesno("上書き確認", f"『{name}』を上書きしますか？"):
-			return
-		self._knee_presets[name] = self._knee_get_params(bone)
-		self._save_knee_presets()
-		self._knee_refresh_preset_combos()
-		self.knee_preset_sel[bone].set(name)
-		messagebox.showinfo("プリセット", f"『{name}』を保存しました。")
-
-	def on_knee_preset_rename(self, bone: str) -> None:
-		old = self.knee_preset_sel[bone].get().strip()
-		if not old or old not in self._knee_presets:
-			messagebox.showwarning("プリセット", "名前を変更するプリセットを選択してください。")
-			return
-		new = simpledialog.askstring("名前変更", "新しい名前:", initialvalue=old, parent=self)
-		if new is None:
-			return
-		new = new.strip()
-		if not new or new == old:
-			return
-		if new in self._knee_presets and not messagebox.askyesno("上書き確認", f"『{new}』は既にあります。上書きしますか？"):
-			return
-		self._knee_presets[new] = self._knee_presets.pop(old)
-		self._save_knee_presets()
-		self._knee_refresh_preset_combos()
-		for b in ("femur", "tibia"):
-			if self.knee_preset_sel[b].get() == old:
-				self.knee_preset_sel[b].set(new)
-
-	def on_knee_preset_delete(self, bone: str) -> None:
-		name = self.knee_preset_sel[bone].get().strip()
-		if not name or name not in self._knee_presets:
-			messagebox.showwarning("プリセット", "削除するプリセットを選択してください。")
-			return
-		if not messagebox.askyesno("削除確認", f"プリセット『{name}』を削除しますか？"):
-			return
-		del self._knee_presets[name]
-		self._save_knee_presets()
-		self._knee_refresh_preset_combos()
-		for b in ("femur", "tibia"):
-			if self.knee_preset_sel[b].get() == name:
-				self.knee_preset_sel[b].set("")
-
-	def _build_knee_reg_panel(self, parent, row, bone, label, src_var, tgt_var, src_title, tgt_title) -> None:
-		"""1つの骨(大腿骨/脛骨)の位置合わせパネルを構築する。"""
-		panel = ttk.LabelFrame(parent, text=f"{label}の位置合わせ", style="Bold.TLabelframe")
-		panel.grid(row=row, column=0, sticky="nsew", padx=8, pady=(4, 4))
-		for i in range(3):
-			panel.columnconfigure(i, weight=[0, 1, 0][i])
-		# 領域
-		self._add_file_row(panel, 0, f"{label}: モデル側 領域", src_var,
-		                   lambda: self._knee_choose(src_var, src_title, "model"))
-		self._add_file_row(panel, 1, f"{label}: 初期スキャン側 領域", tgt_var,
-		                   lambda: self._knee_choose(tgt_var, tgt_title, "model"))
-		# 方式
-		mf = ttk.Frame(panel)
-		mf.grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 0))
-		ttk.Label(mf, text="方式:").grid(row=0, column=0, sticky="w")
-		mv = self.knee_reg_method_var[bone]
-		ttk.Radiobutton(mf, text="RANSAC", value="ransac", variable=mv).grid(row=0, column=1, sticky="w", padx=(6, 6))
-		ttk.Radiobutton(mf, text="主軸PCA", value="pca", variable=mv).grid(row=0, column=2, sticky="w", padx=(0, 6))
-		ttk.Radiobutton(mf, text="手動3点", value="manual", variable=mv).grid(row=0, column=3, sticky="w", padx=(0, 6))
-		# パラメータ（3列レイアウト）
-		pf = ttk.Frame(panel)
-		pf.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 2))
-		pvars = self.knee_reg_pvars[bone]
-		col = 0
-		r = 0
-		for key, kind, default, lbl in self._knee_param_spec():
-			ttk.Label(pf, text=lbl + ":").grid(row=r, column=col * 2, sticky="w", pady=(2, 0))
-			ttk.Entry(pf, textvariable=pvars[key], width=8).grid(row=r, column=col * 2 + 1, sticky="w", padx=(4, 12), pady=(2, 0))
-			col += 1
-			if col >= 3:
-				col = 0
-				r += 1
-		# scaling / preview
-		cf = ttk.Frame(panel)
-		cf.grid(row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 0))
-		ttk.Checkbutton(cf, text="スケール補正", variable=self.knee_reg_scaling_var[bone]).grid(row=0, column=0, sticky="w", padx=(0, 12))
-		ttk.Checkbutton(cf, text="経過を表示", variable=self.knee_reg_preview_var[bone]).grid(row=0, column=1, sticky="w")
-		# プリセット
-		prf = ttk.Frame(panel)
-		prf.grid(row=5, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 2))
-		ttk.Label(prf, text="プリセット:").grid(row=0, column=0, sticky="w")
-		combo = ttk.Combobox(prf, textvariable=self.knee_preset_sel[bone], width=16, state="readonly")
-		combo.grid(row=0, column=1, sticky="w", padx=(4, 6))
-		self.knee_preset_combo[bone] = combo
-		ttk.Button(prf, text="適用", width=5, command=lambda b=bone: self.on_knee_preset_apply(b)).grid(row=0, column=2, padx=2)
-		ttk.Button(prf, text="保存", width=5, command=lambda b=bone: self.on_knee_preset_save(b)).grid(row=0, column=3, padx=2)
-		ttk.Button(prf, text="名前変更", width=8, command=lambda b=bone: self.on_knee_preset_rename(b)).grid(row=0, column=4, padx=2)
-		ttk.Button(prf, text="削除", width=5, command=lambda b=bone: self.on_knee_preset_delete(b)).grid(row=0, column=5, padx=2)
-		# 実行
-		ttk.Button(panel, text=f"{label}を位置合わせ", command=lambda b=bone: self.on_knee_register_bone(b)
-		           ).grid(row=6, column=0, sticky="w", padx=12, pady=(4, 6))
-
-	# ----- Knee coordinate system builders (木村論文準拠) -----
-	def _knee_named_points(self, points, labels) -> dict:
-		"""特徴点配列とラベルから {ラベル大文字: np.array([x,y,z])} を作る。"""
-		d = {}
-		for p, lab in zip(points, labels):
-			key = str(lab).strip().upper().replace(" ", "")
-			d[key] = np.asarray(p, dtype=float)
-		return d
-
-	def _knee_reference_shaft_dir(self, pts: dict) -> np.ndarray:
-		"""L, M, N クランプパネル頂点から、大腿骨骨軸(≒基準座標系Coのy軸=近位方向)の
-		参照方向ベクトルを求める。パネル面の法線を用い、原点→パネル重心の向き(近位)に符号を合わせる。
-		"""
-		L, M, N = pts["L"], pts["M"], pts["N"]
-		normal = np.cross(M - L, N - L)
-		nn = np.linalg.norm(normal)
-		if nn < 1e-9:
-			raise ValueError("L,M,N が同一直線上にあり、パネル法線を定義できません")
-		normal = normal / nn
-		# 近位方向のヒント: 膝(MCL/LCL中点)からクランプ重心(L,M,N重心=近位側)へ向かうベクトル
-		mcl = pts.get("MCL"); lcl = pts.get("LCL")
-		if mcl is not None and lcl is not None:
-			origin = (mcl + lcl) / 2.0
-			proximal_hint = (L + M + N) / 3.0 - origin
-			if np.dot(normal, proximal_hint) < 0:
-				normal = -normal
-		return normal
-
-	def _build_knee_femur_frame(self, points, labels, side: int):
-		"""大腿骨座標系 Cf を構築（木村論文 第3章）。
-
-		Returns: (origin, x_axis, y_axis, z_axis) すべて np.array。
-		side: 1=右膝(Z+=外側=LCL方向), 2=左膝(符号反転)。
-		"""
-		pts = self._knee_named_points(points, labels)
-		for k in ("MCL", "LCL", "L", "M", "N"):
-			if k not in pts:
-				raise ValueError(f"必要な特徴点が見つかりません: {k}（必要: L,M,N,MCL,LCL）")
-		MCL, LCL = pts["MCL"], pts["LCL"]
-		origin = (MCL + LCL) / 2.0
-		# Z軸: LCL→MCL を結ぶ直線。右膝でZ+=外側(=LCL方向)なので LCL-MCL 方向を正にとる
-		z = LCL - MCL
-		if np.linalg.norm(z) < 1e-9:
-			raise ValueError("MCL と LCL が一致しており、Z軸を定義できません")
-		z = z / np.linalg.norm(z)
-		if side == 2:  # 左膝は内外側の符号反転
-			z = -z
-		# 骨軸参照方向(近位)を Z⊥面へ投影して Y軸(近位+)
-		shaft = self._knee_reference_shaft_dir(pts)
-		y = shaft - np.dot(shaft, z) * z
-		if np.linalg.norm(y) < 1e-9:
-			raise ValueError("骨軸参照方向がZ軸と平行で、Y軸を定義できません")
-		y = y / np.linalg.norm(y)
-		# X軸 = Y×Z
-		x = np.cross(y, z)
-		x = x / np.linalg.norm(x)
-		return origin, x, y, z
-
-	def _build_knee_tibia_frame(self, cf_origin, cf_x, cf_y, cf_z, w_scan_deg: float):
-		"""脛骨座標系 Ct を構築。伸展位で Cf に一致。動物膝は Cf を Z軸まわりに屈曲角 φ 回転
-		(木村論文 3.1.2: 「Z軸の負方向に回転」)。φ=w_scan_deg。
-
-		Returns: (origin, x_axis, y_axis, z_axis)。
-		"""
-		phi = np.deg2rad(w_scan_deg)
-		# Cf の Z軸まわりに -φ 回転（ロドリゲス）
-		k = cf_z / np.linalg.norm(cf_z)
-		ang = -phi
-
-		def rot(v):
-			return (v * np.cos(ang)
-			        + np.cross(k, v) * np.sin(ang)
-			        + k * np.dot(k, v) * (1 - np.cos(ang)))
-
-		x = rot(cf_x); y = rot(cf_y); z = cf_z.copy()
-		return cf_origin.copy(), x, y, z
-
-	def on_knee_visualize_coords(self) -> None:
-		"""初期状態スキャン上に特徴点と大腿骨座標系Cf(・脛骨座標系Ct)を可視化する。"""
-		scan_path = self.knee_initial_scan_path.get().strip()
-		pp_path = self.knee_initial_pp_path.get().strip()
-		if not scan_path or not pp_path:
-			messagebox.showwarning("入力不足", "初期状態スキャンと特徴点(PP)を選択してください。")
-			return
-		try:
-			points, labels = self._parse_pp_file(pp_path)
-		except Exception as e:
-			messagebox.showerror("特徴点読み込み失敗", f"PPファイルの読み込みに失敗しました:\n{e}")
-			return
-		try:
-			origin, x_axis, y_axis, z_axis = self._build_knee_femur_frame(points, labels, self.knee_side_var.get())
-		except Exception as e:
-			messagebox.showerror("大腿骨座標系構築エラー", f"Cfの構築に失敗しました:\n{e}")
-			return
-		w_scan = 0.0
-		try:
-			w_scan = float(self.knee_w_scan_deg.get())
-		except Exception:
-			pass
-		t_origin, t_x, t_y, t_z = self._build_knee_tibia_frame(origin, x_axis, y_axis, z_axis, w_scan)
-
-		try:
-			mesh = pv.read(scan_path)
-		except Exception as e:
-			messagebox.showerror("読み込み失敗", f"初期状態スキャンの読み込みに失敗しました:\n{e}")
-			return
-
-		# 軸長: モデルサイズに応じて決定
-		try:
-			diag = float(np.linalg.norm(np.array(mesh.bounds[1::2]) - np.array(mesh.bounds[0::2])))
-			axis_len = max(diag * 0.15, 10.0)
-		except Exception:
-			axis_len = 40.0
-
-		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
-		plotter = pv.Plotter(title="knee: 特徴点/座標系の可視化",
-		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
-		plotter.set_background("white")
-		plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True, show_edges=False)
-
-		# 特徴点表示
-		pts_named = self._knee_named_points(points, labels)
-		colors = {"MCL": "red", "LCL": "blue", "L": "green", "M": "orange", "N": "purple"}
-		for name, col in colors.items():
-			if name in pts_named:
-				p = pts_named[name]
-				plotter.add_mesh(pv.Sphere(radius=max(axis_len * 0.05, 1.0), center=p), color=col)
-				plotter.add_point_labels([p], [name], font_size=14, text_color=col,
-				                         point_size=1, show_points=False, always_visible=True)
-
-		def draw_frame(o, ax, ay, az, prefix, solid=True):
-			specs = [(ax, "red", f"{prefix}X"), (ay, "green", f"{prefix}Y"), (az, "blue", f"{prefix}Z")]
-			for vec, col, name in specs:
-				end = o + vec * axis_len
-				plotter.add_mesh(pv.Line(o, end), color=col, line_width=(5 if solid else 2))
-				plotter.add_point_labels([end], [name], font_size=13, text_color=col,
-				                         point_size=1, show_points=False, always_visible=True)
-
-		# Cf（実線）
-		draw_frame(origin, x_axis, y_axis, z_axis, "Cf_", solid=True)
-		# Ct（W_scan≠0 のとき破線的に細く表示）
-		if abs(w_scan) > 1e-6:
-			draw_frame(t_origin, t_x, t_y, t_z, "Ct_", solid=False)
-
-		plotter.add_text("Cf: X=red Y=green Z=blue  | 点: MCL=red LCL=blue L=green M=orange N=purple",
-		                 position="upper_left", font_size=10, color="black")
-		plotter.show()
-
-	def _knee_load_o3d_pcd(self, path: str, n_points: int):
-		"""STL/OBJ/PLY を VTK/PyVista で読み込み、Open3D の点群として返す。
-
-		Open3D の read_triangle_mesh は Windows の非ASCII(日本語)パスや一部STLで
-		空メッシュを返すことがあるため、堅牢な VTK(pyvista) 経由で読み込んでから変換する。
-		面がある場合は表面から一様サンプリング、点群のみの場合は頂点をそのまま使う。
-		"""
-		try:
-			pm = pv.read(path)
-		except Exception as e:
-			raise ValueError(f"メッシュを読み込めません: {Path(path).name}\n{e}")
-		if pm is None or pm.n_points == 0:
-			raise ValueError(f"メッシュを読み込めません（頂点なし）: {Path(path).name}")
-
-		verts = np.asarray(pm.points, dtype=np.float64)
-		# 面(三角形)を取り出す
-		tris = None
-		try:
-			surf = pm
-			if not isinstance(surf, pv.PolyData):
-				surf = surf.extract_surface()
-			surf = surf.triangulate()
-			verts = np.asarray(surf.points, dtype=np.float64)
-			faces = np.asarray(surf.faces)
-			if faces.size >= 4:
-				tris = faces.reshape(-1, 4)[:, 1:4].astype(np.int32)
-		except Exception:
-			tris = None
-
-		if tris is not None and len(tris) > 0:
-			mesh = o3d.geometry.TriangleMesh()
-			mesh.vertices = o3d.utility.Vector3dVector(verts)
-			mesh.triangles = o3d.utility.Vector3iVector(tris)
-			pcd = mesh.sample_points_uniformly(number_of_points=max(int(n_points), 1000))
-		else:
-			# 面が無い（点群）場合は頂点をそのまま使用
-			pcd = o3d.geometry.PointCloud()
-			pcd.points = o3d.utility.Vector3dVector(verts)
-		if len(pcd.points) == 0:
-			raise ValueError(f"点群を生成できません: {Path(path).name}")
-		return pcd
-
-	def _rigid_from_correspondences(self, src, tgt, allow_scale: bool = False) -> np.ndarray:
-		"""対応点 src(n,3)→tgt(n,3) から剛体(必要ならスケール付)変換 4x4 を求める(Umeyama/Kabsch)。"""
-		src = np.asarray(src, dtype=float)
-		tgt = np.asarray(tgt, dtype=float)
-		sc = src.mean(axis=0)
-		tc = tgt.mean(axis=0)
-		S = src - sc
-		T = tgt - tc
-		H = S.T @ T
-		U, D, Vt = np.linalg.svd(H)
-		d = np.sign(np.linalg.det(Vt.T @ U.T))
-		Dd = np.diag([1.0, 1.0, d])
-		R = Vt.T @ Dd @ U.T
-		scale = 1.0
-		if allow_scale:
-			var = float((S ** 2).sum())
-			scale = float((D * np.array([1.0, 1.0, d])).sum() / var) if var > 1e-12 else 1.0
-		t = tc - scale * R @ sc
-		M = np.eye(4)
-		M[:3, :3] = scale * R
-		M[:3, 3] = t
-		return M
-
-	def _pca_frame(self, points):
-		"""点群の重心と主軸(固有値降順、右手系)を返す。columns=主軸。"""
-		points = np.asarray(points, dtype=float)
-		c = points.mean(axis=0)
-		X = points - c
-		cov = (X.T @ X) / max(len(X) - 1, 1)
-		w, V = np.linalg.eigh(cov)
-		order = np.argsort(w)[::-1]
-		R = V[:, order]
-		if np.linalg.det(R) < 0:
-			R[:, 2] *= -1.0
-		return c, R
-
-	def _pca_align_candidates(self, child_points, parent_points):
-		"""child→parent の主軸整列 4x4 候補を、主軸の符号反転4通り(右手系維持)で返す。"""
-		cc, Rc = self._pca_frame(child_points)
-		cp, Rp = self._pca_frame(parent_points)
-		flips = [np.diag([1.0, 1.0, 1.0]), np.diag([1.0, -1.0, -1.0]),
-		         np.diag([-1.0, 1.0, -1.0]), np.diag([-1.0, -1.0, 1.0])]
-		cands = []
-		for F in flips:
-			R = Rp @ F @ Rc.T
-			t = cp - R @ cc
-			M = np.eye(4)
-			M[:3, :3] = R
-			M[:3, 3] = t
-			cands.append(M)
-		return cands
-
-	def _knee_pick_points(self, mesh, n: int, title: str) -> np.ndarray:
-		"""PyVistaでメッシュ表面の点を n 個クリックさせ、(m,3) 配列で返す。"""
-		picked = []
-		try:
-			b = np.array(mesh.bounds).reshape(3, 2)
-			r = max(float(np.linalg.norm(b[:, 1] - b[:, 0])) * 0.02, 0.5)
-		except Exception:
-			r = 1.0
-		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
-		p = pv.Plotter(title=title, window_size=(int(sw * 0.7), int(sh * 0.7)))
-		p.set_background("white")
-		p.add_mesh(mesh, color="lightgray", show_edges=False)
-
-		def cb(pt, *args):
-			if pt is None or len(picked) >= n:
-				return
-			pt = np.asarray(pt, dtype=float)
-			picked.append(pt)
-			p.add_mesh(pv.Sphere(radius=r, center=pt), color="red")
-			p.add_point_labels([pt], [str(len(picked))], font_size=16, text_color="red",
-			                   show_points=False, always_visible=True)
-
-		p.add_text(f"{title}\n対応点を {n} 個、順番にクリック → ウィンドウを閉じる",
-		           position="upper_left", font_size=11, color="black")
-		try:
-			p.enable_surface_point_picking(callback=cb, show_point=False)
-		except Exception:
-			try:
-				p.enable_point_picking(callback=cb, use_picker=True, show_point=False)
-			except Exception as e:
-				print(f"[knee pick] 点ピッキング初期化に失敗: {e}")
-		p.show()
-		return np.array(picked) if picked else np.zeros((0, 3))
-
-	def _knee_register_region(self, src_path: str, tgt_path: str, label: str,
-	                          params: dict, manual_src_pts=None, manual_tgt_pts=None):
-		"""領域どうしを位置合わせし、src→tgt の4x4変換行列を返す。
-
-		params: 骨ごとのパラメータ dict（_knee_get_params 参照。method/enable_scaling/preview含む）。
-		src = 動かす側(モデル側 領域, child), tgt = 合わせる先(初期スキャン側 領域, parent)。
-		Returns: (transform 4x4 np.ndarray, fitness float, rmse float)
-		"""
-		method = params.get("method", "ransac")
-		n = max(int(params.get("sample_points", 100000)), 1000)
-		child_pcd = self._knee_load_o3d_pcd(src_path, n)
-		parent_pcd = self._knee_load_o3d_pcd(tgt_path, n)
-
-		# voxel_size: 手動指定(>0)があれば優先。0なら近傍距離の中央値から自動推定。
-		manual_voxel = 0.0
-		try:
-			manual_voxel = float(params.get("voxel_size", 0.0))
-		except Exception:
-			manual_voxel = 0.0
-		ransac_dist = float(params.get("ransac_distance", 1.0))
-		if manual_voxel > 1e-9:
-			voxel_size = manual_voxel
-		else:
-			try:
-				num_points = len(parent_pcd.points)
-				sample_n = min(500, max(10, num_points))
-				sample_indices = np.random.choice(num_points, sample_n, replace=False)
-				kdt = o3d.geometry.KDTreeFlann(parent_pcd)
-				nn_dists = []
-				for idx in sample_indices:
-					[_, idxs, dists] = kdt.search_knn_vector_3d(parent_pcd.points[idx], 2)
-					if len(dists) >= 2:
-						nn_dists.append(float(np.sqrt(dists[1])))
-				voxel_size = max(float(np.mean(nn_dists)) * 1.5, 1e-6) if nn_dists else max(ransac_dist, 1e-6)
-			except Exception:
-				voxel_size = max(ransac_dist, 1e-6)
-
-		parent_down = parent_pcd.voxel_down_sample(voxel_size)
-		child_down = child_pcd.voxel_down_sample(voxel_size)
-		print(f"[knee reg:{label}] サンプル={len(parent_pcd.points)}/{len(child_pcd.points)}点, "
-		      f"voxel={voxel_size:.4f}mm{'(手動)' if manual_voxel>1e-9 else '(自動)'}, "
-		      f"ダウンサンプル後={len(parent_down.points)}/{len(child_down.points)}点")
-		radius_normal = voxel_size * 2
-		parent_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
-		child_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
-		scaling = bool(params.get("enable_scaling", False))
-
-		# --- 初期変換の候補を方式ごとに用意 ---
-		init_transforms = []
-		if method == "manual":
-			if manual_src_pts is None or manual_tgt_pts is None or len(manual_src_pts) < 3 or len(manual_tgt_pts) < 3:
-				raise ValueError("手動位置合わせには、モデル側・初期スキャン側それぞれ3点以上の対応点が必要です。")
-			m = min(len(manual_src_pts), len(manual_tgt_pts))
-			init_transforms = [self._rigid_from_correspondences(
-				np.asarray(manual_src_pts)[:m], np.asarray(manual_tgt_pts)[:m], allow_scale=scaling)]
-			print(f"[knee reg:{label}] 手動3点対応から初期変換を計算")
-		elif method == "pca":
-			init_transforms = self._pca_align_candidates(np.asarray(child_down.points), np.asarray(parent_down.points))
-			print(f"[knee reg:{label}] 主軸(PCA)整列: {len(init_transforms)}候補")
-		else:  # ransac
-			radius_feature = voxel_size * 5
-			parent_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-				parent_down, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
-			child_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-				child_down, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
-			dist_ransac = ransac_dist
-			result_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-				child_down, parent_down, child_fpfh, parent_fpfh,
-				mutual_filter=True,
-				max_correspondence_distance=dist_ransac,
-				estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(scaling),
-				ransac_n=3,
-				checkers=[
-					o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-					o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(dist_ransac),
-				],
-				criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-					int(params.get("ransac_max_iter", 1000)), float(params.get("ransac_confidence", 0.99))),
-			)
-			print(f"[knee reg:{label}] RANSAC fitness={result_ransac.fitness:.6f}, RMSE={result_ransac.inlier_rmse:.6f}")
-			init_transforms = [np.array(result_ransac.transformation, dtype=float)]
-
-		# --- 各初期変換から ICP 精密化し、最良(fitness最大)を採用 ---
-		icp_thresh = float(params.get("icp_threshold", 5.0))
-		icp_iter = int(params.get("icp_max_iter", 2000))
-		best_fit = -1.0
-		best_rmse = float("inf")
-		T = np.eye(4)
-		for T0 in init_transforms:
-			res = o3d.pipelines.registration.registration_icp(
-				child_down, parent_down, icp_thresh, np.asarray(T0, dtype=float),
-				o3d.pipelines.registration.TransformationEstimationPointToPoint(scaling),
-				o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=icp_iter),
-			)
-			if res.fitness > best_fit:
-				best_fit = float(res.fitness)
-				best_rmse = float(res.inlier_rmse)
-				T = np.array(res.transformation, dtype=float)
-		print(f"[knee reg:{label}] ICP(最良) fitness={best_fit:.6f}, RMSE={best_rmse:.6f} "
-		      f"(method={method}, {len(init_transforms)}候補から採用)")
-
-		# 経過表示（任意）: 点群で重ね合わせを表示
-		if bool(params.get("preview", True)):
-			try:
-				r_parent = copy.deepcopy(parent_pcd); r_parent.paint_uniform_color([1.0, 0.0, 0.0])
-				r_child = copy.deepcopy(child_pcd); r_child.transform(T); r_child.paint_uniform_color([0.0, 1.0, 0.0])
-				o3d.visualization.draw_geometries(
-					[r_parent, r_child],
-					window_name=f"位置合わせ後 [{label}]: 初期スキャン領域(赤) + モデル領域(緑)")
-			except Exception as e:
-				print(f"[knee reg:{label}] 経過表示に失敗: {e}")
-
-		return T, best_fit, best_rmse
-
-	def on_knee_register_bone(self, bone: str) -> None:
-		"""指定した骨(大腿骨/脛骨)だけを、その骨のパラメータ・方式で位置合わせする。"""
-		if bone == "femur":
-			model = self.knee_femur_model_path.get().strip()
-			src = self.knee_reg_femur_src_path.get().strip()
-			tgt = self.knee_reg_femur_tgt_path.get().strip()
-			label = "大腿骨"
-		else:
-			model = self.knee_tibia_model_path.get().strip()
-			src = self.knee_reg_tibia_src_path.get().strip()
-			tgt = self.knee_reg_tibia_tgt_path.get().strip()
-			label = "脛骨"
-
-		if not (model and src and tgt):
-			messagebox.showwarning(
-				"入力不足",
-				f"{label}: モデルと位置合わせ領域（モデル側・初期スキャン側）を選択してください。")
-			return
-
-		p = self._knee_get_params(bone)
-		method = p.get("method", "ransac")
-		try:
-			if method == "manual":
-				messagebox.showinfo(
-					"手動3点位置合わせ",
-					f"[{label}] まず『モデル側 領域』で対応点を3つクリックし、ウィンドウを閉じてください。\n"
-					f"次に『初期スキャン側 領域』で、同じ順番・同じ部位の3点をクリックしてください。")
-				src_pts = self._knee_pick_points(pv.read(src), 3, f"{label}: モデル側 領域（対応点3つ）")
-				if len(src_pts) < 3:
-					raise ValueError(f"{label}: モデル側の対応点が3つ未満です（{len(src_pts)}点）。")
-				tgt_pts = self._knee_pick_points(pv.read(tgt), 3, f"{label}: 初期スキャン側 領域（同順で3つ）")
-				if len(tgt_pts) < 3:
-					raise ValueError(f"{label}: 初期スキャン側の対応点が3つ未満です（{len(tgt_pts)}点）。")
-				T, fit, rmse = self._knee_register_region(src, tgt, label, p,
-				                                          manual_src_pts=src_pts, manual_tgt_pts=tgt_pts)
-			else:
-				T, fit, rmse = self._knee_register_region(src, tgt, label, p)
-		except Exception as e:
-			messagebox.showerror("位置合わせエラー", f"{label}の位置合わせに失敗しました:\n{e}")
-			return
-
-		if bone == "femur":
-			self._knee_femur_reg_T = T
-		else:
-			self._knee_tibia_reg_T = T
-
-		messagebox.showinfo(
-			f"{label} 位置合わせ完了",
-			f"{label}の位置合わせが完了しました。\n\n"
-			f"fitness={fit:.4f}（1に近いほど良好）, RMSE={rmse:.4f} mm（小さいほど良好）\n\n"
-			"「位置合わせ結果を確認（大腿骨＋脛骨）」で重ね合わせを確認できます。")
-
-	def on_knee_preview_registration(self) -> None:
-		"""位置合わせ結果（初期スキャン＋整列済み大腿骨・脛骨モデル）を重ねて表示する。"""
-		scan_path = self.knee_initial_scan_path.get().strip()
-		if not scan_path:
-			messagebox.showwarning("入力不足", "初期状態スキャンを選択してください。")
-			return
-		if self._knee_femur_reg_T is None and self._knee_tibia_reg_T is None:
-			messagebox.showwarning("未実行", "先に「位置合わせ実行」を行ってください。")
-			return
-		try:
-			scan_mesh = pv.read(scan_path)
-		except Exception as e:
-			messagebox.showerror("読み込み失敗", f"初期状態スキャンの読み込みに失敗しました:\n{e}")
-			return
-
-		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
-		plotter = pv.Plotter(title="knee: 位置合わせ結果の確認", window_size=(int(sw * 0.9), int(sh * 0.9)))
-		plotter.set_background("white")
-		plotter.add_mesh(scan_mesh, color="lightgray", opacity=0.4, smooth_shading=True)
-
-		def add_registered(model_path, T, color):
-			if not model_path or T is None:
-				return
-			try:
-				m = pv.read(model_path)
-				pts = np.hstack([m.points, np.ones((m.points.shape[0], 1))])
-				m.points = (np.asarray(T) @ pts.T).T[:, :3]
-				plotter.add_mesh(m, color=color, opacity=1.0, smooth_shading=True)
-			except Exception as e:
-				print(f"[knee preview] {color} モデル表示失敗: {e}")
-
-		add_registered(self.knee_femur_model_path.get().strip(), self._knee_femur_reg_T, "burlywood")
-		add_registered(self.knee_tibia_model_path.get().strip(), self._knee_tibia_reg_T, "lightblue")
-		plotter.add_text("初期スキャン(灰) + 大腿骨(整列済,肌色) + 脛骨(整列済,水色)",
-		                 position="upper_left", font_size=10, color="black")
-		plotter.show()
-
-	# ----- Knee scene sharing (別PC=解析サーバーとキャッシュ整合させるため) -----
-	def _knee_scene_file(self) -> Path:
-		"""シーン共有ファイル cache/knee_scene.json のパス（git追跡）。"""
-		d = Path(__file__).parent / "cache"
-		d.mkdir(parents=True, exist_ok=True)
-		return d / "knee_scene.json"
-
-	def _file_content_hash(self, path: str) -> str:
-		"""ファイル内容(バイト列)のSHA-256短縮ハッシュ。未存在/失敗は空文字。"""
-		try:
-			p = Path(path)
-			if not p.exists():
-				return ""
-			h = hashlib.sha256()
-			with p.open("rb") as f:
-				for chunk in iter(lambda: f.read(1 << 20), b""):
-					h.update(chunk)
-			return h.hexdigest()[:16]
-		except Exception:
-			return ""
-
-	def _knee_read_scene_file(self) -> dict:
-		"""シーン共有ファイルを読み {タブ名: シーン} に正規化して返す（旧v1単一形式も互換）。"""
-		p = self._knee_scene_file()
-		if not p.exists():
-			return {}
-		data = json.load(p.open("r", encoding="utf-8"))
-		if isinstance(data, dict) and isinstance(data.get("scenes"), dict):
-			return data["scenes"]
-		if isinstance(data, dict) and ("femur_reg_T" in data or "tibia_reg_T" in data):
-			return {"旧シーン": data}  # v1（単一シーン・名前なし）→ 名前付きへ移行
-		return {}
-
-	def _knee_write_scene_file(self, scenes: dict) -> Path:
-		p = self._knee_scene_file()
-		with p.open("w", encoding="utf-8") as f:
-			json.dump({"version": 2, "scenes": scenes}, f, ensure_ascii=False, indent=2)
-		return p
-
-	def _knee_scene_for_tab(self, snap: dict) -> dict:
-		"""タブのスナップショットからシーン共有エントリを作る（パス非依存・内容ハッシュ＋ファイル名ヒント）。"""
-		def h(key):
-			return self._file_content_hash(str(snap.get(key, "")).strip())
-		def bn(key):
-			pth = str(snap.get(key, "")).strip()
-			return Path(pth).name if pth else ""
-		return {
-			"w_scan_deg": float(snap.get("knee_w_scan_deg", 0.0) or 0.0),
-			"side": int(snap.get("knee_side", 1) or 1),
-			"femur_reg_T": snap.get("_femur_reg_T"),
-			"tibia_reg_T": snap.get("_tibia_reg_T"),
-			"femur_color": str(snap.get("knee_femur_color", "") or ""),
-			"tibia_color": str(snap.get("knee_tibia_color", "") or ""),
-			# 内容一致確認用（別PCで同じファイルかを警告するため。パスではなく中身のハッシュ）
-			"hash_initial_pp": h("knee_initial_pp"),
-			"hash_femur_model": h("knee_femur_model"),
-			"hash_tibia_model": h("knee_tibia_model"),
-			"hash_transform": h("knee_transform"),
-			# 別PCでファイルを選び直す際のヒント（ファイル名のみ）
-			"file_hints": {
-				"initial_scan": bn("knee_initial_scan"),
-				"initial_pp": bn("knee_initial_pp"),
-				"femur_model": bn("knee_femur_model"),
-				"tibia_model": bn("knee_tibia_model"),
-				"transform": bn("knee_transform"),
-			},
-			"saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-		}
-
-	def _knee_apply_scene_to_snap(self, snap: dict, sc: dict) -> None:
-		"""シーンエントリ（reg_T・W_scan・左右）をタブのスナップショットへ反映する。"""
-		try:
-			snap["knee_w_scan_deg"] = float(sc.get("w_scan_deg", snap.get("knee_w_scan_deg", 0.0)))
-		except Exception:
-			pass
-		s = sc.get("side")
-		if s in (1, 2):
-			snap["knee_side"] = int(s)
-		for ckey, skey in (("femur_color", "knee_femur_color"), ("tibia_color", "knee_tibia_color")):
-			c = sc.get(ckey)
-			if c:
-				snap[skey] = str(c)
-		# 厳密再現のため無条件で同期（保存側で未登録ならNoneになる）
-		snap["_femur_reg_T"] = sc.get("femur_reg_T")
-		snap["_tibia_reg_T"] = sc.get("tibia_reg_T")
-
-	def _knee_scene_check_files(self, snap: dict, sc: dict) -> list:
-		"""タブのファイル内容とシーンの内容ハッシュを照合し、警告文リストを返す。"""
-		hints = sc.get("file_hints") or {}
-		out = []
-		for label, hkey, pkey, hintkey in (
-			("特徴点PP", "hash_initial_pp", "knee_initial_pp", "initial_pp"),
-			("大腿骨", "hash_femur_model", "knee_femur_model", "femur_model"),
-			("脛骨", "hash_tibia_model", "knee_tibia_model", "tibia_model"),
-			("変位データ", "hash_transform", "knee_transform", "transform"),
-		):
-			saved_h = sc.get(hkey, "")
-			if not saved_h:
-				continue
-			path = str(snap.get(pkey, "")).strip()
-			cur_h = self._file_content_hash(path) if path else ""
-			if not cur_h:
-				hint = hints.get(hintkey, "")
-				out.append(f"{label}: 未選択" + (f"（→ {hint}）" if hint else ""))
-			elif cur_h != saved_h:
-				out.append(f"{label}: 内容不一致")
-		return out
-
-	def on_knee_scene_save(self) -> None:
-		"""アクティブな試験タブのシーンを、タブ名をキーに共有ファイルへ書き出す。"""
-		if self._knee_femur_reg_T is None and self._knee_tibia_reg_T is None:
-			messagebox.showwarning("シーン保存", "先に位置合わせを行ってください（reg_Tがありません）。")
-			return
-		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-		name = self._knee_tabs[self._knee_active_tab].get('name', '試験1')
-		try:
-			scenes = self._knee_read_scene_file()
-		except Exception:
-			scenes = {}
-		scenes[name] = self._knee_scene_for_tab(self._knee_tabs[self._knee_active_tab]['snapshot'])
-		try:
-			p = self._knee_write_scene_file(scenes)
-		except Exception as e:
-			messagebox.showerror("シーン保存", f"保存に失敗しました:\n{e}")
-			return
-		messagebox.showinfo(
-			"シーン保存",
-			f"シーン「{name}」を保存しました:\n{p}\n\n"
-			"このファイルを git commit/push すると、別PC（サーバー/Mac等）で「シーンを読込」して\n"
-			"同じタブ名・同じ位置合わせ結果で計算/再現できます。")
-
-	def on_knee_scene_save_all(self) -> None:
-		"""全試験タブのシーンをまとめて共有ファイルへ書き出す（位置合わせ未実施のタブはスキップ）。"""
-		if self._knee_tabs:
-			self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-		try:
-			scenes = self._knee_read_scene_file()
-		except Exception:
-			scenes = {}
-		saved, skipped = [], []
-		for t in self._knee_tabs:
-			snap = t.get('snapshot') or {}
-			name = t.get('name', '?')
-			if snap.get('_femur_reg_T') is None and snap.get('_tibia_reg_T') is None:
-				skipped.append(name)
-				continue
-			scenes[name] = self._knee_scene_for_tab(snap)
-			saved.append(name)
-		if not saved:
-			messagebox.showwarning("シーン保存", "reg_T を持つタブがありません。先に位置合わせを行ってください。")
-			return
-		try:
-			p = self._knee_write_scene_file(scenes)
-		except Exception as e:
-			messagebox.showerror("シーン保存", f"保存に失敗しました:\n{e}")
-			return
-		msg = f"{len(saved)}タブのシーンを保存しました: {', '.join(saved)}\n{p}"
-		if skipped:
-			msg += f"\n（位置合わせ未実施のためスキップ: {', '.join(skipped)}）"
-		msg += "\n\ngit commit/push すると別PCで「シーンを読込」でき、タブ名ごと引き継がれます。"
-		messagebox.showinfo("シーン保存", msg)
-
-	def on_knee_scene_load(self) -> None:
-		"""シーン共有ファイルをタブ名で同期する（同名タブ=reg_T等を更新 / 無ければ新規タブ作成）。"""
-		p = self._knee_scene_file()
-		if not p.exists():
-			messagebox.showwarning("シーン読込", f"シーン共有ファイルが見つかりません:\n{p}\n\n"
-			                        "先に位置合わせ済みのPCで「シーンを保存」→git共有してください。")
-			return
-		try:
-			scenes = self._knee_read_scene_file()
-		except Exception as e:
-			messagebox.showerror("シーン読込", f"読み込みに失敗しました:\n{e}")
-			return
-		if not scenes:
-			messagebox.showwarning("シーン読込", "シーン共有ファイルに有効なシーンがありません。")
-			return
-		# アクティブタブの現状を保存してから同期
-		self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-		updated, created, warn_lines = [], [], []
-		for name, sc in scenes.items():
-			if not isinstance(sc, dict):
-				continue
-			idx = next((k for k, t in enumerate(self._knee_tabs) if t.get('name') == name), None)
-			if idx is None:
-				snap = copy.deepcopy(self._knee_default_snap or {})
-				self._knee_apply_scene_to_snap(snap, sc)
-				self._knee_tabs.append({'name': name, 'snapshot': snap})
-				created.append(name)
-			else:
-				snap = self._knee_tabs[idx].get('snapshot') or {}
-				self._knee_apply_scene_to_snap(snap, sc)
-				self._knee_tabs[idx]['snapshot'] = snap
-				updated.append(name)
-			ws = self._knee_scene_check_files(snap, sc)
-			if ws:
-				warn_lines.append(f"・{name}: " + " / ".join(ws))
-		# アクティブタブへ反映（同期で変わった可能性があるため）
-		self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab]['snapshot'])
-		self._knee_rebuild_tabbar()
-		msg = "シーンを読み込みました（タブ名で同期）。\n"
-		if updated:
-			msg += f"更新: {', '.join(updated)}\n"
-		if created:
-			msg += f"新規タブ: {', '.join(created)}\n"
-		if warn_lines:
-			msg += ("\n⚠ ファイル内容が保存時と一致しない/未選択のタブがあります"
-			        "（キャッシュが当たらない可能性）:\n" + "\n".join(warn_lines)
-			        + "\n\n各タブで同じ内容のファイルを選択してください（→はファイル名ヒント）。")
-		else:
-			msg += "\nモデル/変位データの内容一致を確認しました。このまま計算/表示できます。"
-		messagebox.showinfo("シーン読込", msg)
-
-	def _knee_apply_T(self, mesh, T):
-		"""pvメッシュに4x4同次変換を適用（in-place）してメッシュを返す。"""
-		if mesh.n_points == 0:
-			return mesh
-		pts = np.hstack([mesh.points, np.ones((mesh.points.shape[0], 1))])
-		mesh.points = (np.asarray(T, dtype=float) @ pts.T).T[:, :3]
-		return mesh
-
-	def _knee_prepare_scene(self, require_models: bool = True) -> dict:
-		"""初期スキャン特徴点から Cf/Ct を構築し、ワールド座標系(Cf=原点)へ整列した
-		大腿骨・脛骨モデルと座標系を準備する。both 静的可視化 と アニメーション で共用。
-
-		Returns dict: A(Cf→world), w_scan, points_world, labels, cf_world, ct_world,
-		              femur_world, tibia_world (require_models=Trueのとき)。
-		エラーは ValueError(メッセージ) で送出。
-		"""
-		scan_path = self.knee_initial_scan_path.get().strip()
-		pp_path = self.knee_initial_pp_path.get().strip()
-		if not pp_path:
-			raise ValueError("初期スキャン特徴点(PP)を選択してください。")
-		points, labels = self._parse_pp_file(pp_path)
-		origin, cfx, cfy, cfz = self._build_knee_femur_frame(points, labels, self.knee_side_var.get())
-		try:
-			w_scan = float(self.knee_w_scan_deg.get())
-		except Exception:
-			w_scan = 0.0
-		t_o, t_x, t_y, t_z = self._build_knee_tibia_frame(origin, cfx, cfy, cfz, w_scan)
-
-		# A: Cf座標系 → ワールド座標系（Cfを原点・単位軸に整列）
-		Rf = np.column_stack([cfx, cfy, cfz])
-		A = np.eye(4)
-		A[:3, :3] = Rf.T
-		A[:3, 3] = -Rf.T @ origin
-
-		# 特徴点をワールドへ
-		pw = np.hstack([points, np.ones((points.shape[0], 1))])
-		points_world = (A @ pw.T).T[:, :3]
-
-		# Ct をワールドへ（原点=0、軸は回転のみ）
-		ct_axes_world = (Rf.T @ np.column_stack([t_x, t_y, t_z]))
-		ct_world = (np.array([0.0, 0.0, 0.0]), ct_axes_world[:, 0], ct_axes_world[:, 1], ct_axes_world[:, 2])
-		cf_world = (np.array([0.0, 0.0, 0.0]), np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0]))
-
-		result = {"A": A, "w_scan": w_scan, "points_world": points_world, "labels": labels,
-		          "cf_world": cf_world, "ct_world": ct_world}
-
-		if require_models:
-			femur_path = self.knee_femur_model_path.get().strip()
-			tibia_path = self.knee_tibia_model_path.get().strip()
-			if not femur_path or not tibia_path:
-				raise ValueError("大腿骨モデルと脛骨モデルを選択してください。")
-			if self._knee_femur_reg_T is None or self._knee_tibia_reg_T is None:
-				raise ValueError("先に③「位置合わせ実行」で大腿骨・脛骨を初期スキャンへ整列してください。")
-			femur = pv.read(femur_path)
-			tibia = pv.read(tibia_path)
-			# モデル → 初期スキャン座標系(reg) → ワールド(A)
-			self._knee_apply_T(femur, A @ np.asarray(self._knee_femur_reg_T))
-			self._knee_apply_T(tibia, A @ np.asarray(self._knee_tibia_reg_T))
-			result["femur_world"] = femur
-			result["tibia_world"] = tibia
-		return result
-
-	def _knee_draw_frame(self, plotter, o, ax, ay, az, prefix, axis_len, solid=True):
-		"""PyVistaに座標系(3軸)を描画する。"""
-		for vec, col, name in [(ax, "red", f"{prefix}X"), (ay, "green", f"{prefix}Y"), (az, "blue", f"{prefix}Z")]:
-			end = o + np.asarray(vec) * axis_len
-			plotter.add_mesh(pv.Line(o, end), color=col, line_width=(5 if solid else 2))
-			plotter.add_point_labels([end], [name], font_size=13, text_color=col,
-			                         point_size=1, show_points=False, always_visible=True)
-
-	def on_knee_visualize_all(self) -> None:
-		"""大腿骨・脛骨モデル（位置合わせ済み）と Cf/Ct を全体可視化する。"""
-		try:
-			scene = self._knee_prepare_scene(require_models=True)
-		except Exception as e:
-			messagebox.showwarning("全体可視化", str(e))
-			return
-
-		femur = scene["femur_world"]; tibia = scene["tibia_world"]
-		try:
-			b = np.array(femur.bounds).reshape(3, 2)
-			diag = float(np.linalg.norm(b[:, 1] - b[:, 0]))
-			axis_len = max(diag * 0.15, 10.0)
-		except Exception:
-			axis_len = 40.0
-
-		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
-		plotter = pv.Plotter(title="knee: 関節全体（位置合わせ済み + Cf/Ct）",
-		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
-		plotter.set_background("white")
-		plotter.add_mesh(femur, color=self._knee_color("femur"), opacity=1.0, smooth_shading=True, show_edges=False)
-		plotter.add_mesh(tibia, color=self._knee_color("tibia"), opacity=1.0, smooth_shading=True, show_edges=False)
-
-		# 特徴点
-		named = self._knee_named_points(scene["points_world"], scene["labels"])
-		colors = {"MCL": "red", "LCL": "blue", "L": "green", "M": "orange", "N": "purple"}
-		for name, col in colors.items():
-			if name in named:
-				plotter.add_mesh(pv.Sphere(radius=max(axis_len * 0.04, 1.0), center=named[name]), color=col)
-
-		cfo, cfx, cfy, cfz = scene["cf_world"]
-		self._knee_draw_frame(plotter, cfo, cfx, cfy, cfz, "Cf_", axis_len, solid=True)
-		if abs(scene["w_scan"]) > 1e-6:
-			cto, ctx, cty, ctz = scene["ct_world"]
-			self._knee_draw_frame(plotter, cto, ctx, cty, ctz, "Ct_", axis_len, solid=False)
-
-		plotter.add_text("大腿骨 + 脛骨（色は④の表示色設定） / Cf: X=red Y=green Z=blue（Ctは細線）",
-		                 position="upper_left", font_size=10, color="black")
-		plotter.show()
-
-	def on_knee_animate(self) -> None:
-		"""変位・姿勢変化データに沿って脛骨を動かすシミュレーション（共通コアを利用）。
-
-		大腿骨(Cf)固定・脛骨を fmTtb(Θ(t)) で駆動する。脛骨メッシュの初期配置からは
-		スキャン時屈曲 fmTtb(FE=W_scan) を差し引く（ヒト膝 W=0 で恒等）。
-		実際のアニメ/ヒートマップ描画は hip と共通の on_animate エンジンを再利用する。
-		"""
-		transform_path = self.knee_transform_path.get().strip()
-		if not transform_path:
-			messagebox.showwarning("シミュレーション", "変位・姿勢変化データ(xlsx/kkr)を選択してください。")
-			return
-		try:
-			scene = self._knee_prepare_scene(require_models=True)
-		except Exception as e:
-			messagebox.showwarning("シミュレーション", str(e))
-			return
-		try:
-			transform_data = self._load_transform_matrices(transform_path)
-			if not transform_data:
-				messagebox.showerror("エラー", "変位・姿勢変化データが空です。")
-				return
-		except Exception as e:
-			messagebox.showerror("読み込み失敗", f"変位・姿勢変化データの読み込みに失敗しました:\n{e}")
-			return
-
-		femur = scene["femur_world"]
-		tibia = scene["tibia_world"]
-
-		# 脛骨の初期配置から W_scan ぶんの屈曲を差し引く: fmTtb(FE=W_scan)^-1
-		# （transform_data の絶対屈曲 FE(t) がそのまま脛骨姿勢になる。ヒト膝 W=0 で恒等。
-		#   後で on_animate が同じ fmTtb を再適用するので符号規約に依存せず自己整合する）
-		w_scan = scene["w_scan"]
-		if abs(w_scan) > 1e-9:
-			T_wscan = self._build_transform_matrix(w_scan, 0.0, 0.0, 0.0, 0.0, 0.0)
-			self._knee_apply_T(tibia, np.linalg.inv(T_wscan))
-
-		# --- hip 共通の on_animate エンジンをそのまま再利用（アダプタ方式・hip側は無改変） ---
-		# ワールド整列済みの大腿骨(prox)/脛骨(dist)を一時STLに書き出し、hipの座標系ビルダーが
-		# 「単位座標系」を返す特徴点(pp)を合成して与える。こうすると on_animate 内の座標変換が
-		# 恒等になり、準備済みメッシュをそのまま変位データで動かせる（=同じ描画/ヒートマップ資産）。
-		import tempfile, shutil
-		tmpdir = Path(tempfile.mkdtemp(prefix="frs_knee_anim_"))
-
-		def _radius_of(mesh):
-			try:
-				b = np.array(mesh.bounds).reshape(3, 2)
-				return max(float(np.linalg.norm(b[:, 1] - b[:, 0])) * 0.5, 20.0)
-			except Exception:
-				return 60.0
-
-		try:
-			femur_stl = tmpdir / "femur_world.stl"
-			tibia_stl = tmpdir / "tibia_world.stl"
-			femur.triangulate().save(str(femur_stl))
-			tibia.triangulate().save(str(tibia_stl))
-			# 単位座標系を生む特徴点（hipビルダーで identity を返すことを検証済み）
-			prox_abcd = tmpdir / "prox_abcd.pp"; prox_olmn = tmpdir / "prox_olmn.pp"
-			dist_abc = tmpdir / "dist_abc.pp"; dist_olmn = tmpdir / "dist_olmn.pp"
-			self._knee_write_pp(prox_abcd, [((0, 0, 1), "A"), ((0, 0, 0), "B"), ((-1, 0, 0.5), "C"), ((-1, 0, 0.5), "D")])
-			self._knee_write_pp(prox_olmn, [((0, 0, 0), "O"), ((1, 0, 0), "L"), ((0, 1, 0), "M"), ((0, 0, 1), "N")])
-			self._knee_write_pp(dist_abc, [((0, -0.001, 1), "A"), ((0, -0.001, 0), "B")])
-			self._knee_write_pp(dist_olmn, [((0, 0, 0), "O"), ((1, 0, 0), "L"), ((0, 1, 0), "M"), ((0, 0, 1), "N")])
-		except Exception as e:
-			try:
-				shutil.rmtree(tmpdir)
-			except Exception:
-				pass
-			messagebox.showerror("準備失敗", f"アニメーション用データの準備に失敗しました:\n{e}")
-			return
-
-		# 現在の hip 側状態を退避（on_animate 実行中だけ差し替え、終了後に必ず復元）
-		saved = {}
-		save_names = (
-			"joint_var", "prox_model_path", "prox_pp_abcd_path", "prox_pp_olmn_path",
-			"dist_model_path", "dist_pp_abc_path", "dist_pp_olmn_path", "transform_group_path",
-			"prox_cartilage_model_path", "dist_cartilage_model_path",
-			"prox_offset_x", "prox_offset_y", "prox_offset_z",
-			"dist_offset_x", "dist_offset_y", "dist_offset_z",
-			"prox_radius", "dist_radius", "show_ao_angle",
-		)
-		for nm in save_names:
-			try:
-				saved[nm] = getattr(self, nm).get()
-			except Exception:
-				pass
-		saved_prox_color = getattr(self, "prox_color", None)
-		saved_dist_color = getattr(self, "dist_color", None)
-		try:
-			self.joint_var.set(1)  # hip 座標系ビルダーを使用
-			self.prox_model_path.set(str(femur_stl))
-			self.prox_pp_abcd_path.set(str(prox_abcd))
-			self.prox_pp_olmn_path.set(str(prox_olmn))
-			self.dist_model_path.set(str(tibia_stl))
-			self.dist_pp_abc_path.set(str(dist_abc))
-			self.dist_pp_olmn_path.set(str(dist_olmn))
-			self.transform_group_path.set(transform_path)
-			self.prox_cartilage_model_path.set("")
-			self.dist_cartilage_model_path.set("")
-			for v in (self.prox_offset_x, self.prox_offset_y, self.prox_offset_z,
-			          self.dist_offset_x, self.dist_offset_y, self.dist_offset_z):
-				v.set(0.0)
-			self.prox_radius.set(_radius_of(femur))
-			self.dist_radius.set(_radius_of(tibia))
-			self.show_ao_angle.set(False)
-			self.prox_color = self._knee_color("femur")  # 大腿骨（④の表示色設定、既定=肌色）
-			self.dist_color = self._knee_color("tibia")  # 脛骨（④の表示色設定、既定=水色）
-			# hip 共通エンジンを起動（モーダル：ウィンドウを閉じるまでブロック）
-			self.on_animate()
-		finally:
-			for nm, val in saved.items():
-				try:
-					getattr(self, nm).set(val)
-				except Exception:
-					pass
-			if saved_prox_color is not None:
-				self.prox_color = saved_prox_color
-			if saved_dist_color is not None:
-				self.dist_color = saved_dist_color
-			try:
-				shutil.rmtree(tmpdir)
-			except Exception:
-				pass
-
-	def _knee_write_pp(self, path, entries) -> None:
-		"""特徴点を PickedPoints XML 形式で書き出す。entries: [((x,y,z), label), ...]。"""
-		root = ET.Element('PickedPoints')
-		for (x, y, z), lab in entries:
-			e = ET.SubElement(root, 'point')
-			e.set('x', f"{float(x):.8f}")
-			e.set('y', f"{float(y):.8f}")
-			e.set('z', f"{float(z):.8f}")
-			e.set('active', "1")
-			e.set('name', str(lab))
-		ET.ElementTree(root).write(str(path), encoding="utf-8", xml_declaration=True)
-	# endregion knee simulator
 
 	def _create_org_tab(self) -> None:
 		"""ORGタブのUIを構築"""
@@ -2762,14 +954,10 @@ class MainMenuGUI(_BaseWindow):
 		canvas.pack(side="left", fill="both", expand=True)
 		scrollbar.pack(side="right", fill="y")
 		
-		# マウスホイールでスクロール（Mac/Windows/Linux 両対応）
+		# マウスホイールでスクロール
 		def _on_mousewheel(event):
-			step = _mousewheel_units(event)
-			if step:
-				canvas.yview_scroll(step, "units")
+			canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 		canvas.bind_all("<MouseWheel>", _on_mousewheel)
-		canvas.bind_all("<Button-4>", _on_mousewheel)
-		canvas.bind_all("<Button-5>", _on_mousewheel)
 		
 		container = scrollable_frame
 		container.columnconfigure(0, weight=1)
@@ -2965,12 +1153,8 @@ class MainMenuGUI(_BaseWindow):
 		canvas.pack(side="left", fill="both", expand=True)
 		scrollbar.pack(side="right", fill="y")
 		def _on_mousewheel_cs(event):
-			step = _mousewheel_units(event)
-			if step:
-				canvas.yview_scroll(step, "units")
+			canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 		canvas.bind_all("<MouseWheel>", _on_mousewheel_cs)
-		canvas.bind_all("<Button-4>", _on_mousewheel_cs)
-		canvas.bind_all("<Button-5>", _on_mousewheel_cs)
 		
 		container = scrollable_frame
 		container.columnconfigure(0, weight=1)
@@ -2990,17 +1174,14 @@ class MainMenuGUI(_BaseWindow):
 		cs_notebook = ttk.Notebook(container)
 		cs_notebook.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
 
-		# --- 近位サブタブ ---
+		# --- 近位（骨盤）サブタブ ---
 		prox_tab = ttk.Frame(cs_notebook, padding=8)
-		cs_notebook.add(prox_tab, text=self._joint_label("cs_prox_tab"))
-		self._joint_widgets["cs_notebook"] = cs_notebook
-		self._joint_widgets["cs_prox_tab"] = prox_tab
+		cs_notebook.add(prox_tab, text="近位（骨盤）")
 		self._build_cs_side_ui(prox_tab, side="prox")
 
-		# --- 遠位サブタブ ---
+		# --- 遠位（大腿骨）サブタブ ---
 		dist_tab = ttk.Frame(cs_notebook, padding=8)
-		cs_notebook.add(dist_tab, text=self._joint_label("cs_dist_tab"))
-		self._joint_widgets["cs_dist_tab"] = dist_tab
+		cs_notebook.add(dist_tab, text="遠位（大腿骨）")
 		self._build_cs_side_ui(dist_tab, side="dist")
 
 		# === 共有: RANSAC/ICPパラメータ ===
@@ -3070,7 +1251,7 @@ class MainMenuGUI(_BaseWindow):
 			side: "prox" or "dist"
 		"""
 		parent.columnconfigure(0, weight=1)
-		side_label = self._joint_label("cs_prox_tab" if side == "prox" else "cs_dist_tab")
+		side_label = "近位（骨盤）" if side == "prox" else "遠位（大腿骨）"
 
 		# 変数を取得
 		if side == "prox":
@@ -3155,10 +1336,9 @@ class MainMenuGUI(_BaseWindow):
 		mesh_frame.columnconfigure(1, weight=1)
 		row_idx += 1
 
-		# 近位
-		fem_prox_header = ttk.Label(mesh_frame, text=f"【{self._joint_label('cs_prox_tab')}】", font=(self.ui_font_family, 9, "bold"))
-		fem_prox_header.grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 2))
-		self._joint_widgets["fem_prox_header"] = fem_prox_header
+		# 近位（骨盤）
+		ttk.Label(mesh_frame, text="【近位（骨盤）】", font=(self.ui_font_family, 9, "bold")).grid(
+			row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 2))
 		ttk.Label(mesh_frame, text="骨モデル:").grid(row=1, column=0, sticky="w", padx=(20, 4), pady=2)
 		fem_prox_bone_entry = ttk.Entry(mesh_frame, textvariable=self.fem_prox_bone_path, width=60)
 		fem_prox_bone_entry.grid(row=1, column=1, sticky="ew", padx=4, pady=2)
@@ -3172,10 +1352,9 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(mesh_frame, text="参照...", width=8,
 			command=lambda: self._choose_fem_file("prox_cartilage")).grid(row=2, column=2, padx=(4, 8), pady=2)
 
-		# 遠位
-		fem_dist_header = ttk.Label(mesh_frame, text=f"【{self._joint_label('cs_dist_tab')}】", font=(self.ui_font_family, 9, "bold"))
-		fem_dist_header.grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 2))
-		self._joint_widgets["fem_dist_header"] = fem_dist_header
+		# 遠位（大腿骨）
+		ttk.Label(mesh_frame, text="【遠位（大腿骨）】", font=(self.ui_font_family, 9, "bold")).grid(
+			row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 2))
 		ttk.Label(mesh_frame, text="骨モデル:").grid(row=4, column=0, sticky="w", padx=(20, 4), pady=2)
 		fem_dist_bone_entry = ttk.Entry(mesh_frame, textvariable=self.fem_dist_bone_path, width=60)
 		fem_dist_bone_entry.grid(row=4, column=1, sticky="ew", padx=4, pady=2)
@@ -3394,7 +1573,7 @@ class MainMenuGUI(_BaseWindow):
 					penalty_stiffness=self.fem_penalty_stiffness.get(),
 					contact_tolerance=self.fem_contact_tolerance.get(),
 				)
-				solver = FEMContactSolver(material=material, contact=contact, verbose=True, shared_cache=self._shared_fem_cache)
+				solver = FEMContactSolver(material=material, contact=contact, verbose=True)
 				results = solver.analyze(
 					prox_cart, dist_cart,
 					boundary_mode=self.fem_boundary_mode.get(),
@@ -3575,34 +1754,17 @@ class MainMenuGUI(_BaseWindow):
 				penalty_stiffness=self.fem_penalty_stiffness.get(),
 				contact_tolerance=self.fem_contact_tolerance.get(),
 			)
-			solver = FEMContactSolver(material=material, contact=contact, verbose=True, shared_cache=self._shared_fem_cache)
+			solver = FEMContactSolver(material=material, contact=contact, verbose=True)
 
 			# 現在のメッシュ位置のコピーで解析
 			prox_cart_copy = prox_cartilage_mesh.copy()
 			dist_cart_copy = dist_cartilage_mesh.copy()
 
-			# キャッシュ存在確認 → 状態ウィンドウ表示
-			boundary_mode = self.fem_boundary_mode.get()
-			max_nodes = self.fem_max_nodes.get()
-			from_cache = solver.has_cache(prox_cart_copy, dist_cart_copy, boundary_mode, max_nodes)
-			status_win = tk.Toplevel(self)
-			status_win.title("FEM解析")
-			status_win.resizable(False, False)
-			status_win.transient(self)
-			msg = "キャッシュからFEM結果を読み込んでいます..." if from_cache else "FEM接触解析を実行中..."
-			ttk.Label(status_win, text=msg, padding=20).pack()
-			status_win.update_idletasks()
-			x = self.winfo_rootx() + (self.winfo_width() - status_win.winfo_width()) // 2
-			y = self.winfo_rooty() + (self.winfo_height() - status_win.winfo_height()) // 2
-			status_win.geometry(f"+{x}+{y}")
-			status_win.update()
-
 			results = solver.analyze(
 				prox_cart_copy, dist_cart_copy,
-				boundary_mode=boundary_mode,
-				max_nodes=max_nodes,
+				boundary_mode=self.fem_boundary_mode.get(),
+				max_nodes=self.fem_max_nodes.get(),
 			)
-			status_win.destroy()
 
 			# 結果を可視化
 			scalar_name = self.fem_scalar_name.get()
@@ -3654,10 +1816,6 @@ class MainMenuGUI(_BaseWindow):
 			plotter.show()
 
 		except Exception as e:
-			try:
-				status_win.destroy()
-			except Exception:
-				pass
 			messagebox.showerror("FEM解析エラー", f"解析中にエラーが発生しました:\n{e}")
 			import traceback
 			traceback.print_exc()
@@ -4466,241 +2624,6 @@ class MainMenuGUI(_BaseWindow):
 			messagebox.showerror("エラー", f"PPファイルの統合に失敗しました:\n{e}")
 			traceback.print_exc()
 
-	# ================================================================
-	# Cache Settings タブ
-	# ================================================================
-
-	def _create_cache_tab(self) -> None:
-		"""Cache Settingsタブのコンテンツを作成"""
-		container = self.cache_tab
-		container.columnconfigure(0, weight=1)
-
-		# --- NASパス設定 ---
-		nas_frame = ttk.LabelFrame(container, text="NAS共有キャッシュ設定")
-		nas_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
-		nas_frame.columnconfigure(1, weight=1)
-
-		ttk.Label(nas_frame, text="NASパス:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-		ttk.Entry(nas_frame, textvariable=self.cache_nas_path).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-		ttk.Button(nas_frame, text="参照...", command=self._choose_cache_nas_path).grid(row=0, column=2, padx=4, pady=4)
-
-		ttk.Label(nas_frame, text="例: Z:/FRS_cache  や  //NAS_NAME/share/FRS_cache",
-				  foreground="gray").grid(row=1, column=0, columnspan=3, sticky="w", padx=8)
-
-		ttk.Checkbutton(nas_frame, text="キャッシュ有効", variable=self.cache_enabled).grid(
-			row=2, column=0, columnspan=2, sticky="w", padx=4, pady=4)
-
-		# --- 操作ボタン ---
-		btn_frame = ttk.Frame(container)
-		btn_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-
-		ttk.Button(btn_frame, text="NASパスを適用（再初期化）",
-				   command=self._on_cache_reinit).pack(side="left", padx=4)
-		ttk.Button(btn_frame, text="統計情報を表示",
-				   command=self._on_cache_show_stats).pack(side="left", padx=4)
-
-		# --- 統計情報表示エリア ---
-		self._cache_stats_text = tk.Text(container, height=12, width=60, state="disabled",
-										 font=("Consolas", 9))
-		self._cache_stats_text.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
-		container.rowconfigure(2, weight=1)
-
-		# --- キャッシュ一覧 ---
-		list_frame = ttk.LabelFrame(container, text="計算済みデータ一覧")
-		list_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
-		container.rowconfigure(3, weight=1)
-
-		list_btn_frame = ttk.Frame(list_frame)
-		list_btn_frame.pack(fill=tk.X, padx=4, pady=4)
-		ttk.Button(list_btn_frame, text="一覧を更新",
-				   command=self._on_cache_list_refresh).pack(side="left", padx=4)
-		ttk.Button(list_btn_frame, text="選択行を削除",
-				   command=self._on_cache_list_delete_selected).pack(side="left", padx=4)
-
-		cols = ("type", "xlsx", "prox_stl", "dist_stl", "frames", "date")
-		col_labels = {"type": "種類", "xlsx": "運動データ(xlsx)", "prox_stl": "近位STL",
-					  "dist_stl": "遠位STL", "frames": "フレーム数", "date": "計算日時"}
-		self._cache_list_tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=8)
-		for c in cols:
-			self._cache_list_tree.heading(c, text=col_labels[c])
-		self._cache_list_tree.column("type",     width=70,  anchor="center")
-		self._cache_list_tree.column("xlsx",     width=220, anchor="w")
-		self._cache_list_tree.column("prox_stl", width=140, anchor="w")
-		self._cache_list_tree.column("dist_stl", width=140, anchor="w")
-		self._cache_list_tree.column("frames",   width=80,  anchor="center")
-		self._cache_list_tree.column("date",     width=130, anchor="center")
-
-		sb = ttk.Scrollbar(list_frame, orient="vertical", command=self._cache_list_tree.yview)
-		self._cache_list_tree.configure(yscrollcommand=sb.set)
-		self._cache_list_tree.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
-		sb.pack(side="left", fill="y", pady=4)
-
-		# --- 危険ゾーン ---
-		danger_frame = ttk.LabelFrame(container, text="キャッシュ削除")
-		danger_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-
-		ttk.Button(danger_frame, text="NASキャッシュを全削除",
-				   command=self._on_cache_clear_all).pack(side="left", padx=4, pady=4)
-
-	def _choose_cache_nas_path(self) -> None:
-		d = filedialog.askdirectory(title="NASキャッシュディレクトリを選択")
-		if d:
-			self.cache_nas_path.set(d)
-
-	def _on_cache_reinit(self) -> None:
-		self._reinit_shared_cache()
-		self._on_cache_show_stats()
-		messagebox.showinfo("キャッシュ", "共有キャッシュを再初期化しました。")
-
-	def _on_cache_list_refresh(self) -> None:
-		"""キャッシュ一覧を更新する"""
-		tree = self._cache_list_tree
-		tree.delete(*tree.get_children())
-
-		# NASベースパス配下の全サブフォルダをスキャン（フォルダ名の変遷に対応）
-		nas_base = self.cache_nas_path.get().strip()
-		all_meta = []
-
-		if nas_base:
-			from pathlib import Path
-			base = Path(nas_base)
-			print(f"[CacheList] NASベースパス: {base}")
-			# 候補フォルダを全て試す（ドットあり・なし両方）
-			candidate_dirs = [
-				(base / "fem_cache",     "fem"),
-				(base / ".fem_cache",    "fem"),
-				(base / "overlap_cache", "overlap"),
-				(base / ".overlap_cache","overlap"),
-			]
-			visited_keys = set()
-			for scan_dir, cache_type in candidate_dirs:
-				if not scan_dir.exists():
-					print(f"[CacheList]   スキップ（存在しない）: {scan_dir}")
-					continue
-				print(f"[CacheList]   スキャン中: {scan_dir}")
-				# メタデータJSONを読み込み
-				import json as _json
-				for meta_file in scan_dir.glob("_meta_*.json"):
-					try:
-						with open(meta_file, 'r', encoding='utf-8') as f:
-							meta = _json.load(f)
-						mk = meta_file.stem[6:]
-						if mk in visited_keys:
-							continue
-						meta['_meta_key'] = mk
-						meta['_scan_dir'] = str(scan_dir)
-						all_meta.append(meta)
-						visited_keys.add(mk)
-					except Exception:
-						pass
-				# メタデータのないPKLファイルをスキャン
-				for pkl_file in scan_dir.glob("*.pkl"):
-					if pkl_file.name.startswith('_'):
-						continue
-					stem = pkl_file.stem
-					if stem.startswith('fem_'):
-						key = stem[4:]
-					elif stem.startswith('overlap_'):
-						key = stem[8:]
-					else:
-						key = stem
-					if key in visited_keys:
-						continue
-					try:
-						stat = pkl_file.stat()
-						mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
-						size_mb = round(stat.st_size / (1024**2), 1)
-						all_meta.append({
-							'type': cache_type,
-							'xlsx': '（情報なし）',
-							'prox_stl': '（情報なし）',
-							'dist_stl': '（情報なし）',
-							'frames': '-',
-							'date': mtime.strftime('%Y-%m-%d %H:%M'),
-							'size_mb': size_mb,
-							'_meta_key': key,
-							'_no_meta': True,
-							'_scan_dir': str(scan_dir),
-						})
-						visited_keys.add(key)
-					except Exception:
-						pass
-			print(f"[CacheList] 合計 {len(all_meta)} 件")
-		else:
-			print("[CacheList] NASパス未設定")
-
-		# 日時でソート（新しい順）
-		all_meta.sort(key=lambda m: m.get('date', ''), reverse=True)
-		for meta in all_meta:
-			cache_type = meta.get('type', 'unknown')
-			type_label = {"fem": "FEM", "overlap": "Overlap"}.get(cache_type, cache_type)
-			if meta.get('_no_meta'):
-				type_label += "※"  # メタデータなし（旧キャッシュ）
-			if cache_type == 'fem':
-				frames_str = f"{meta.get('frames_cached','?')}/{meta.get('frames','?')}"
-			else:
-				frames_str = str(meta.get('frames', '-'))
-			tree.insert("", "end",
-				values=(
-					type_label,
-					meta.get('xlsx', ''),
-					meta.get('prox_stl', ''),
-					meta.get('dist_stl', ''),
-					frames_str,
-					meta.get('date', ''),
-				),
-				tags=(cache_type, meta.get('_meta_key', ''))
-			)
-		if not all_meta:
-			tree.insert("", "end", values=("", "キャッシュなし（NAS未接続またはデータなし）", "", "", "", ""))
-
-	def _on_cache_list_delete_selected(self) -> None:
-		"""選択行のキャッシュを削除する"""
-		tree = self._cache_list_tree
-		selected = tree.selection()
-		if not selected:
-			messagebox.showwarning("選択なし", "削除する行を選択してください。")
-			return
-		if not messagebox.askyesno("確認", f"{len(selected)}件のキャッシュを削除しますか？"):
-			return
-		for item in selected:
-			tags = tree.item(item, "tags")
-			if len(tags) >= 2:
-				cache_type, meta_key = tags[0], tags[1]
-				cache = self._shared_fem_cache if cache_type == 'fem' else self._shared_overlap_cache
-				if cache and meta_key:
-					cache.delete_dataset(meta_key)
-		self._on_cache_list_refresh()
-		messagebox.showinfo("完了", "選択したキャッシュを削除しました。")
-
-	def _on_cache_show_stats(self) -> None:
-		lines = []
-		for name, cache in [("FEM", self._shared_fem_cache), ("Overlap", self._shared_overlap_cache)]:
-			if cache is None:
-				lines.append(f"[{name}] 未初期化")
-				continue
-			s = cache.stats()
-			lines.append(f"[{name}]")
-			lines.append(f"  NAS接続:  {'OK' if s['nas_available'] else 'なし'}")
-			if s['nas_available']:
-				lines.append(f"  NAS:      {s['nas_count']}件 ({s['nas_size_mb']:.1f} MB)")
-			lines.append(f"  メモリ:   {s['memory_count']}件（セッション内）")
-			lines.append("")
-		self._cache_stats_text.config(state="normal")
-		self._cache_stats_text.delete("1.0", "end")
-		self._cache_stats_text.insert("1.0", "\n".join(lines))
-		self._cache_stats_text.config(state="disabled")
-
-	def _on_cache_clear_all(self) -> None:
-		if not messagebox.askyesno("確認", "NASキャッシュを全削除しますか？\nこの操作は取り消せません。"):
-			return
-		if self._shared_fem_cache:
-			self._shared_fem_cache.clear_all()
-		if self._shared_overlap_cache:
-			self._shared_overlap_cache.clear_all()
-		self._on_cache_show_stats()
-		messagebox.showinfo("完了", "NASキャッシュを削除しました。")
-
 	def choose_randomizer_input(self) -> None:
 		path = filedialog.askopenfilename(
 			title="モデルファイルを選択",
@@ -4884,12 +2807,7 @@ class MainMenuGUI(_BaseWindow):
 		return raw
 
 	def _register_dnd(self, widget, textvariable: tk.StringVar) -> None:
-		"""ウィジェットにドラッグ&ドロップを登録する。
-
-		macOS/Windows/Linux 差異への対応:
-		  - <<Drop>> と <<Drop:DND_Files>> の両方をバインド（Aqua では後者しか発火しない事例がある）
-		  - 初回登録時のみ失敗をコンソール表示（以降は静かにスキップ）
-		"""
+		"""ウィジェットにドラッグ&ドロップを登録する"""
 		if not _HAS_DND:
 			return
 		try:
@@ -4899,19 +2817,14 @@ class MainMenuGUI(_BaseWindow):
 				if path and os.path.exists(path):
 					textvariable.set(path)
 			widget.dnd_bind("<<Drop>>", on_drop)
-			widget.dnd_bind("<<Drop:DND_Files>>", on_drop)
-		except Exception as e:
-			if not getattr(self, "_dnd_warn_shown", False):
-				print(f"[DnD] 登録に失敗しました（以降のDnDは無効化されます）: {e}")
-				self._dnd_warn_shown = True
+		except Exception:
+			pass  # DnD非対応環境ではスキップ
 
-	def _add_file_row(self, parent: ttk.Frame, row: int, label_text: str, textvariable: tk.StringVar, command):
+	def _add_file_row(self, parent: ttk.Frame, row: int, label_text: str, textvariable: tk.StringVar, command) -> None:
 		"""Add a file selection row with label, readonly entry (showing filename only), and browse button.
 		ドラッグ&ドロップにも対応（tkinterdnd2が利用可能な場合）。
-		ラベルウィジェットを返す（後から text を差し替えられるように）。
 		"""
-		row_label = ttk.Label(parent, text=label_text)
-		row_label.grid(row=row, column=0, sticky="w", padx=12, pady=6)
+		ttk.Label(parent, text=label_text).grid(row=row, column=0, sticky="w", padx=12, pady=6)
 
 		# Create a frame to hold the entry with custom display
 		entry_frame = ttk.Frame(parent)
@@ -4936,11 +2849,8 @@ class MainMenuGUI(_BaseWindow):
 		entry.pack(fill="x", expand=True)
 
 		# ドラッグ&ドロップ対応
-		# macOS の readonly Entry はドロップ受け取りが不安定なため、
-		# 周辺の Label / Frame でも受け付けて取りこぼしを防ぐ。
 		self._register_dnd(entry, textvariable)
 		self._register_dnd(entry_frame, textvariable)
-		self._register_dnd(row_label, textvariable)
 
 		# Add tooltip showing full path on hover
 		def show_tooltip(event):
@@ -4963,7 +2873,6 @@ class MainMenuGUI(_BaseWindow):
 		entry.bind("<Leave>", hide_tooltip)
 
 		ttk.Button(parent, text="参照...", command=command).grid(row=row, column=2, sticky="e", padx=12, pady=6)
-		return row_label
 
 	# ----- File pickers -----
 	def choose_prox_model(self) -> None:
@@ -5280,7 +3189,7 @@ class MainMenuGUI(_BaseWindow):
 			w_path = self.cs_dist_model1_whole_path.get().strip()
 			r_path = self.cs_dist_model1_region_path.get().strip()
 			w2_path = self.cs_dist_model2_whole_path.get().strip()
-		side_label = self._joint_label("cs_prox_tab" if side == "prox" else "cs_dist_tab")
+		side_label = "近位（骨盤）" if side == "prox" else "遠位（大腿骨）"
 		if not w_path:
 			messagebox.showwarning("入力不足", "モデル1の全体モデルを選択してください。")
 			return
@@ -5310,7 +3219,7 @@ class MainMenuGUI(_BaseWindow):
 			m2w_path = self.cs_dist_model2_whole_path.get().strip()
 			m2r_path = self.cs_dist_model2_region_path.get().strip()
 
-		side_label = self._joint_label("cs_prox_tab" if side == "prox" else "cs_dist_tab")
+		side_label = "近位（骨盤）" if side == "prox" else "遠位（大腿骨）"
 		# 既存のon_cs_executeを呼び出す（パスを一時的にprox変数にセット）
 		# on_cs_executeはcs_prox_*を参照するので、dist実行時はswap
 		if side == "dist":
@@ -5835,93 +3744,8 @@ class MainMenuGUI(_BaseWindow):
 						model2_transformed.save(save_path2)
 						print(f"座標系一致済みモデル2を保存: {Path(save_path2).name}")
 			
-			# --- カラー統合モデルの保存 ---
-			want_combined = messagebox.askyesno(
-				"カラー統合モデル保存",
-				"骨モデルと軟骨モデルを色分けした状態で\n"
-				"1つの3Dモデル（PLY形式）として保存しますか？\n\n"
-				f"  骨モデル : {self.cs_bone_color}  ({model2_transformed.n_cells}面)\n"
-				f"  軟骨モデル: {self.cs_cartilage_color}  ({cartilage_mesh.n_cells}面)\n\n"
-				"MeshLabやBlenderで色付きのまま開けます。")
-			if want_combined:
-				def _hex_to_rgb(hex_color):
-					h = hex_color.lstrip('#')
-					return [int(h[i:i+2], 16) for i in (0, 2, 4)]
-
-				def _write_colored_ply(save_path, meshes_with_colors):
-					"""
-					頂点カラー付きPLY（バイナリ）を直接書き出す。
-					PyVistaのsave()はRGB属性を無視するためカスタム実装。
-					meshes_with_colors: [(pv_mesh, [r,g,b]), ...]
-					"""
-					import struct
-					all_verts  = []
-					all_colors = []
-					all_faces  = []
-					vert_offset = 0
-					for mesh, color in meshes_with_colors:
-						tri = mesh.triangulate()
-						pts = tri.points.astype(np.float32)
-						all_verts.append(pts)
-						all_colors.append(np.full((len(pts), 3), color, dtype=np.uint8))
-						all_faces.append(tri.faces.reshape(-1, 4)[:, 1:].astype(np.int32) + vert_offset)
-						vert_offset += len(pts)
-					verts  = np.concatenate(all_verts,  axis=0)
-					colors = np.concatenate(all_colors, axis=0)
-					faces  = np.concatenate(all_faces,  axis=0)
-					header = (
-						"ply\n"
-						"format binary_little_endian 1.0\n"
-						f"element vertex {len(verts)}\n"
-						"property float x\n"
-						"property float y\n"
-						"property float z\n"
-						"property uchar red\n"
-						"property uchar green\n"
-						"property uchar blue\n"
-						f"element face {len(faces)}\n"
-						"property list uchar int vertex_indices\n"
-						"end_header\n"
-					).encode('ascii')
-					with open(save_path, 'wb') as fp:
-						fp.write(header)
-						for (x, y, z), (r, g, b) in zip(verts, colors):
-							fp.write(struct.pack('<fffBBB', x, y, z, r, g, b))
-						for (v0, v1, v2) in faces:
-							fp.write(struct.pack('<Biii', 3, v0, v1, v2))
-
-				bone_rgb = _hex_to_rgb(self.cs_bone_color)
-				cart_rgb = _hex_to_rgb(self.cs_cartilage_color)
-
-				original_path = Path(self.cs_prox_model1_whole_path.get())
-				default_name = original_path.stem + "_カラー統合.ply"
-				save_path_combined = filedialog.asksaveasfilename(
-					title="カラー統合モデルを保存（骨＋軟骨・色分け済み）",
-					defaultextension=".ply",
-					initialdir=str(original_path.parent),
-					initialfile=default_name,
-					filetypes=[
-						("PLY files（色情報あり）", "*.ply"),
-						("All files", "*.*")
-					]
-				)
-				if save_path_combined:
-					_write_colored_ply(
-						save_path_combined,
-						[
-							(model2_transformed, bone_rgb),
-							(cartilage_mesh,     cart_rgb),
-						]
-					)
-					print(f"カラー統合モデルを保存: {save_path_combined}")
-					messagebox.showinfo(
-						"保存完了",
-						f"カラー統合モデルを保存しました。\n\n"
-						f"保存先:\n{save_path_combined}\n\n"
-						f"MeshLab / Blender / Windows 3Dビューアで色付きのまま開けます。")
-
 			print("\n=== 軟骨分離処理完了 ===")
-
+		
 		except Exception as e:
 			messagebox.showerror("エラー", f"軟骨分離中にエラーが発生しました:\n{str(e)}")
 			print(f"エラー詳細: {e}")
@@ -5933,13 +3757,8 @@ class MainMenuGUI(_BaseWindow):
 		model_path = self.prox_model_path.get().strip()
 		pp_abcd_path = self.prox_pp_abcd_path.get().strip()
 		pp_olmn_path = self.prox_pp_olmn_path.get().strip()
-		# 膝関節 (ISB) では OLMN ファイルは不要
-		knee_mode = (self.joint_var.get() == 2)
-		if not model_path or not pp_abcd_path or (not knee_mode and not pp_olmn_path):
-			if knee_mode:
-				messagebox.showwarning("入力不足", "近位モデルと近位特徴点(ABCD)を選択してください。")
-			else:
-				messagebox.showwarning("入力不足", "近位モデルと近位特徴点(ABCD, OLMN)を選択してください。")
+		if not model_path or not pp_abcd_path or not pp_olmn_path:
+			messagebox.showwarning("入力不足", "近位モデルと近位特徴点(ABCD, OLMN)を選択してください。")
 			return
 
 		# ライブラリの確認（遅延インポート）
@@ -5954,16 +3773,12 @@ class MainMenuGUI(_BaseWindow):
 			)
 			return
 
-		# PP読み込み（PickedPoints XML対応）- 膝関節モードでは OLMN なしも可
+		# PP読み込み（PickedPoints XML対応）- 2つのファイルを統合
 		try:
 			points_abcd, labels_abcd = self._parse_pp_file(pp_abcd_path)
-			if pp_olmn_path:
-				points_olmn, labels_olmn = self._parse_pp_file(pp_olmn_path)
-				points = np.vstack([points_abcd, points_olmn])
-				labels = labels_abcd + labels_olmn
-			else:
-				points = points_abcd
-				labels = labels_abcd
+			points_olmn, labels_olmn = self._parse_pp_file(pp_olmn_path)
+			points = np.vstack([points_abcd, points_olmn])
+			labels = labels_abcd + labels_olmn
 		except Exception as e:
 			messagebox.showerror("PP読み込み失敗", f"PPファイルの読み込みに失敗しました:\n{e}")
 			return
@@ -6192,13 +4007,8 @@ class MainMenuGUI(_BaseWindow):
 		dist_model_path = self.dist_model_path.get().strip()
 		dist_pp_abc_path = self.dist_pp_abc_path.get().strip()
 		dist_pp_olmn_path = self.dist_pp_olmn_path.get().strip()
-		# 膝関節 (ISB) では OLMN ファイルは不要
-		knee_mode = (self.joint_var.get() == 2)
-		if not dist_model_path or not dist_pp_abc_path or (not knee_mode and not dist_pp_olmn_path):
-			if knee_mode:
-				messagebox.showwarning("入力不足", "遠位モデルと遠位特徴点(ABCD)を選択してください。")
-			else:
-				messagebox.showwarning("入力不足", "遠位モデルと遠位特徴点(ABC, OLMN)を選択してください。")
+		if not dist_model_path or not dist_pp_abc_path or not dist_pp_olmn_path:
+			messagebox.showwarning("入力不足", "遠位モデルと遠位特徴点(ABC, OLMN)を選択してください。")
 			return
 
 		# ライブラリの確認（遅延インポート）
@@ -6213,16 +4023,12 @@ class MainMenuGUI(_BaseWindow):
 			)
 			return
 
-		# PP読み込み（PickedPoints XML対応）- 膝関節モードでは OLMN なしも可
+		# PP読み込み（PickedPoints XML対応）- 2つのファイルを統合
 		try:
 			dist_points_abc, dist_labels_abc = self._parse_pp_file(dist_pp_abc_path)
-			if dist_pp_olmn_path:
-				dist_points_olmn, dist_labels_olmn = self._parse_pp_file(dist_pp_olmn_path)
-				dist_points = np.vstack([dist_points_abc, dist_points_olmn])
-				dist_labels = dist_labels_abc + dist_labels_olmn
-			else:
-				dist_points = dist_points_abc
-				dist_labels = dist_labels_abc
+			dist_points_olmn, dist_labels_olmn = self._parse_pp_file(dist_pp_olmn_path)
+			dist_points = np.vstack([dist_points_abc, dist_points_olmn])
+			dist_labels = dist_labels_abc + dist_labels_olmn
 		except Exception as e:
 			messagebox.showerror("PP読み込み失敗", f"PPファイルの読み込みに失敗しました:\n{e}")
 			return
@@ -6456,16 +4262,8 @@ class MainMenuGUI(_BaseWindow):
 		dist_pp_abc_path = self.dist_pp_abc_path.get().strip()
 		dist_pp_olmn_path = self.dist_pp_olmn_path.get().strip()
 		
-		# 膝関節 (ISB仕様) では OLMN ファイルは不要（原点は ABCD相当の中で決まる）
-		knee_mode = (self.joint_var.get() == 2)
-		required_paths = [prox_model_path, prox_pp_abcd_path, dist_model_path, dist_pp_abc_path]
-		if not knee_mode:
-			required_paths.extend([prox_pp_olmn_path, dist_pp_olmn_path])
-		if not all(required_paths):
-			if knee_mode:
-				messagebox.showwarning("入力不足", "近位・遠位のモデルと特徴点(ABCD相当)を選択してください。")
-			else:
-				messagebox.showwarning("入力不足", "近位・遠位のモデルと特徴点(ABCD, OLMN, ABC, OLMN)をすべて選択してください。")
+		if not all([prox_model_path, prox_pp_abcd_path, prox_pp_olmn_path, dist_model_path, dist_pp_abc_path, dist_pp_olmn_path]):
+			messagebox.showwarning("入力不足", "近位・遠位のモデルと特徴点(ABCD, OLMN, ABC, OLMN)をすべて選択してください。")
 			return
 
 		# ライブラリの確認（遅延インポート）
@@ -6480,30 +4278,22 @@ class MainMenuGUI(_BaseWindow):
 			)
 			return
 
-		# 近位PP読み込み（膝関節モードでは OLMN ファイルなしでも可）
+		# 近位PP読み込み - 2つのファイルを統合
 		try:
 			prox_points_abcd, prox_labels_abcd = self._parse_pp_file(prox_pp_abcd_path)
-			if prox_pp_olmn_path:
-				prox_points_olmn, prox_labels_olmn = self._parse_pp_file(prox_pp_olmn_path)
-				prox_points = np.vstack([prox_points_abcd, prox_points_olmn])
-				prox_labels = prox_labels_abcd + prox_labels_olmn
-			else:
-				prox_points = prox_points_abcd
-				prox_labels = prox_labels_abcd
+			prox_points_olmn, prox_labels_olmn = self._parse_pp_file(prox_pp_olmn_path)
+			prox_points = np.vstack([prox_points_abcd, prox_points_olmn])
+			prox_labels = prox_labels_abcd + prox_labels_olmn
 		except Exception as e:
 			messagebox.showerror("近位PP読み込み失敗", f"近位PPファイルの読み込みに失敗しました:\n{e}")
 			return
 
-		# 遠位PP読み込み（膝関節モードでは OLMN ファイルなしでも可）
+		# 遠位PP読み込み - 2つのファイルを統合
 		try:
 			dist_points_abc, dist_labels_abc = self._parse_pp_file(dist_pp_abc_path)
-			if dist_pp_olmn_path:
-				dist_points_olmn, dist_labels_olmn = self._parse_pp_file(dist_pp_olmn_path)
-				dist_points = np.vstack([dist_points_abc, dist_points_olmn])
-				dist_labels = dist_labels_abc + dist_labels_olmn
-			else:
-				dist_points = dist_points_abc
-				dist_labels = dist_labels_abc
+			dist_points_olmn, dist_labels_olmn = self._parse_pp_file(dist_pp_olmn_path)
+			dist_points = np.vstack([dist_points_abc, dist_points_olmn])
+			dist_labels = dist_labels_abc + dist_labels_olmn
 		except Exception as e:
 			messagebox.showerror("遠位PP読み込み失敗", f"遠位PPファイルの読み込みに失敗しました:\n{e}")
 			return
@@ -6649,9 +4439,8 @@ class MainMenuGUI(_BaseWindow):
 		window_width = int(screen_width * 0.9)
 		window_height = int(screen_height * 0.9)
 
-		# プロッタ作成（関節種別でタイトル切替）
-		plotter_title = "膝関節全体モデル/特徴点の可視化 (ISB)" if knee_mode else "股関節全体モデル/特徴点の可視化"
-		all_plotter = pv.Plotter(title=plotter_title, window_size=(window_width, window_height))
+		# プロッタ作成
+		all_plotter = pv.Plotter(title="股関節全体モデル/特徴点の可視化", window_size=(window_width, window_height))
 		all_plotter.set_background("white")
 		
 		# 近位モデル（設定したカラーを使用）
@@ -6822,95 +4611,49 @@ class MainMenuGUI(_BaseWindow):
 		dist_z_axis_initial = dist_z_axis.copy() if dist_z_axis is not None else None
 		
 		# 遠位座標系の軸ラインを保持（動的更新用）
-		# 近位軸に合わせて長さと色を統一
-		DIST_AXIS_LENGTH = 50.0
 		dist_x_line = None
 		dist_y_line = None
 		dist_z_line = None
 		if dist_origin is not None and dist_x_axis is not None and dist_y_axis is not None and dist_z_axis is not None:
-			dist_x_line = pv.Line(dist_origin, dist_origin + dist_x_axis * DIST_AXIS_LENGTH)
-			dist_y_line = pv.Line(dist_origin, dist_origin + dist_y_axis * DIST_AXIS_LENGTH)
-			dist_z_line = pv.Line(dist_origin, dist_origin + dist_z_axis * DIST_AXIS_LENGTH)
-
+			axis_length = 50.0
+			dist_x_line = pv.Line(dist_origin, dist_origin + dist_x_axis * axis_length)
+			dist_y_line = pv.Line(dist_origin, dist_origin + dist_y_axis * axis_length)
+			dist_z_line = pv.Line(dist_origin, dist_origin + dist_z_axis * axis_length)
+			
 			# 遠位座標系の軸をプロッターに追加（スライダーで動的に更新される）
-			# 近位と同じ配色・太さに統一
-			dx_actor = all_plotter.add_mesh(dist_x_line, color='red',   line_width=3, label='Dist X')
+			dx_actor = all_plotter.add_mesh(dist_x_line, color='red', line_width=3, label='Dist X')
 			dy_actor = all_plotter.add_mesh(dist_y_line, color='green', line_width=3, label='Dist Y')
-			dz_actor = all_plotter.add_mesh(dist_z_line, color='blue',  line_width=3, label='Dist Z')
+			dz_actor = all_plotter.add_mesh(dist_z_line, color='blue', line_width=3, label='Dist Z')
 			
 			# トグル制御用にアクターをリストに追加
 			dist_axis_actors.append(dx_actor)
 			dist_axis_actors.append(dy_actor)
 			dist_axis_actors.append(dz_actor)
 		
-		# チェックボックスUI（BooleanVar に保存して再起動後も復元）
-		# 重要: VTKコールバック内で SetVisibility を直接呼ぶと、VTK内部の状態と
-		# 競合して Python が segfault することがある（try/except では捕えられない）。
-		# self.after(0, ...) で Tk のメインループに退避してから実行する。
-		def _safe_set_visibility(actors, state):
-			for a in actors:
-				if a is None:
-					continue
-				try:
-					a.SetVisibility(bool(state))
-				except Exception as e:
-					print(f"[viz toggle] SetVisibility failed: {e}")
-
-		# VTKコールバックからTk操作を避けるため、可視化変更はキューに積んで
-		# Tkのrender_loop内でまとめて適用する。
-		pending_visibility = {
-			"prox_model": None,
-			"prox_pp": None,
-			"prox_axes": None,
-			"dist_model": None,
-			"dist_pp": None,
-			"dist_axes": None,
-		}
-
-		def _queue_visibility(key, state):
-			try:
-				pending_visibility[key] = bool(state)
-			except Exception as e:
-				print(f"[viz toggle queue] {key}: {e}")
-
+		# チェックボックスUI
 		def toggle_prox_model(state):
-			_queue_visibility("prox_model", state)
-
+			prox_mesh_actor.SetVisibility(state)
+		
 		def toggle_prox_points(state):
-			_queue_visibility("prox_pp", state)
-
+			prox_points_actor.SetVisibility(state)
+			for label_actor in prox_label_actors:
+				label_actor.SetVisibility(state)
+		
 		def toggle_dist_model(state):
-			_queue_visibility("dist_model", state)
-
+			dist_mesh_actor.SetVisibility(state)
+		
 		def toggle_dist_points(state):
-			_queue_visibility("dist_pp", state)
-
+			dist_points_actor.SetVisibility(state)
+			for label_actor in dist_label_actors:
+				label_actor.SetVisibility(state)
+		
 		def toggle_prox_axes(state):
-			_queue_visibility("prox_axes", state)
-
+			for actor in prox_axis_actors:
+				actor.SetVisibility(state)
+		
 		def toggle_dist_axes(state):
-			_queue_visibility("dist_axes", state)
-
-		# 起動時の保存済み表示状態の反映は show() 完了後に遅延適用する。
-		# （init 中の SetVisibility が VTK 内部の初期化と競合してクラッシュする
-		#  可能性があるため、show() で完全に立ち上がってから適用）
-		print(f"[viz init] prox_model={self.viz_show_prox_model.get()} "
-		      f"prox_pp={self.viz_show_prox_pp.get()} prox_axes={self.viz_show_prox_axes.get()} "
-		      f"dist_model={self.viz_show_dist_model.get()} dist_pp={self.viz_show_dist_pp.get()} "
-		      f"dist_axes={self.viz_show_dist_axes.get()}")
-		print(f"[viz init] actors: prox_mesh={prox_mesh_actor is not None} "
-		      f"prox_pts={prox_points_actor is not None} prox_axes_n={len(prox_axis_actors)} "
-		      f"dist_mesh={dist_mesh_actor is not None} dist_pts={dist_points_actor is not None} "
-		      f"dist_axes_n={len(dist_axis_actors)}")
-
-		def _apply_saved_viz_state():
-			"""保存済みの表示/非表示状態を実 actor に適用（show() 後に呼ぶ）。"""
-			_safe_set_visibility([prox_mesh_actor], self.viz_show_prox_model.get())
-			_safe_set_visibility([prox_points_actor] + list(prox_label_actors), self.viz_show_prox_pp.get())
-			_safe_set_visibility(prox_axis_actors, self.viz_show_prox_axes.get())
-			_safe_set_visibility([dist_mesh_actor], self.viz_show_dist_model.get())
-			_safe_set_visibility([dist_points_actor] + list(dist_label_actors), self.viz_show_dist_pp.get())
-			_safe_set_visibility(dist_axis_actors, self.viz_show_dist_axes.get())
+			for actor in dist_axis_actors:
+				actor.SetVisibility(state)
 		
 		def update_prox_opacity(value):
 			prox_mesh_actor.GetProperty().SetOpacity(value)
@@ -6920,27 +4663,27 @@ class MainMenuGUI(_BaseWindow):
 		
 		# チェックボックスとラベル - 近位（設定したカラーを使用）
 		all_plotter.add_text("Prox Model", position=(10, 10), font_size=10, color="black")
-		all_plotter.add_checkbox_button_widget(toggle_prox_model, value=self.viz_show_prox_model.get(), position=(130, 12), size=20, border_size=1, color_on=self.prox_color, color_off="white")
-
+		all_plotter.add_checkbox_button_widget(toggle_prox_model, value=True, position=(130, 12), size=20, border_size=1, color_on=self.prox_color, color_off="white")
+		
 		all_plotter.add_text("Prox PP", position=(10, 40), font_size=10, color="black")
-		all_plotter.add_checkbox_button_widget(toggle_prox_points, value=self.viz_show_prox_pp.get(), position=(130, 42), size=20, border_size=1, color_on=self.prox_color, color_off="white")
-
+		all_plotter.add_checkbox_button_widget(toggle_prox_points, value=True, position=(130, 42), size=20, border_size=1, color_on=self.prox_color, color_off="white")
+		
 		prox_y_offset = 70
 		if prox_axis_actors:
 			all_plotter.add_text("Prox Axes", position=(10, prox_y_offset), font_size=10, color="black")
-			all_plotter.add_checkbox_button_widget(toggle_prox_axes, value=self.viz_show_prox_axes.get(), position=(130, prox_y_offset+2), size=20, border_size=1, color_on=self.prox_color, color_off="white")
+			all_plotter.add_checkbox_button_widget(toggle_prox_axes, value=True, position=(130, prox_y_offset+2), size=20, border_size=1, color_on=self.prox_color, color_off="white")
 			prox_y_offset += 30
-
+		
 		# チェックボックスとラベル - 遠位（設定したカラーを使用）
 		all_plotter.add_text("Dist Model", position=(10, prox_y_offset), font_size=10, color="black")
-		all_plotter.add_checkbox_button_widget(toggle_dist_model, value=self.viz_show_dist_model.get(), position=(130, prox_y_offset+2), size=20, border_size=1, color_on=self.dist_color, color_off="white")
-
+		all_plotter.add_checkbox_button_widget(toggle_dist_model, value=True, position=(130, prox_y_offset+2), size=20, border_size=1, color_on=self.dist_color, color_off="white")
+		
 		all_plotter.add_text("Dist PP", position=(10, prox_y_offset+30), font_size=10, color="black")
-		all_plotter.add_checkbox_button_widget(toggle_dist_points, value=self.viz_show_dist_pp.get(), position=(130, prox_y_offset+32), size=20, border_size=1, color_on=self.dist_color, color_off="white")
+		all_plotter.add_checkbox_button_widget(toggle_dist_points, value=True, position=(130, prox_y_offset+32), size=20, border_size=1, color_on=self.dist_color, color_off="white")
 
 		if dist_axis_actors:
 			all_plotter.add_text("Dist Axes", position=(10, prox_y_offset+60), font_size=10, color="black")
-			all_plotter.add_checkbox_button_widget(toggle_dist_axes, value=self.viz_show_dist_axes.get(), position=(130, prox_y_offset+62), size=20, border_size=1, color_on=self.dist_color, color_off="white")
+			all_plotter.add_checkbox_button_widget(toggle_dist_axes, value=True, position=(130, prox_y_offset+62), size=20, border_size=1, color_on=self.dist_color, color_off="white")
 
 		# 透明度スライダー - 近位（設定したカラーを使用）
 		all_plotter.add_slider_widget(
@@ -6980,35 +4723,18 @@ class MainMenuGUI(_BaseWindow):
 			'AP': 0.0,  # Anterior/Posterior translation
 			'PD': 0.0,  # Proximal/Distal translation
 		}
-
-		# 靭帯リスト（apply_transformで終点を追従させるためここで宣言）
-		# 各要素: {'name', 'prox_point' (ワールド固定), 'dist_point_local' (脛骨ローカル),
-		#         'thickness', 'color', 'line_source', 'actor', 'label_actor'}
-		ligaments = []
 		
 		def apply_transform():
 			"""現在のパラメータで遠位モデルと座標系を変換"""
 			# 同次変換行列を構築（ワールド座標系基準）
-			# 膝関節 (ISB): FE=X, VV=Y, IE=Z 回転、ML/AP/PD は X/Y/Z 並進（連成なし）
-			# 股関節 (既存): FE=Z, VV=X, IE=Y 回転、並進は連成式
-			if knee_mode:
-				matrix = self._build_transform_matrix_knee_isb(
-					fe=transform_params['FE'],
-					vv=transform_params['VV'],
-					ie=transform_params['IE'],
-					ml=transform_params['ML'],
-					ap=transform_params['AP'],
-					pd=transform_params['PD'],
-				)
-			else:
-				matrix = self._build_transform_matrix(
-					rz=transform_params['FE'],
-					rx=transform_params['VV'],
-					ry=transform_params['IE'],
-					ml=transform_params['ML'],
-					ap=transform_params['AP'],
-					pd=transform_params['PD']
-				)
+			matrix = self._build_transform_matrix(
+				rz=transform_params['FE'],
+				rx=transform_params['VV'],
+				ry=transform_params['IE'],
+				ml=transform_params['ML'],
+				ap=transform_params['AP'],
+				pd=transform_params['PD']
+			)
 			
 			# 遠位メッシュを変換
 			# dist_mesh_for_sliderは遠位座標系の初期位置からの相対位置を保持
@@ -7089,36 +4815,14 @@ class MainMenuGUI(_BaseWindow):
 				transformed_y_axis = rotation_matrix @ dist_y_axis_initial
 				transformed_z_axis = rotation_matrix @ dist_z_axis_initial
 				
-				axis_length = 50.0  # 近位と同じ長さに統一
+				axis_length = 50.0
 				# X軸の更新
 				dist_x_line.points = np.array([transformed_origin, transformed_origin + transformed_x_axis * axis_length])
 				# Y軸の更新
 				dist_y_line.points = np.array([transformed_origin, transformed_origin + transformed_y_axis * axis_length])
 				# Z軸の更新
 				dist_z_line.points = np.array([transformed_origin, transformed_origin + transformed_z_axis * axis_length])
-
-			# 靭帯チューブの遠位端を追従させる（遠位側はローカル→現在表示位置に変換）
-			# Tube は pv.Line + tube() の polydata を毎フレーム再生成して mapper 差し替え。
-			if ligaments and dist_origin_initial is not None:
-				for lig in ligaments:
-					try:
-						local_pt = lig['dist_point_local']
-						centered = local_pt - dist_origin_initial
-						centered_homo = np.append(centered, 1.0)
-						transformed_homo = matrix @ centered_homo
-						dist_pt_world = transformed_homo[:3] + dist_origin_initial
-						tube_pd = _build_tube_polydata(lig['prox_point'], dist_pt_world, lig['thickness'])
-						if lig.get('actor') is not None:
-							lig['actor'].GetMapper().SetInputData(tube_pd)
-						if lig.get('label_actor') is not None:
-							mid = (lig['prox_point'] + dist_pt_world) / 2.0
-							try:
-								lig['label_actor'].SetPosition(*mid)
-							except Exception:
-								pass
-					except Exception:
-						pass
-
+		
 		# スライダー関数（角度用）
 		def update_FE(value):
 			transform_params['FE'] = value
@@ -7152,28 +4856,85 @@ class MainMenuGUI(_BaseWindow):
 		# スライダーウィジェットの参照を保持
 		slider_widgets = {}
 		
-		# event_type='always' でドラッグ中もコールバックが連続発火 → 3Dモデルがリアルタイム追従
-		# 古いPyVistaでは event_type 引数が無いため、未対応バージョン用のフォールバックを用意
-		def _make_slider(callback, rng, title, posy, color):
-			kwargs = dict(
-				rng=rng, value=0.0, title=title,
-				pointa=(slider_x_start, posy), pointb=(slider_x_end, posy),
-				style='modern', tube_width=0.005, slider_width=0.015, color=color,
-			)
-			try:
-				return all_plotter.add_slider_widget(callback, event_type='always', **kwargs)
-			except TypeError:
-				return all_plotter.add_slider_widget(callback, **kwargs)
-
 		# 角度スライダー（度）
-		slider_widgets['FE'] = _make_slider(update_FE, [-180.0, 180.0], "FE", 0.85, "blue")
-		slider_widgets['VV'] = _make_slider(update_VV, [-180.0, 180.0], "VV", 0.75, "red")
-		slider_widgets['IE'] = _make_slider(update_IE, [-180.0, 180.0], "IE", 0.65, "green")
-
+		slider_widgets['FE'] = all_plotter.add_slider_widget(
+			update_FE,
+			rng=[-180.0, 180.0],
+			value=0.0,
+			title="FE",
+			pointa=(slider_x_start, 0.85),
+			pointb=(slider_x_end, 0.85),
+			style='modern',
+			tube_width=0.005,
+			slider_width=0.015,
+			color="blue",
+		)
+		
+		slider_widgets['VV'] = all_plotter.add_slider_widget(
+			update_VV,
+			rng=[-180.0, 180.0],
+			value=0.0,
+			title="VV",
+			pointa=(slider_x_start, 0.75),
+			pointb=(slider_x_end, 0.75),
+			style='modern',
+			tube_width=0.005,
+			slider_width=0.015,
+			color="red",
+		)
+		
+		slider_widgets['IE'] = all_plotter.add_slider_widget(
+			update_IE,
+			rng=[-180.0, 180.0],
+			value=0.0,
+			title="IE",
+			pointa=(slider_x_start, 0.65),
+			pointb=(slider_x_end, 0.65),
+			style='modern',
+			tube_width=0.005,
+			slider_width=0.015,
+			color="green",
+		)
+		
 		# 変位スライダー（mm）
-		slider_widgets['ML'] = _make_slider(update_ML, [-50.0, 50.0], "ML", 0.50, "blue")
-		slider_widgets['AP'] = _make_slider(update_AP, [-50.0, 50.0], "AP", 0.40, "red")
-		slider_widgets['PD'] = _make_slider(update_PD, [-50.0, 50.0], "PD", 0.30, "green")
+		slider_widgets['ML'] = all_plotter.add_slider_widget(
+			update_ML,
+			rng=[-50.0, 50.0],
+			value=0.0,
+			title="ML",
+			pointa=(slider_x_start, 0.50),
+			pointb=(slider_x_end, 0.50),
+			style='modern',
+			tube_width=0.005,
+			slider_width=0.015,
+			color="blue",  # Z軸と同じ色
+		)
+		
+		slider_widgets['AP'] = all_plotter.add_slider_widget(
+			update_AP,
+			rng=[-50.0, 50.0],
+			value=0.0,
+			title="AP",
+			pointa=(slider_x_start, 0.40),
+			pointb=(slider_x_end, 0.40),
+			style='modern',
+			tube_width=0.005,
+			slider_width=0.015,
+			color="red",  # X軸と同じ色
+		)
+		
+		slider_widgets['PD'] = all_plotter.add_slider_widget(
+			update_PD,
+			rng=[-50.0, 50.0],
+			value=0.0,
+			title="PD",
+			pointa=(slider_x_start, 0.30),
+			pointb=(slider_x_end, 0.30),
+			style='modern',
+			tube_width=0.005,
+			slider_width=0.015,
+			color="green",  # Y軸と同じ色
+		)
 		
 		# Resetボタンの追加
 		def reset_all():
@@ -7207,1046 +4968,7 @@ class MainMenuGUI(_BaseWindow):
 		all_plotter.add_key_event('r', reset_all)
 		all_plotter.add_key_event('R', reset_all)
 
-		# ===== 自動再生コントロールウィンドウ（Tkinter） =====
-		# 6DOF それぞれに: 再生/停止トグル、方向 (+/-)、速度 (任意入力) を提供。
-		# 範囲端 (FE/VV/IE は ±180°、ML/AP/PD は ±50mm) に達したら反転（往復運動）。
-		# 値は20msごとに増分し、PyVistaウィジェットと apply_transform に同期反映する。
-
-		DOF_CONFIG = {
-			'FE': {'rng': (-180.0, 180.0), 'default_speed': 30.0, 'unit': '°/s', 'kind': 'rot'},
-			'VV': {'rng': (-180.0, 180.0), 'default_speed': 30.0, 'unit': '°/s', 'kind': 'rot'},
-			'IE': {'rng': (-180.0, 180.0), 'default_speed': 30.0, 'unit': '°/s', 'kind': 'rot'},
-			'ML': {'rng': (-50.0, 50.0),   'default_speed': 10.0, 'unit': 'mm/s', 'kind': 'trans'},
-			'AP': {'rng': (-50.0, 50.0),   'default_speed': 10.0, 'unit': 'mm/s', 'kind': 'trans'},
-			'PD': {'rng': (-50.0, 50.0),   'default_speed': 10.0, 'unit': 'mm/s', 'kind': 'trans'},
-		}
-		INTERVAL_MS = 20  # ~50Hz 更新
-
-		auto_state = {}
-		for dof in DOF_CONFIG:
-			auto_state[dof] = {'playing': False, 'direction': 1, 'after_id': None}
-
-		ctrl_window = tk.Toplevel(self)
-		ctrl_window.title("自動再生コントロール" + (" [膝関節 ISB]" if knee_mode else " [股関節]"))
-		ctrl_window.geometry("680x780")
-		ctrl_window.resizable(True, True)
-		ctrl_window.attributes('-topmost', True)
-
-		# スクロール可能なコンテナ
-		ctrl_canvas = tk.Canvas(ctrl_window, highlightthickness=0)
-		ctrl_scrollbar = ttk.Scrollbar(ctrl_window, orient="vertical", command=ctrl_canvas.yview)
-		ctrl_scroll_frame = ttk.Frame(ctrl_canvas)
-		ctrl_scroll_frame.bind("<Configure>", lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox("all")))
-		ctrl_canvas.create_window((0, 0), window=ctrl_scroll_frame, anchor="nw")
-		ctrl_canvas.configure(yscrollcommand=ctrl_scrollbar.set)
-		ctrl_canvas.pack(side="left", fill="both", expand=True)
-		ctrl_scrollbar.pack(side="right", fill="y")
-		def _on_ctrl_mousewheel(event):
-			try:
-				step = _mousewheel_units(event)
-				if step:
-					ctrl_canvas.yview_scroll(step, "units")
-			except Exception:
-				pass
-		ctrl_canvas.bind_all("<MouseWheel>", _on_ctrl_mousewheel)
-		ctrl_canvas.bind_all("<Button-4>", _on_ctrl_mousewheel)
-		ctrl_canvas.bind_all("<Button-5>", _on_ctrl_mousewheel)
-
-		# 個別自動再生セクション (LabelFrame + 単一grid で揃える)
-		auto_frame = ttk.LabelFrame(ctrl_scroll_frame, text="個別自動再生")
-		auto_frame.pack(fill="x", padx=8, pady=(8, 4))
-		# 列幅は uniform="auto_col" + 固定widthで揃える
-		hdr_font = (self.ui_font_family, 9, "bold")
-		ttk.Label(auto_frame, text="DOF",   width=6,  font=hdr_font).grid(row=0, column=0, padx=4, pady=(4, 2), sticky="w")
-		ttk.Label(auto_frame, text="現在値", width=10, font=hdr_font).grid(row=0, column=1, padx=4, pady=(4, 2), sticky="w")
-		ttk.Label(auto_frame, text="方向",   width=6,  font=hdr_font).grid(row=0, column=2, padx=4, pady=(4, 2), sticky="w")
-		ttk.Label(auto_frame, text="速度",   width=10, font=hdr_font).grid(row=0, column=3, padx=4, pady=(4, 2), sticky="w")
-		ttk.Label(auto_frame, text="単位",   width=8,  font=hdr_font).grid(row=0, column=4, padx=4, pady=(4, 2), sticky="w")
-		ttk.Label(auto_frame, text="再生",   width=8,  font=hdr_font).grid(row=0, column=5, padx=4, pady=(4, 2), sticky="w")
-
-		ctrl_widgets = {}  # 各DOFのwidget参照
-
-		def update_value_display(dof):
-			try:
-				ctrl_widgets[dof]['value_label'].config(text=f"{transform_params[dof]:+.2f}")
-			except Exception:
-				pass
-
-		def make_animate_step(dof):
-			lo, hi = DOF_CONFIG[dof]['rng']
-			def animate_step():
-				st = auto_state[dof]
-				if not st['playing']:
-					return
-				# 速度を取得（不正値の場合は前回値維持）
-				try:
-					speed = float(ctrl_widgets[dof]['speed_var'].get())
-				except (ValueError, tk.TclError):
-					speed = DOF_CONFIG[dof]['default_speed']
-				delta = st['direction'] * speed * (INTERVAL_MS / 1000.0)
-				new_val = transform_params[dof] + delta
-				# 範囲端で反転（往復運動）
-				if new_val > hi:
-					new_val = hi - (new_val - hi)
-					st['direction'] = -1
-					ctrl_widgets[dof]['dir_btn'].config(text="-")
-				elif new_val < lo:
-					new_val = lo + (lo - new_val)
-					st['direction'] = 1
-					ctrl_widgets[dof]['dir_btn'].config(text="+")
-				new_val = max(lo, min(hi, new_val))
-				transform_params[dof] = new_val
-				# PyVistaスライダーウィジェットの値も同期
-				try:
-					slider_widgets[dof].GetRepresentation().SetValue(new_val)
-				except Exception:
-					pass
-				# 3Dモデルに反映
-				try:
-					apply_transform()
-				except Exception:
-					pass
-				update_value_display(dof)
-				# 次フレームを予約
-				st['after_id'] = self.after(INTERVAL_MS, animate_step)
-			return animate_step
-
-		def toggle_play(dof):
-			st = auto_state[dof]
-			st['playing'] = not st['playing']
-			if st['playing']:
-				ctrl_widgets[dof]['play_btn'].config(text="停止")
-				make_animate_step(dof)()
-			else:
-				ctrl_widgets[dof]['play_btn'].config(text="再生")
-				if st['after_id'] is not None:
-					try:
-						self.after_cancel(st['after_id'])
-					except Exception:
-						pass
-					st['after_id'] = None
-
-		def toggle_direction(dof):
-			st = auto_state[dof]
-			st['direction'] = -st['direction']
-			ctrl_widgets[dof]['dir_btn'].config(text="+" if st['direction'] > 0 else "-")
-
-		for row_idx, dof in enumerate(['FE', 'VV', 'IE', 'ML', 'AP', 'PD'], start=1):
-			cfg = DOF_CONFIG[dof]
-			ttk.Label(auto_frame, text=dof, width=6).grid(row=row_idx, column=0, padx=4, pady=2, sticky="w")
-			value_label = ttk.Label(auto_frame, text="+0.00", width=10)
-			value_label.grid(row=row_idx, column=1, padx=4, pady=2, sticky="w")
-			dir_btn = ttk.Button(auto_frame, text="+", width=4,
-				command=lambda d=dof: toggle_direction(d))
-			dir_btn.grid(row=row_idx, column=2, padx=4, pady=2)
-			speed_var = tk.DoubleVar(value=cfg['default_speed'])
-			speed_entry = ttk.Entry(auto_frame, textvariable=speed_var, width=10)
-			speed_entry.grid(row=row_idx, column=3, padx=4, pady=2)
-			ttk.Label(auto_frame, text=cfg['unit'], width=8).grid(row=row_idx, column=4, padx=4, pady=2, sticky="w")
-			play_btn = ttk.Button(auto_frame, text="再生", width=8,
-				command=lambda d=dof: toggle_play(d))
-			play_btn.grid(row=row_idx, column=5, padx=4, pady=2)
-			ctrl_widgets[dof] = {
-				'value_label': value_label,
-				'dir_btn': dir_btn,
-				'speed_var': speed_var,
-				'play_btn': play_btn,
-			}
-
-		# 全停止 + リセットボタン
-		btm = ttk.Frame(ctrl_scroll_frame)
-		btm.pack(fill="x", padx=8, pady=(4, 8))
-		def stop_all_autoplay():
-			for d in DOF_CONFIG:
-				if auto_state[d]['playing']:
-					toggle_play(d)
-		def reset_from_ctrl():
-			stop_all_autoplay()
-			reset_all()
-			for d in DOF_CONFIG:
-				update_value_display(d)
-		ttk.Button(btm, text="全停止", command=stop_all_autoplay).pack(side="left", padx=4)
-		ttk.Button(btm, text="全リセット (0に戻す)", command=reset_from_ctrl).pack(side="left", padx=4)
-
-		# ===== シーケンス再生 (パターン1〜5) =====
-		# 各パターンに DOF・方向・速度・変位を設定。チェックされたものを上から順番に実行する。
-		# 各パターンは「現在値から指定変位だけ動かす」累積動作。
-		seq_state = {
-			'running': False,
-			'step_idx': 0,
-			'queue': [],         # 実行待ちパターンのリスト
-			'accumulated': 0.0,  # 現在ステップで動いた量
-			'after_id': None,
-		}
-		PATTERN_COUNT = 5
-		DOF_OPTIONS = ['FE', 'VV', 'IE', 'ML', 'AP', 'PD']
-
-		seq_frame = ttk.LabelFrame(ctrl_scroll_frame, text="シーケンス再生 (パターン1〜5)")
-		seq_frame.pack(fill="x", padx=8, pady=(4, 4))
-
-		# ヘッダ行 + 各行を一つの grid に入れる（カラム揃え）
-		ttk.Label(seq_frame, text="有効",   width=5,  font=hdr_font).grid(row=0, column=0, padx=4, pady=(4, 2))
-		ttk.Label(seq_frame, text="パターン", width=8,  font=hdr_font).grid(row=0, column=1, padx=4, pady=(4, 2))
-		ttk.Label(seq_frame, text="DOF",   width=6,  font=hdr_font).grid(row=0, column=2, padx=4, pady=(4, 2))
-		ttk.Label(seq_frame, text="方向",   width=5,  font=hdr_font).grid(row=0, column=3, padx=4, pady=(4, 2))
-		ttk.Label(seq_frame, text="速度",   width=10, font=hdr_font).grid(row=0, column=4, padx=4, pady=(4, 2))
-		ttk.Label(seq_frame, text="変位",   width=10, font=hdr_font).grid(row=0, column=5, padx=4, pady=(4, 2))
-		ttk.Label(seq_frame, text="単位 (速度/変位)", width=18, font=hdr_font).grid(row=0, column=6, padx=4, pady=(4, 2))
-
-		pattern_widgets = []  # 各行のtk変数群
-		for p_idx in range(1, PATTERN_COUNT + 1):
-			enabled_v = tk.BooleanVar(value=False)
-			dof_v = tk.StringVar(value='FE')
-			dir_v = tk.StringVar(value='+')
-			speed_v = tk.DoubleVar(value=10.0)
-			disp_v = tk.DoubleVar(value=20.0)
-			unit_label = ttk.Label(seq_frame, text="°/s, °", width=18)
-
-			def make_unit_updater(dv, lbl):
-				def upd(*_):
-					kind = DOF_CONFIG.get(dv.get(), {}).get('kind', 'rot')
-					lbl.config(text="°/s, °" if kind == 'rot' else "mm/s, mm")
-				return upd
-
-			ttk.Checkbutton(seq_frame, variable=enabled_v).grid(row=p_idx, column=0, padx=4, pady=1)
-			ttk.Label(seq_frame, text=f"パターン{p_idx}", width=8).grid(row=p_idx, column=1, padx=4, pady=1, sticky="w")
-			dof_cb = ttk.Combobox(seq_frame, textvariable=dof_v, values=DOF_OPTIONS, width=5, state='readonly')
-			dof_cb.grid(row=p_idx, column=2, padx=4, pady=1)
-			dof_cb.bind('<<ComboboxSelected>>', make_unit_updater(dof_v, unit_label))
-			ttk.Combobox(seq_frame, textvariable=dir_v, values=['+', '-'], width=4, state='readonly').grid(row=p_idx, column=3, padx=4, pady=1)
-			ttk.Entry(seq_frame, textvariable=speed_v, width=10).grid(row=p_idx, column=4, padx=4, pady=1)
-			ttk.Entry(seq_frame, textvariable=disp_v, width=10).grid(row=p_idx, column=5, padx=4, pady=1)
-			unit_label.grid(row=p_idx, column=6, padx=4, pady=1, sticky="w")
-
-			pattern_widgets.append({
-				'enabled': enabled_v, 'dof': dof_v, 'dir': dir_v,
-				'speed': speed_v, 'disp': disp_v, 'unit_label': unit_label,
-			})
-
-		# ステータス表示 (シーケンス枠内の最後の行を使う)
-		seq_status_label = ttk.Label(seq_frame, text="状態: 停止中", foreground="gray")
-		seq_status_label.grid(row=PATTERN_COUNT + 1, column=0, columnspan=7, padx=4, pady=(4, 2), sticky="w")
-
-		# 制御ボタン
-		seq_btn_frame = ttk.Frame(seq_frame)
-		seq_btn_frame.grid(row=PATTERN_COUNT + 2, column=0, columnspan=7, padx=4, pady=(0, 6), sticky="w")
-
-		def stop_sequence():
-			seq_state['running'] = False
-			if seq_state['after_id'] is not None:
-				try:
-					self.after_cancel(seq_state['after_id'])
-				except Exception:
-					pass
-				seq_state['after_id'] = None
-			try:
-				seq_start_btn.config(text="シーケンス再生開始")
-				seq_status_label.config(text="状態: 停止中", foreground="gray")
-			except Exception:
-				pass
-
-		def sequence_step():
-			if not seq_state['running']:
-				return
-			# 全パターン消化?
-			if seq_state['step_idx'] >= len(seq_state['queue']):
-				try:
-					seq_status_label.config(text="状態: 完了", foreground="green")
-				except Exception:
-					pass
-				stop_sequence()
-				return
-
-			current = seq_state['queue'][seq_state['step_idx']]
-			dof = current['dof']
-			cfg = DOF_CONFIG[dof]
-			lo, hi = cfg['rng']
-
-			# 1ステップ分の増分（方向×速度×dt）
-			delta_per_step = current['dir'] * current['speed'] * (INTERVAL_MS / 1000.0)
-			remaining_disp = current['target_disp'] - seq_state['accumulated']
-
-			if abs(delta_per_step) >= remaining_disp:
-				# 最終ステップ: ぴったり目標分だけ動かす
-				delta = current['dir'] * remaining_disp
-			else:
-				delta = delta_per_step
-
-			new_val = transform_params[dof] + delta
-			# 範囲外ならクランプ（往復はしない: シーケンスは指定変位を達成して次へ）
-			new_val_clamped = max(lo, min(hi, new_val))
-			actual_delta = new_val_clamped - transform_params[dof]
-			transform_params[dof] = new_val_clamped
-
-			seq_state['accumulated'] += abs(actual_delta)
-
-			# PyVistaスライダーと表示を同期
-			try:
-				slider_widgets[dof].GetRepresentation().SetValue(new_val_clamped)
-			except Exception:
-				pass
-			try:
-				apply_transform()
-			except Exception:
-				pass
-			update_value_display(dof)
-
-			# ステータス更新
-			try:
-				seq_status_label.config(
-					text=f"状態: パターン{current['idx']} 実行中 ({dof} {seq_state['accumulated']:.2f}/{current['target_disp']:.2f})",
-					foreground="blue")
-			except Exception:
-				pass
-
-			# 範囲端で動けなくなった場合、強制的に次へ（無限ループ回避）
-			step_done = (seq_state['accumulated'] >= current['target_disp'] - 1e-6) or (abs(actual_delta) < 1e-9)
-
-			if step_done:
-				seq_state['step_idx'] += 1
-				seq_state['accumulated'] = 0.0
-
-			seq_state['after_id'] = self.after(INTERVAL_MS, sequence_step)
-
-		def start_sequence():
-			# 個別自動再生は止めてから開始（競合回避）
-			stop_all_autoplay()
-			# 有効パターンを集める
-			queue = []
-			for i, w in enumerate(pattern_widgets, start=1):
-				if not w['enabled'].get():
-					continue
-				try:
-					sp = float(w['speed'].get())
-					dp = float(w['disp'].get())
-				except (ValueError, tk.TclError):
-					continue
-				# 速度と変位は絶対値で扱う（符号は「方向」コンボボックスが担当）
-				sp_abs = abs(sp)
-				dp_abs = abs(dp)
-				if sp_abs <= 0 or dp_abs <= 0:
-					continue
-				queue.append({
-					'idx': i,
-					'dof': w['dof'].get(),
-					'dir': 1 if w['dir'].get() == '+' else -1,
-					'speed': sp_abs,
-					'target_disp': dp_abs,
-				})
-			if not queue:
-				try:
-					seq_status_label.config(text="状態: チェック済みパターンが無いか入力値が不正", foreground="red")
-				except Exception:
-					pass
-				return
-			seq_state['running'] = True
-			seq_state['step_idx'] = 0
-			seq_state['queue'] = queue
-			seq_state['accumulated'] = 0.0
-			try:
-				seq_start_btn.config(text="シーケンス停止")
-			except Exception:
-				pass
-			sequence_step()
-
-		def toggle_sequence():
-			if seq_state['running']:
-				stop_sequence()
-			else:
-				start_sequence()
-
-		seq_start_btn = ttk.Button(seq_btn_frame, text="シーケンス再生開始", command=toggle_sequence)
-		seq_start_btn.pack(side="left", padx=4)
-
-		# ===== プリセット永続化（姿勢 + シーケンス） =====
-		presets_data = self._load_presets()
-		# 形式: {"poses": [{"name": str, "params": {FE,VV,IE,ML,AP,PD}}, ...],
-		#       "sequences": [{"name": str, "patterns": [{...}x5]}, ...]}
-
-		def persist_presets():
-			"""現在のpresets_dataをファイルに保存。"""
-			self._save_presets(presets_data)
-
-		# ===== 姿勢の保存・呼び出し =====
-		pose_frame = ttk.LabelFrame(ctrl_scroll_frame, text="姿勢の保存・呼び出し")
-		pose_frame.pack(fill="x", padx=8, pady=(8, 4))
-
-		pose_top = ttk.Frame(pose_frame)
-		pose_top.pack(fill="x", padx=4, pady=(4, 4))
-		ttk.Label(pose_top, text="現在のFE/VV/IE/ML/AP/PD値を名前付きで保存します。").pack(side="left")
-
-		# 保存済み姿勢のリストUI（行を動的に追加・削除）
-		pose_list_frame = ttk.Frame(pose_frame)
-		pose_list_frame.pack(fill="x", padx=4, pady=(0, 4))
-
-		pose_row_widgets = []  # 各行の {'frame': ..., 'name_var': ..., 'pose': dict}
-
-		def refresh_pose_list():
-			# 既存の行を破棄
-			for w in pose_row_widgets:
-				try: w['frame'].destroy()
-				except Exception: pass
-			pose_row_widgets.clear()
-			# 再構築
-			for idx, pose in enumerate(presets_data.get("poses", [])):
-				row = ttk.Frame(pose_list_frame)
-				row.pack(fill="x", pady=1)
-				name_var = tk.StringVar(value=pose.get("name", f"姿勢{idx+1}"))
-				ttk.Entry(row, textvariable=name_var, width=20).pack(side="left", padx=2)
-				# 値プレビュー
-				p = pose.get("params", {})
-				preview = f"FE:{p.get('FE',0):+.1f} VV:{p.get('VV',0):+.1f} IE:{p.get('IE',0):+.1f} | ML:{p.get('ML',0):+.1f} AP:{p.get('AP',0):+.1f} PD:{p.get('PD',0):+.1f}"
-				ttk.Label(row, text=preview, foreground="gray", font=(self.ui_font_family, 8)).pack(side="left", padx=8)
-				def apply_pose(i=idx):
-					stop_all_autoplay(); stop_sequence()
-					p2 = presets_data["poses"][i].get("params", {})
-					for d in DOF_OPTIONS:
-						if d in p2:
-							transform_params[d] = float(p2[d])
-							try: slider_widgets[d].GetRepresentation().SetValue(transform_params[d])
-							except Exception: pass
-							update_value_display(d)
-					try: apply_transform()
-					except Exception: pass
-				def delete_pose(i=idx):
-					try: presets_data["poses"].pop(i)
-					except Exception: pass
-					persist_presets()
-					refresh_pose_list()
-				def rename_pose(*_, i=idx, nv=name_var):
-					try: presets_data["poses"][i]["name"] = nv.get()
-					except Exception: pass
-					persist_presets()
-				name_var.trace_add("write", rename_pose)
-				ttk.Button(row, text="適用", width=6, command=apply_pose).pack(side="right", padx=2)
-				ttk.Button(row, text="削除", width=6, command=delete_pose).pack(side="right", padx=2)
-				pose_row_widgets.append({'frame': row, 'name_var': name_var})
-
-		def save_current_pose():
-			# 名前のデフォルト
-			default_name = f"姿勢{len(presets_data.get('poses', [])) + 1}"
-			new_pose = {
-				"name": default_name,
-				"params": {d: float(transform_params[d]) for d in DOF_OPTIONS},
-			}
-			presets_data.setdefault("poses", []).append(new_pose)
-			persist_presets()
-			refresh_pose_list()
-
-		ttk.Button(pose_top, text="現在の姿勢を保存", command=save_current_pose).pack(side="right", padx=2)
-		refresh_pose_list()
-
-		# ===== シーケンスプリセット =====
-		preset_frame = ttk.LabelFrame(ctrl_scroll_frame, text="シーケンスプリセット")
-		preset_frame.pack(fill="x", padx=8, pady=(8, 8))
-
-		preset_top = ttk.Frame(preset_frame)
-		preset_top.pack(fill="x", padx=4, pady=(4, 4))
-		ttk.Label(preset_top, text="現在のシーケンス（パターン1〜5の内容）を名前付きで保存します。").pack(side="left")
-
-		preset_list_frame = ttk.Frame(preset_frame)
-		preset_list_frame.pack(fill="x", padx=4, pady=(0, 4))
-
-		preset_row_widgets = []
-
-		def refresh_preset_list():
-			for w in preset_row_widgets:
-				try: w['frame'].destroy()
-				except Exception: pass
-			preset_row_widgets.clear()
-			for idx, preset in enumerate(presets_data.get("sequences", [])):
-				row = ttk.Frame(preset_list_frame)
-				row.pack(fill="x", pady=1)
-				name_var = tk.StringVar(value=preset.get("name", f"シーケンス{idx+1}"))
-				ttk.Entry(row, textvariable=name_var, width=20).pack(side="left", padx=2)
-				patterns = preset.get("patterns", [])
-				enabled_count = sum(1 for p in patterns if p.get("enabled"))
-				ttk.Label(row, text=f"有効パターン数: {enabled_count}", foreground="gray", font=(self.ui_font_family, 8)).pack(side="left", padx=8)
-				def load_preset(i=idx):
-					stop_sequence()
-					patterns2 = presets_data["sequences"][i].get("patterns", [])
-					for j, w_row in enumerate(pattern_widgets):
-						if j < len(patterns2):
-							p = patterns2[j]
-							try:
-								w_row['enabled'].set(bool(p.get('enabled', False)))
-								w_row['dof'].set(str(p.get('dof', 'FE')))
-								w_row['dir'].set(str(p.get('dir', '+')))
-								w_row['speed'].set(float(p.get('speed', 10.0)))
-								w_row['disp'].set(float(p.get('disp', 20.0)))
-								# 単位ラベル更新
-								kind = DOF_CONFIG.get(w_row['dof'].get(), {}).get('kind', 'rot')
-								w_row['unit_label'].config(text="°/s, °" if kind == 'rot' else "mm/s, mm")
-							except Exception:
-								pass
-						else:
-							w_row['enabled'].set(False)
-				def delete_preset(i=idx):
-					try: presets_data["sequences"].pop(i)
-					except Exception: pass
-					persist_presets()
-					refresh_preset_list()
-				def rename_preset(*_, i=idx, nv=name_var):
-					try: presets_data["sequences"][i]["name"] = nv.get()
-					except Exception: pass
-					persist_presets()
-				name_var.trace_add("write", rename_preset)
-				ttk.Button(row, text="読込", width=6, command=load_preset).pack(side="right", padx=2)
-				ttk.Button(row, text="削除", width=6, command=delete_preset).pack(side="right", padx=2)
-				preset_row_widgets.append({'frame': row, 'name_var': name_var})
-
-		def save_current_sequence():
-			default_name = f"シーケンス{len(presets_data.get('sequences', [])) + 1}"
-			patterns_snapshot = []
-			for w in pattern_widgets:
-				try:
-					patterns_snapshot.append({
-						'enabled': bool(w['enabled'].get()),
-						'dof': str(w['dof'].get()),
-						'dir': str(w['dir'].get()),
-						'speed': float(w['speed'].get()),
-						'disp': float(w['disp'].get()),
-					})
-				except Exception:
-					patterns_snapshot.append({'enabled': False, 'dof': 'FE', 'dir': '+', 'speed': 10.0, 'disp': 20.0})
-			presets_data.setdefault("sequences", []).append({
-				"name": default_name,
-				"patterns": patterns_snapshot,
-			})
-			persist_presets()
-			refresh_preset_list()
-
-		ttk.Button(preset_top, text="現在のシーケンスを保存", command=save_current_sequence).pack(side="right", padx=2)
-		refresh_preset_list()
-
-		# ===== 靭帯作成 =====
-		# 「追加」→ 近位モデル上で点をクリック → 遠位モデル上で点をクリック → 2点をつなぐラインを描画。
-		# 名前・太さ・色は後から変更可能。遠位点は脛骨ローカル座標で保持し、スライダー操作で追従する。
-		# 靭帯は presets ファイルに永続化される。
-		from tkinter import colorchooser as _colorchooser
-
-		# 関節種別ごとに別キーで保存（モデルが違うと点位置の意味が変わるため）
-		lig_save_key = "ligaments_knee" if knee_mode else "ligaments_hip"
-		loading_ligaments = [False]  # 復元中フラグ（loopで persist しないように）
-
-		def persist_ligaments():
-			if loading_ligaments[0]:
-				return
-			try:
-				presets_data[lig_save_key] = [
-					{
-						'name': lig['name'],
-						'prox_point': lig['prox_point'].tolist(),
-						'dist_point_local': lig['dist_point_local'].tolist(),
-						'thickness': float(lig['thickness']),
-						'color': lig['color'],
-						'visible': bool(lig.get('visible', True)),
-					}
-					for lig in ligaments
-				]
-				persist_presets()
-			except Exception as e:
-				print(f"[靭帯永続化] 失敗: {e}")
-
-		lig_frame = ttk.LabelFrame(ctrl_scroll_frame, text="靭帯作成")
-		lig_frame.pack(fill="x", padx=8, pady=(8, 8))
-
-		lig_top = ttk.Frame(lig_frame)
-		lig_top.pack(fill="x", padx=4, pady=(4, 2))
-		lig_status_label = ttk.Label(lig_top, text="状態: 待機中", foreground="gray")
-		lig_status_label.pack(side="left", padx=2)
-
-		pick_state = {'mode': 'idle', 'prox_point': None}  # 'idle' / 'waiting_prox' / 'waiting_dist' / 'processing'
-
-		# 右クリックでサーフェスピッキングするVTKオブザーバ
-		# 左クリックドラッグはカメラ回転のまま使えるよう、VTKの RightButtonPressEvent を直接フック
-		import vtk as _vtk
-		lig_cell_picker = _vtk.vtkCellPicker()
-		lig_cell_picker.SetTolerance(0.005)
-		# 骨・軟骨メッシュのみをピック対象に限定（座標軸・PP点・ラベル等は除外）
-		try:
-			lig_cell_picker.SetPickFromList(True)
-			lig_cell_picker.InitializePickList()
-			if prox_mesh_actor is not None:
-				lig_cell_picker.AddPickList(prox_mesh_actor)
-			if dist_mesh_actor is not None:
-				lig_cell_picker.AddPickList(dist_mesh_actor)
-			if prox_cart_actor is not None:
-				lig_cell_picker.AddPickList(prox_cart_actor)
-			if dist_cart_actor is not None:
-				lig_cell_picker.AddPickList(dist_cart_actor)
-		except Exception as e:
-			print(f"[靭帯ピック] PickList 設定失敗: {e}")
-
-		def set_lig_status(text, color="gray"):
-			try:
-				lig_status_label.config(text=text, foreground=color)
-			except Exception:
-				pass
-
-		def cancel_pick():
-			pick_state['mode'] = 'idle'
-			pick_state['prox_point'] = None
-			set_lig_status("状態: 待機中", "gray")
-
-		def build_current_matrix():
-			"""現在のスライダー値から変換行列を組み立てる。"""
-			if knee_mode:
-				return self._build_transform_matrix_knee_isb(
-					fe=transform_params['FE'], vv=transform_params['VV'], ie=transform_params['IE'],
-					ml=transform_params['ML'], ap=transform_params['AP'], pd=transform_params['PD'])
-			else:
-				return self._build_transform_matrix(
-					rz=transform_params['FE'], rx=transform_params['VV'], ry=transform_params['IE'],
-					ml=transform_params['ML'], ap=transform_params['AP'], pd=transform_params['PD'])
-
-		def to_dist_local(world_pt):
-			"""現在表示中の遠位点(world)を、脛骨ローカル(slider=0時)座標に逆変換。"""
-			if dist_origin_initial is None:
-				return np.array(world_pt, dtype=float).copy()
-			matrix = build_current_matrix()
-			try:
-				inv = np.linalg.inv(matrix)
-			except Exception:
-				inv = np.eye(4)
-			centered = np.array(world_pt, dtype=float) - dist_origin_initial
-			centered_homo = np.append(centered, 1.0)
-			local_centered = (inv @ centered_homo)[:3]
-			return local_centered + dist_origin_initial
-
-		def _compute_dist_world_for_lig(lig):
-			"""靭帯の遠位点 (ローカル) を、現在の変換で表示位置 (ワールド) に。"""
-			if dist_origin_initial is None:
-				return np.array(lig['dist_point_local'], dtype=float)
-			m = build_current_matrix()
-			centered = lig['dist_point_local'] - dist_origin_initial
-			homo = np.append(centered, 1.0)
-			return (m @ homo)[:3] + dist_origin_initial
-
-		def _build_tube_polydata(prox_pt, dist_pt, radius):
-			"""2点間のチューブ polydata を生成。半径はワールド単位(mm)。"""
-			line = pv.Line(prox_pt, dist_pt, resolution=2)
-			# n_sides を大きくすると滑らか。負・ゼロ半径は VTK が嫌うので最小値を保証。
-			r = max(0.05, float(radius))
-			return line.tube(radius=r, n_sides=14)
-
-		def regenerate_ligament_tube(lig):
-			"""指定靭帯のチューブ形状を再生成して actor の入力を差し替える。"""
-			dist_world = _compute_dist_world_for_lig(lig)
-			tube_pd = _build_tube_polydata(lig['prox_point'], dist_world, lig['thickness'])
-			if lig.get('actor') is not None:
-				try:
-					lig['actor'].GetMapper().SetInputData(tube_pd)
-				except Exception:
-					pass
-			# ラベル位置も中点に追従
-			if lig.get('label_actor') is not None:
-				mid = (np.array(lig['prox_point']) + dist_world) / 2.0
-				try:
-					lig['label_actor'].SetPosition(*mid)
-				except Exception:
-					pass
-
-		def add_ligament(name, prox_pt, dist_local_pt, thickness=1.5, color="#FF8800", visible=True):
-			"""靭帯データを構築してプロッタにチューブを追加。
-
-			thickness は ワールド単位 (mm) のチューブ半径。ズームしてもボーンとの
-			相対太さが変わらない（pv.Tube は実3D形状）。
-			visible: 初期表示状態（False で隠す）。
-			"""
-			prox_arr = np.array(prox_pt, dtype=float)
-			dist_local_arr = np.array(dist_local_pt, dtype=float)
-			# 現在の表示位置に遠位点を変換
-			if dist_origin_initial is not None:
-				matrix = build_current_matrix()
-				centered = dist_local_arr - dist_origin_initial
-				centered_homo = np.append(centered, 1.0)
-				transformed_homo = matrix @ centered_homo
-				dist_world = transformed_homo[:3] + dist_origin_initial
-			else:
-				dist_world = dist_local_arr
-			tube_pd = _build_tube_polydata(prox_arr, dist_world, thickness)
-			actor = all_plotter.add_mesh(tube_pd, color=color, smooth_shading=True)
-			# 中点に名前ラベル
-			mid = (prox_arr + dist_world) / 2.0
-			label_actor = None
-			try:
-				label_actor = all_plotter.add_point_labels(
-					[mid], [name], point_size=0, font_size=10, text_color=color,
-					bold=True, shadow=True, show_points=False)
-			except Exception:
-				pass
-			# 初期可視状態を反映
-			try:
-				if actor is not None:
-					actor.SetVisibility(bool(visible))
-				if label_actor is not None:
-					label_actor.SetVisibility(bool(visible))
-			except Exception:
-				pass
-			lig = {
-				'name': name,
-				'prox_point': prox_arr,
-				'dist_point_local': dist_local_arr,
-				'thickness': float(thickness),
-				'color': color,
-				'visible': bool(visible),
-				'actor': actor,
-				'label_actor': label_actor,
-			}
-			ligaments.append(lig)
-			refresh_ligament_list()
-			persist_ligaments()
-
-		def toggle_ligament_visibility(idx, visible):
-			"""指定靭帯の表示/非表示を切替。"""
-			try:
-				lig = ligaments[idx]
-				lig['visible'] = bool(visible)
-				if lig.get('actor') is not None:
-					try: lig['actor'].SetVisibility(bool(visible))
-					except Exception: pass
-				if lig.get('label_actor') is not None:
-					try: lig['label_actor'].SetVisibility(bool(visible))
-					except Exception: pass
-				persist_ligaments()
-			except Exception as e:
-				print(f"[靭帯表示切替] 失敗: {e}")
-
-		def on_pick_callback(point):
-			"""ピックされた3D点を処理する。pick_state['mode']で分岐。
-
-			VTKイベントコールバック内では add_mesh 等が落ちるので、
-			レンダラ操作は self.after(...) で次のイベントループに遅延させる。
-			"""
-			p = np.array(point, dtype=float)
-			if pick_state['mode'] == 'waiting_prox':
-				pick_state['prox_point'] = p
-				pick_state['mode'] = 'waiting_dist'
-				self.after(0, lambda: set_lig_status("状態: 遠位上を右クリックで点を追加…", "blue"))
-			elif pick_state['mode'] == 'waiting_dist':
-				dist_picked = p.copy()
-				prox = pick_state['prox_point']
-				pick_state['prox_point'] = None
-				pick_state['mode'] = 'processing'
-
-				def deferred_create():
-					try:
-						dist_local = to_dist_local(dist_picked)
-						default_name = f"靭帯{len(ligaments) + 1}"
-						add_ligament(default_name, prox, dist_local)
-						set_lig_status(f"状態: 「{default_name}」を作成しました", "green")
-					except Exception as e:
-						set_lig_status(f"靭帯作成エラー: {e}", "red")
-					finally:
-						pick_state['mode'] = 'idle'
-
-				self.after(50, deferred_create)
-
-		def on_right_button_press(obj, event):
-			"""右クリック時のVTKオブザーバ。pickingモード中だけ動作する。
-
-			Pick() を VTK の RightButtonPressEvent 内で直接呼ぶと VTK 内部状態の
-			再入で落ちることがあるので、クリック座標だけ捕まえて self.after で遅延実行する。
-			"""
-			if pick_state['mode'] not in ('waiting_prox', 'waiting_dist'):
-				return  # ピッキング待機中でなければ無視（カメラ操作はそのまま）
-			try:
-				x, y = obj.GetEventPosition()
-			except Exception:
-				return
-
-			def do_pick():
-				try:
-					if pick_state['mode'] not in ('waiting_prox', 'waiting_dist'):
-						return
-					renderer = all_plotter.renderer
-					lig_cell_picker.Pick(x, y, 0, renderer)
-					# PickList で骨・軟骨に限定済み。それ以外はヒットしない。
-					if lig_cell_picker.GetCellId() < 0:
-						return
-					# どのアクターに当たったかチェック（PickList 設定でも念のため確認）
-					picked_actor = lig_cell_picker.GetActor()
-					allowed = {prox_mesh_actor, dist_mesh_actor, prox_cart_actor, dist_cart_actor}
-					if picked_actor not in allowed:
-						return  # 想定外アクターは無視
-					point = lig_cell_picker.GetPickPosition()
-					on_pick_callback(np.array(point, dtype=float))
-				except Exception as e:
-					print(f"[靭帯ピック] 失敗: {e}")
-
-			# 30ms 遅延でVTKの右クリックイベント処理が完全に戻ったあとに実行
-			self.after(30, do_pick)
-
-		# 右クリックオブザーバをセッション中ずっと登録しておく（モード判定で実行制御）
-		try:
-			all_plotter.iren.add_observer('RightButtonPressEvent', on_right_button_press)
-		except Exception as e:
-			print(f"[靭帯] 右クリック observer 登録失敗: {e}")
-
-		def begin_pick():
-			if pick_state['mode'] != 'idle':
-				cancel_pick()
-				return
-			pick_state['mode'] = 'waiting_prox'
-			pick_state['prox_point'] = None
-			set_lig_status("状態: 近位上を右クリックで点を追加…", "blue")
-
-		ttk.Button(lig_top, text="追加", command=begin_pick).pack(side="right", padx=2)
-		ttk.Button(lig_top, text="キャンセル", command=cancel_pick).pack(side="right", padx=2)
-
-		lig_list_frame = ttk.Frame(lig_frame)
-		lig_list_frame.pack(fill="x", padx=4, pady=(2, 6))
-		lig_row_widgets = []
-
-		def remove_ligament(idx):
-			try:
-				lig = ligaments[idx]
-				# PyVista actor削除
-				if lig.get('actor') is not None:
-					try: all_plotter.remove_actor(lig['actor'])
-					except Exception: pass
-				if lig.get('label_actor') is not None:
-					try: all_plotter.remove_actor(lig['label_actor'])
-					except Exception: pass
-				ligaments.pop(idx)
-			except Exception:
-				pass
-			refresh_ligament_list()
-			persist_ligaments()
-
-		def update_ligament_thickness(idx, value):
-			try:
-				lig = ligaments[idx]
-				w = max(0.05, float(value))
-				lig['thickness'] = w
-				# チューブを再生成 (半径=mm単位、ワールド空間)
-				regenerate_ligament_tube(lig)
-				persist_ligaments()
-			except (ValueError, tk.TclError):
-				pass
-
-		def update_ligament_color(idx):
-			try:
-				lig = ligaments[idx]
-				result = _colorchooser.askcolor(color=lig['color'], parent=ctrl_window, title=f"「{lig['name']}」の色を選択")
-				if result and result[1]:
-					hex_color = result[1]
-					lig['color'] = hex_color
-					persist_ligaments()
-					if lig.get('actor') is not None:
-						try:
-							# hex → RGB(0-1)
-							r = int(hex_color[1:3], 16) / 255.0
-							g = int(hex_color[3:5], 16) / 255.0
-							b = int(hex_color[5:7], 16) / 255.0
-							lig['actor'].GetProperty().SetColor(r, g, b)
-						except Exception:
-							pass
-					# ラベルの色も更新（再生成）
-					if lig.get('label_actor') is not None:
-						try:
-							all_plotter.remove_actor(lig['label_actor'])
-						except Exception:
-							pass
-						try:
-							dist_world = _compute_dist_world_for_lig(lig)
-							mid_pt = (lig['prox_point'] + dist_world) / 2.0
-							lig['label_actor'] = all_plotter.add_point_labels(
-								[mid_pt], [lig['name']], point_size=0, font_size=10,
-								text_color=hex_color, bold=True, shadow=True, show_points=False)
-						except Exception:
-							pass
-					refresh_ligament_list()
-			except Exception as e:
-				print(f"[靭帯色] 失敗: {e}")
-
-		def update_ligament_name(idx, name_var):
-			try:
-				lig = ligaments[idx]
-				new_name = name_var.get()
-				lig['name'] = new_name
-				persist_ligaments()
-				# ラベルを再生成
-				if lig.get('label_actor') is not None:
-					try:
-						all_plotter.remove_actor(lig['label_actor'])
-					except Exception:
-						pass
-					try:
-						dist_world = _compute_dist_world_for_lig(lig)
-						mid_pt = (lig['prox_point'] + dist_world) / 2.0
-						lig['label_actor'] = all_plotter.add_point_labels(
-							[mid_pt], [new_name], point_size=0, font_size=10,
-							text_color=lig['color'], bold=True, shadow=True, show_points=False)
-					except Exception:
-						pass
-			except Exception:
-				pass
-
-		def refresh_ligament_list():
-			# 既存行を破棄
-			for w in lig_row_widgets:
-				try: w['frame'].destroy()
-				except Exception: pass
-			lig_row_widgets.clear()
-			# ヘッダ行（先頭に1回だけ）
-			if ligaments:
-				hdr_row = ttk.Frame(lig_list_frame)
-				hdr_row.pack(fill="x", pady=(2, 1))
-				ttk.Label(hdr_row, text="表示", width=5, font=hdr_font).pack(side="left", padx=2)
-				ttk.Label(hdr_row, text="名前", width=14, font=hdr_font).pack(side="left", padx=2)
-				ttk.Label(hdr_row, text="太さ", width=6, font=hdr_font).pack(side="left", padx=2)
-				ttk.Label(hdr_row, text="色",   width=6, font=hdr_font).pack(side="left", padx=2)
-				lig_row_widgets.append({'frame': hdr_row})
-			# 各靭帯行
-			for idx, lig in enumerate(ligaments):
-				row = ttk.Frame(lig_list_frame)
-				row.pack(fill="x", pady=1)
-
-				# 表示/非表示チェックボックス
-				vis_var = tk.BooleanVar(value=bool(lig.get('visible', True)))
-				vis_chk = ttk.Checkbutton(row, variable=vis_var,
-					command=lambda i=idx, vv=vis_var: toggle_ligament_visibility(i, vv.get()))
-				vis_chk.pack(side="left", padx=(8, 4))
-
-				name_var = tk.StringVar(value=lig['name'])
-				name_entry = ttk.Entry(row, textvariable=name_var, width=14)
-				name_entry.pack(side="left", padx=2)
-				name_var.trace_add("write", lambda *_, i=idx, nv=name_var: update_ligament_name(i, nv))
-
-				thick_var = tk.DoubleVar(value=lig['thickness'])
-				thick_entry = ttk.Entry(row, textvariable=thick_var, width=6)
-				thick_entry.pack(side="left", padx=2)
-				thick_var.trace_add("write", lambda *_, i=idx, tv=thick_var: update_ligament_thickness(i, tv.get()))
-
-				# カラーボタン（現色を背景に表示）
-				color_btn = tk.Button(row, text=" ", bg=lig['color'], width=4,
-					command=lambda i=idx: update_ligament_color(i))
-				color_btn.pack(side="left", padx=2)
-
-				ttk.Button(row, text="削除", width=6, command=lambda i=idx: remove_ligament(i)).pack(side="right", padx=2)
-				lig_row_widgets.append({'frame': row, 'name_var': name_var, 'vis_var': vis_var})
-
-		refresh_ligament_list()
-
-		# 保存済み靭帯の復元（関節種別ごと）
-		saved_ligs = presets_data.get(lig_save_key, []) or []
-		if saved_ligs:
-			loading_ligaments[0] = True
-			try:
-				for sl in saved_ligs:
-					try:
-						add_ligament(
-							name=str(sl.get('name', f"靭帯{len(ligaments)+1}")),
-							prox_pt=np.array(sl.get('prox_point', [0,0,0]), dtype=float),
-							dist_local_pt=np.array(sl.get('dist_point_local', [0,0,0]), dtype=float),
-							thickness=float(sl.get('thickness', 1.5)),
-							color=str(sl.get('color', '#FF8800')),
-							visible=bool(sl.get('visible', True)),
-						)
-					except Exception as e:
-						print(f"[靭帯復元] スキップ: {e}")
-			finally:
-				loading_ligaments[0] = False
-
-		# ===== PyVistaウィンドウをノンブロッキング表示 + レンダループ =====
-		plotter_alive = [True]
-
-		def on_plotter_exit(*args):
-			plotter_alive[0] = False
-
-		try:
-			all_plotter.iren.add_observer('ExitEvent', on_plotter_exit)
-		except Exception:
-			pass
-
-		def on_ctrl_close():
-			stop_all_autoplay()
-			stop_sequence()
-			# 表示状態などをここで永続化
-			try:
-				self._save_state()
-			except Exception as e:
-				print(f"[on_ctrl_close save] {e}")
-			try:
-				ctrl_window.destroy()
-			except Exception:
-				pass
-		ctrl_window.protocol("WM_DELETE_WINDOW", on_ctrl_close)
-
-		try:
-			all_plotter.show(auto_close=False, interactive_update=True)
-		except TypeError:
-			all_plotter.show(auto_close=False)
-
-		# show() 直後に保存済みの表示状態を適用（チェックボックスとactor の状態を一致させる）
-		try:
-			self.after(300, _apply_saved_viz_state)
-		except Exception as e:
-			print(f"[viz preset schedule] {e}")
-
-		# レンダループ: PyVista の VTK イベントを Tk の after で駆動
-		render_after_id = [None]
-		def _apply_pending_visibility():
-			"""チェックボックスからの可視化変更を安全に適用。"""
-			try:
-				if pending_visibility["prox_model"] is not None:
-					state = pending_visibility["prox_model"]
-					_safe_set_visibility([prox_mesh_actor], state)
-					self.viz_show_prox_model.set(state)
-					pending_visibility["prox_model"] = None
-				if pending_visibility["prox_pp"] is not None:
-					state = pending_visibility["prox_pp"]
-					_safe_set_visibility([prox_points_actor] + list(prox_label_actors), state)
-					self.viz_show_prox_pp.set(state)
-					pending_visibility["prox_pp"] = None
-				if pending_visibility["prox_axes"] is not None:
-					state = pending_visibility["prox_axes"]
-					_safe_set_visibility(prox_axis_actors, state)
-					self.viz_show_prox_axes.set(state)
-					pending_visibility["prox_axes"] = None
-				if pending_visibility["dist_model"] is not None:
-					state = pending_visibility["dist_model"]
-					_safe_set_visibility([dist_mesh_actor], state)
-					self.viz_show_dist_model.set(state)
-					pending_visibility["dist_model"] = None
-				if pending_visibility["dist_pp"] is not None:
-					state = pending_visibility["dist_pp"]
-					_safe_set_visibility([dist_points_actor] + list(dist_label_actors), state)
-					self.viz_show_dist_pp.set(state)
-					pending_visibility["dist_pp"] = None
-				if pending_visibility["dist_axes"] is not None:
-					state = pending_visibility["dist_axes"]
-					_safe_set_visibility(dist_axis_actors, state)
-					self.viz_show_dist_axes.set(state)
-					pending_visibility["dist_axes"] = None
-			except Exception as e:
-				print(f"[viz toggle apply] {e}")
-
-		def render_loop():
-			if not plotter_alive[0]:
-				stop_all_autoplay()
-				stop_sequence()
-				try:
-					ctrl_window.destroy()
-				except Exception:
-					pass
-				return
-			try:
-				_apply_pending_visibility()
-				all_plotter.update()
-			except Exception:
-				plotter_alive[0] = False
-				stop_all_autoplay()
-				stop_sequence()
-				try:
-					ctrl_window.destroy()
-				except Exception:
-					pass
-				return
-			render_after_id[0] = self.after(30, render_loop)
-		render_after_id[0] = self.after(30, render_loop)
+		all_plotter.show()
 
 	def on_visualize_options(self) -> None:
 		"""可視化オプションウィンドウを開く"""
@@ -8415,7 +5137,7 @@ class MainMenuGUI(_BaseWindow):
 		# A-O線表示
 		ao_frame = ttk.Frame(options_window)
 		ao_frame.pack(fill="x", padx=40, pady=5)
-		ttk.Checkbutton(ao_frame, text=self._joint_label("ao_checkbox"), variable=self.show_ao_angle).pack(side="left")
+		ttk.Checkbutton(ao_frame, text="骨盤A-O線と大腿骨A-Oを表示する", variable=self.show_ao_angle).pack(side="left")
 		
 		# 保存と閉じるボタン
 		button_frame = ttk.Frame(options_window)
@@ -8612,52 +5334,7 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			raise Exception(f"KKR読み込みエラー: {str(e)}")
 	
-	def _build_transform_matrix_knee_isb(self, fe: float, vv: float, ie: float,
-	                                     ml: float, ap: float, pd: float) -> np.ndarray:
-		"""膝関節 ISB / Grood-Suntay 簡略化版の4x4同次変換行列。
-
-		ワールド軸 = 大腿骨座標系 (X=外側, Y=前方, Z=近位) に整列済みのメッシュに対して使う。
-		- FE (Flexion/Extension): 大腿骨X軸まわりの回転 [deg]
-		- VV (Varus/Valgus):      Y軸まわりの回転 [deg]
-		- IE (Internal/External): Z軸まわりの回転 [deg]
-		- ML / AP / PD: X / Y / Z 方向の独立並進 [mm]（股関節版のような連成は無い）
-
-		合成順序: R = Rx(FE) @ Ry(VV) @ Rz(IE)。小角度では順序非依存。
-		"""
-		fe_rad = np.deg2rad(fe)
-		vv_rad = np.deg2rad(vv)
-		ie_rad = np.deg2rad(ie)
-
-		Rx = np.array([
-			[1, 0, 0],
-			[0, np.cos(fe_rad), -np.sin(fe_rad)],
-			[0, np.sin(fe_rad),  np.cos(fe_rad)],
-		])
-		Ry = np.array([
-			[ np.cos(vv_rad), 0, np.sin(vv_rad)],
-			[ 0, 1, 0],
-			[-np.sin(vv_rad), 0, np.cos(vv_rad)],
-		])
-		Rz = np.array([
-			[np.cos(ie_rad), -np.sin(ie_rad), 0],
-			[np.sin(ie_rad),  np.cos(ie_rad), 0],
-			[0, 0, 1],
-		])
-		R = Rx @ Ry @ Rz
-
-		# 並進は「回転後の脛骨ローカルフレーム」で適用する。
-		# こうしないと FE=-90° 等で脛骨が回転した後、ML/AP/PD のスライダーが
-		# 関節座標系ではなく世界軸に沿って動いてしまい、AP と PD が入れ替わって
-		# 見える等の不一致が生じる。R @ t_local で「脛骨と一緒に回る軸」に並進する。
-		t_local = np.array([ml, ap, pd], dtype=float)
-		t_world = R @ t_local
-
-		T = np.eye(4, dtype=float)
-		T[:3, :3] = R
-		T[:3, 3] = t_world
-		return T
-
-	def _build_transform_matrix(self, rz: float, rx: float, ry: float,
+	def _build_transform_matrix(self, rz: float, rx: float, ry: float, 
 							  ml: float, ap: float, pd: float) -> np.ndarray:
 		"""Z-X-Y オイラー角と変位から4x4同次変換行列を構築
 		
@@ -8767,75 +5444,63 @@ class MainMenuGUI(_BaseWindow):
 		close_btn.pack(pady=10)
 
 	def _get_cache_hash(self, prox_mesh, dist_mesh, transform_data, simplify_mesh=False):
-		"""キャッシュファイル用のハッシュを生成（コンテンツベース）
-
-		ファイルパスではなくデータの中身に基づくため、異なるPC・OSで
-		同じデータなら同じハッシュが生成される。
-
+		"""キャッシュファイル用のハッシュを生成
+		
 		Args:
-			prox_mesh: 近位メッシュ
-			dist_mesh: 遠位メッシュ
+			prox_mesh: 近位メッシュ（整合性のため引数としては残すが、実際はパスを使用）
+			dist_mesh: 遠位メッシュ（同上）
 			transform_data: 変換データ
 			simplify_mesh: メッシュ簡略化フラグ
-
+			
 		Returns:
 			str: ハッシュ文字列
 		"""
-		hasher = hashlib.sha256()
-		hasher.update(b"v6_content_based")
-
-		# メッシュの頂点座標（ファイルパスではなく実データ）
-		hasher.update(np.round(np.array(prox_mesh.points), 2).tobytes())
-		hasher.update(np.round(np.array(dist_mesh.points), 2).tobytes())
-
-		# 変換データ（行列の中身）
-		hasher.update(str(len(transform_data)).encode())
-		for tf in transform_data:
-			m = tf['matrix']
-			hasher.update(np.round(np.array(m), 6).tobytes())
-
+		# メッシュと変換データから一意のハッシュを生成
+		hash_input = ["v5_robust_params"]  # バージョンを変更
+		
+		# ファイルパスを使用（ポイント配列より安定かつ確実）
+		hash_input.append(f"pm:{self.prox_model_path.get()}")
+		hash_input.append(f"dm:{self.dist_model_path.get()}")
+		hash_input.append(f"tg:{self.transform_group_path.get()}")
+		
+		# PPファイル（座標系・変換に影響）
+		hash_input.append(f"pp1:{self.prox_pp_abcd_path.get()}")
+		hash_input.append(f"pp2:{self.prox_pp_olmn_path.get()}")
+		hash_input.append(f"dp1:{self.dist_pp_abc_path.get()}")
+		hash_input.append(f"dp2:{self.dist_pp_olmn_path.get()}")
+		
 		# パラメータ（抽出領域・ヒートマップに影響）
-		params = (
-			f"pr:{self.prox_radius.get()}|dr:{self.dist_radius.get()}|"
-			f"po:{self.prox_offset_x.get()}/{self.prox_offset_y.get()}/{self.prox_offset_z.get()}|"
-			f"do:{self.dist_offset_x.get()}/{self.dist_offset_y.get()}/{self.dist_offset_z.get()}|"
-			f"simplify:{simplify_mesh}"
-		)
-		hasher.update(params.encode('utf-8'))
-
-		return hasher.hexdigest()[:20]
+		hash_input.append(f"pr:{self.prox_radius.get()}")
+		hash_input.append(f"dr:{self.dist_radius.get()}")
+		hash_input.append(f"po:{self.prox_offset_x.get()}/{self.prox_offset_y.get()}/{self.prox_offset_z.get()}")
+		hash_input.append(f"do:{self.dist_offset_x.get()}/{self.dist_offset_y.get()}/{self.dist_offset_z.get()}")
+		
+		# 変換データのフレーム数
+		hash_input.append(str(len(transform_data)))
+		
+		# ※ transform_dataの中身（numpy配列）を文字列化してハッシュに含めると、
+		#   浮動小数点の表示形式の違いなどでハッシュが不安定になる場合があるため、
+		#   ファイルパスとフレーム数で識別する形に変更。
+		
+		# メッシュ簡略化フラグを追加
+		hash_input.append(f"simplify:{simplify_mesh}")
+		
+		# ハッシュ生成
+		hash_str = '|'.join(hash_input)
+		return hashlib.md5(hash_str.encode()).hexdigest()
 
 	def _get_cache_filepath(self, cache_hash):
-		"""キャッシュファイルのパスを取得（SharedCacheManager対応）
-
-		SharedCacheManagerが設定されている場合はNAS→ローカルの順に検索。
-		設定されていない場合は従来のローカルキャッシュ。
-
+		"""キャッシュファイルのパスを取得
+		
 		Args:
 			cache_hash: ハッシュ文字列
-
+			
 		Returns:
 			Path: キャッシュファイルのパス
 		"""
-		# SharedCacheManagerが設定されている場合
-		if hasattr(self, '_shared_overlap_cache') and self._shared_overlap_cache is not None:
-			scm = self._shared_overlap_cache
-			if scm.is_nas_available() and scm._nas_dir is not None:
-				nas_file = scm._nas_dir / f"overlap_{cache_hash}.pkl"
-				return nas_file  # 存在有無にかかわらずNASパスを返す
-
-		# NAS未設定時は git 管理下の共有キャッシュ（cache/overlap/）を使う。
-		# 内容ベースのハッシュキーなので、サーバーで計算→git push→他PCでpull すれば
-		# 同じデータに対して同じファイルが見つかり、再計算なしで表示できる。
-		cache_dir = Path(__file__).parent / "cache" / "overlap"
-		cache_dir.mkdir(parents=True, exist_ok=True)
-		new_path = cache_dir / f"overlap_{cache_hash}.pkl"
-		# 後方互換: 旧 .overlap_cache/ に既存キャッシュがあれば読めるようにする（保存は新フォルダ）
-		if not new_path.exists():
-			old_path = Path(__file__).parent / ".overlap_cache" / f"overlap_{cache_hash}.pkl"
-			if old_path.exists():
-				return old_path
-		return new_path
+		cache_dir = Path(__file__).parent / ".overlap_cache"
+		cache_dir.mkdir(exist_ok=True)
+		return cache_dir / f"overlap_{cache_hash}.pkl"
 
 	def _save_overlap_cache(self, cache_filepath, overlap_meshes, overlap_areas, overlap_depths, heatmap_meshes=None):
 		"""オーバーラップデータとヒートマップをキャッシュファイルに保存
@@ -8873,21 +5538,7 @@ class MainMenuGUI(_BaseWindow):
 					cache_data['overlap'].append(None)
 			
 			# ヒートマップデータ（最適化：共通ジオメトリを抽出）
-			if isinstance(heatmap_meshes, _LazyHeatmapList):
-				# 遅延リストは base + 距離配列を直接保存（メッシュ再生成なし＝高速・省メモリ）
-				base = heatmap_meshes._base
-				if base is not None and base.n_points > 0:
-					cache_data['heatmap_base'] = {
-						'n_points': base.n_points, 'n_faces': base.n_cells,
-						'points': base.points, 'faces': base.faces,
-					}
-					print(f"[キャッシュ] ヒートマップ共通ジオメトリを抽出: {base.n_points}点, {base.n_cells}面")
-				for d in heatmap_meshes.distances:
-					if d is None:
-						cache_data['heatmap'].append(None)
-					else:
-						cache_data['heatmap'].append({'type': 'ref', 'distance': np.asarray(d, dtype=np.float32)})
-			elif heatmap_meshes is not None:
+			if heatmap_meshes is not None:
 				# ベースメッシュを探す（最初の非空メッシュ）
 				base_mesh_info = None
 				for mesh in heatmap_meshes:
@@ -8919,53 +5570,21 @@ class MainMenuGUI(_BaseWindow):
 							heatmap_dict['points'] = mesh.points
 							heatmap_dict['faces'] = mesh.faces if mesh.faces is not None and len(mesh.faces) > 0 else None
 						
-						# スカラーデータ（distance）を保存（float32でファイル容量・時間を半減）
+						# スカラーデータ（distance）を保存
 						if 'distance' in mesh.array_names:
-							heatmap_dict['distance'] = np.asarray(mesh['distance'], dtype=np.float32)
-
+							heatmap_dict['distance'] = mesh['distance']
+							
 						cache_data['heatmap'].append(heatmap_dict)
 					else:
 						cache_data['heatmap'].append(None)
 			
-			# ファイルに保存（アトミック: 一時ファイルへ書いてから置換。中断時の破損を防ぐ）
-			tmp_path = Path(str(cache_filepath) + ".tmp")
-			with open(tmp_path, 'wb') as f:
-				pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-			os.replace(str(tmp_path), str(cache_filepath))
-
+			# ファイルに保存
+			with open(cache_filepath, 'wb') as f:
+				pickle.dump(cache_data, f)
+			
 			print(f"[キャッシュ] 保存完了: {cache_filepath}")
 			if heatmap_meshes is not None:
 				print(f"[キャッシュ] ヒートマップデータも保存: {len(heatmap_meshes)}フレーム")
-
-			# SharedCacheManagerが設定されている場合、NASにも同期＋メタデータ保存
-			if hasattr(self, '_shared_overlap_cache') and self._shared_overlap_cache is not None:
-				scm = self._shared_overlap_cache
-				if scm.is_nas_available() and scm._nas_dir is not None:
-					try:
-						import shutil
-						nas_file = scm._nas_dir / cache_filepath.name
-						if not nas_file.exists():
-							scm._nas_dir.mkdir(parents=True, exist_ok=True)
-							shutil.copy2(str(cache_filepath), str(nas_file))
-							print(f"[キャッシュ] NASに同期完了: {nas_file}")
-					except Exception as e2:
-						print(f"[キャッシュ] NAS同期エラー（無視）: {e2}")
-					# メタデータ保存
-					try:
-						cache_hash = cache_filepath.stem.replace('overlap_', '')
-						size_mb = round(cache_filepath.stat().st_size / (1024**2), 1) if cache_filepath.exists() else 0
-						meta = {
-							'type': 'overlap',
-							'xlsx': os.path.basename(self.transform_group_path.get()),
-							'prox_stl': os.path.basename(self.prox_model_path.get()),
-							'dist_stl': os.path.basename(self.dist_model_path.get()),
-							'frames': len(overlap_meshes),
-							'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
-							'size_mb': size_mb,
-						}
-						scm.save_metadata(cache_hash, meta)
-					except Exception as e3:
-						print(f"[キャッシュ] メタデータ保存エラー（無視）: {e3}")
 		except Exception as e:
 			print(f"[キャッシュ] 保存失敗 (詳細): {e}")
 			import traceback
@@ -9047,48 +5666,46 @@ class MainMenuGUI(_BaseWindow):
 					except Exception as e:
 						print(f"[キャッシュ] 共通ジオメトリ復元失敗: {e}")
 
-				print(f"[キャッシュ] ヒートマップを遅延復元（メッシュは再生時に必要分だけ生成）: {total_frames}フレーム")
-
-				# 全フレーム同一形状(base)で距離のみ異なる典型ケースは、遅延リストで即時復元する
-				# （19000超のPolyDataを先に全部作らないので、読込後の待ちが大幅に短縮）。
-				all_ref = (base_mesh_cache is not None) and all(
-					(d is None) or (d.get('type') == 'ref') for d in heatmap_data)
-
-				if all_ref:
-					distances = [None if d is None else d.get('distance') for d in heatmap_data]
-					heatmap_meshes = _LazyHeatmapList(base_mesh_cache, distances)
-					progress_bar['value'] = total_frames
-					progress_label.config(text=f"{total_frames} / {total_frames} フレーム (100%)")
-					progress_window.update()
-				else:
-					# 形状がフレームごとに異なる場合は従来どおり個別復元
-					for i, data in enumerate(heatmap_data):
-						if cancel_var.get():
-							progress_window.destroy()
-							print("[キャッシュ] 読み込みがキャンセルされました")
-							return None
-						if data is None:
-							heatmap_meshes.append(pv.PolyData())
+				print(f"[キャッシュ] ヒートマップ再構築開始: {total_frames}フレーム")
+				
+				for i, data in enumerate(heatmap_data):
+					# キャンセルチェック
+					if cancel_var.get():
+						progress_window.destroy()
+						print("[キャッシュ] 読み込みがキャンセルされました")
+						return None
+					
+					if data is None:
+						heatmap_meshes.append(pv.PolyData())
+					else:
+						mesh = None
+						
+						# 新形式（最適化版）対応: 共通ジオメトリ利用
+						if 'type' in data and data['type'] == 'ref' and base_mesh_cache is not None:
+							# ベースメッシュの形状を再利用（メモリ効率・速度向上）
+							# deep=Falseでポイント配列を共有、ただしスカラーは別
+							mesh = base_mesh_cache.copy(deep=False)
 						else:
-							mesh = None
-							if 'type' in data and data['type'] == 'ref' and base_mesh_cache is not None:
-								mesh = base_mesh_cache.copy(deep=False)
-							else:
-								if 'faces' in data and data['faces'] is not None:
-									mesh = pv.PolyData(data['points'], data['faces'])
-								elif 'points' in data:
-									mesh = pv.PolyData(data['points'])
-							if mesh:
-								if 'distance' in data:
-									mesh['distance'] = data['distance']
-								heatmap_meshes.append(mesh)
-							else:
-								heatmap_meshes.append(pv.PolyData())
-						if i % 100 == 0 or i == total_frames - 1:
-							progress_bar['value'] = i + 1
-							progress_label.config(text=f"{i + 1} / {total_frames} フレーム ({(i+1)/total_frames*100:.1f}%)")
-							progress_window.update()
-
+							# 従来形式または個別保持（full）
+							if 'faces' in data and data['faces'] is not None:
+								mesh = pv.PolyData(data['points'], data['faces'])
+							elif 'points' in data:
+								mesh = pv.PolyData(data['points'])
+						
+						if mesh:
+							# スカラーデータ（distance）も復元
+							if 'distance' in data:
+								mesh['distance'] = data['distance']
+							heatmap_meshes.append(mesh)
+						else:
+							heatmap_meshes.append(pv.PolyData())
+					
+					# 100フレームごとに進捗更新（UI応答性確保）
+					if i % 100 == 0 or i == total_frames - 1:
+						progress_bar['value'] = i + 1
+						progress_label.config(text=f"{i + 1} / {total_frames} フレーム ({(i+1)/total_frames*100:.1f}%)")
+						progress_window.update()
+				
 				progress_window.destroy()
 				
 				print(f"[キャッシュ] 読み込み完了: {cache_filepath}")
@@ -9370,7 +5987,7 @@ class MainMenuGUI(_BaseWindow):
 		use_cache_var = tk.BooleanVar(value=True)
 		use_bbox_var = tk.BooleanVar(value=True)
 		use_simplify_var = tk.BooleanVar(value=True)
-		enable_fem_precompute_var = tk.BooleanVar(value=False)  # FEM事前計算（デフォルトOFF。必要時のみチェック）
+		enable_fem_precompute_var = tk.BooleanVar(value=False)  # FEM事前計算
 		
 		# タイトル
 		title_label = ttk.Label(
@@ -9518,9 +6135,6 @@ class MainMenuGUI(_BaseWindow):
 			command=skip_computation
 		)
 		skip_button.pack(side=tk.LEFT, padx=5)
-
-		# ウィンドウの×で閉じられた場合は「計算せずに進む」と同じ扱い（計算を始めない）
-		progress_window.protocol("WM_DELETE_WINDOW", skip_computation)
 		
 		# キャンセルボタン
 		def cancel_computation():
@@ -9552,12 +6166,7 @@ class MainMenuGUI(_BaseWindow):
 		x = (progress_window.winfo_screenwidth() // 2) - (progress_window.winfo_width() // 2)
 		y = (progress_window.winfo_screenheight() // 2) - (progress_window.winfo_height() // 2)
 		progress_window.geometry(f"+{x}+{y}")
-
-		# ※ 自動スタートはしない。ユーザーが FEM/ヒートマップ等のオプションを設定してから
-		#   「計算開始」または「計算せずに進む」を押すまで待機する。
-		#   （以前はここで after(200, start_computation) により即時開始していたため、
-		#     FEM事前計算などをオフにできなかった。）
-
+		
 		options_dict = {
 			'use_parallel': use_parallel_var,
 			'use_cache': use_cache_var,
@@ -10874,31 +7483,7 @@ class MainMenuGUI(_BaseWindow):
 		"""
 		n_vertices = len(vertices)
 		print(f"  元の頂点数: {n_vertices}")
-
-		# --- GPU一括計算パス（GPUがある場合のみ。厳密な点→三角形距離） ---
-		# GPUがあれば全頂点を一括計算（サンプリング/補間不要）。CPUのみの環境では
-		# 全対比較(O(N×M))は不利なので、従来のVTK逐次パスにフォールバックする。
-		try:
-			import frs_gpu
-			if frs_gpu.has_torch() and frs_gpu.get_device() in ("cuda", "mps"):
-				parent_tri = parent_mesh
-				if not isinstance(parent_tri, pv.PolyData):
-					parent_tri = parent_tri.extract_surface()
-				parent_tri = parent_tri.triangulate()
-				pverts = np.asarray(parent_tri.points, dtype=np.float64)
-				pfaces_raw = np.asarray(parent_tri.faces)
-				if pfaces_raw.size >= 4:
-					pfaces = pfaces_raw.reshape(-1, 4)[:, 1:4].astype(np.int64)
-					print(f"  [GPU] {frs_gpu.device_info()} で全{n_vertices}点を一括距離計算（三角形{len(pfaces)}）")
-					d_gpu = frs_gpu.point_to_mesh_distance(np.asarray(vertices, dtype=np.float64), pverts, pfaces, batch=1024)
-					if d_gpu is not None and len(d_gpu) == n_vertices:
-						if progress_callback:
-							progress_callback(100.0)
-						print("  ✓ GPU距離計算完了")
-						return d_gpu
-		except Exception as e:
-			print(f"  [GPU] 失敗のためCPUにフォールバック: {e}")
-
+		
 		# サンプリング比率を計算
 		if n_vertices > max_sample_points:
 			sample_rate = max_sample_points / n_vertices
@@ -12877,11 +9462,9 @@ class MainMenuGUI(_BaseWindow):
 			overlap_areas_precomputed = []  # 面積リストを追加
 			overlap_depths_precomputed = []  # 深度リストを追加
 			heatmap_precomputed = []  # 距離ヒートマップリストを追加
-			fem_pressure_precomputed = []  # FEM接触圧リスト
-			prox_fem_surface = None  # FEM近位表面メッシュ
-
-			if skip_var.get() or not start_var.get():
-				# 事前計算をスキップ（「計算せずに進む」/×閉じ/未開始のいずれも計算しない）
+			
+			if skip_var.get():
+				# 事前計算をスキップ
 				try:
 					progress_window.destroy()
 				except:
@@ -12975,26 +9558,9 @@ class MainMenuGUI(_BaseWindow):
 								vtk_error_output.SetFileName("nul" if os.name == 'nt' else "/dev/null")
 								vtk_original_output = vtk.vtkOutputWindow.GetInstance()
 								vtk.vtkOutputWindow.SetInstance(vtk_error_output)
-
-								# --- 符号付き距離を Open3D BVH で一括高速計算（VTK implicit と一致・大幅高速化） ---
-								# BVHにより O(N log M)。GPU総当たりやVTK per-frame より桁違いに速く、追加ライブラリ不要。
-								_use_fast_heatmap = False
+								
 								try:
-									print(f"[高速] Open3D BVH でヒートマップ{len(transform_data)}フレームを一括計算します")
-									heatmap_precomputed = self._precompute_heatmaps_o3d(
-										prox_joint_region, dist_surface, prox_points, transform_data,
-										update_progress, cancel_var)
-									_use_fast_heatmap = True
-									print(f"[高速] ヒートマップ {len(heatmap_precomputed)}フレーム計算完了")
-								except Exception as e:
-									print(f"[高速] Open3D計算に失敗、CPU逐次にフォールバック: {e}")
-									_use_fast_heatmap = False
-									heatmap_precomputed = []
-
-								try:
-									if _use_fast_heatmap:
-										pass  # 既に高速パスで計算済み
-									elif use_parallel_heatmap:
+									if use_parallel_heatmap:
 										# Phase 3: スレッド並列処理でヒートマップを計算（GIL制約あるが、I/O待機が多いため有効）
 										from concurrent.futures import ThreadPoolExecutor, as_completed
 										import multiprocessing
@@ -13122,26 +9688,14 @@ class MainMenuGUI(_BaseWindow):
 							overlap_depths_precomputed = []
 							heatmap_precomputed = []
 						else:
-							# ヒートマップも含めてキャッシュに保存（新規計算した場合のみ）。
-							# 大量フレームだと保存に時間がかかるため、バックグラウンドで書き出し、
-							# アニメーションは待たずに先に表示する（保存は継続・完了時にログ表示）。
+							# ヒートマップも含めてキャッシュに保存（新規計算した場合のみ）
 							if use_cache and heatmap_newly_computed and heatmap_precomputed:
 								cache_hash = self._get_cache_hash(prox_mesh, dist_mesh, transform_data, use_simplify)
 								cache_filepath = self._get_cache_filepath(cache_hash)
-								print(f"[キャッシュ] ヒートマップをバックグラウンドで保存します（アニメは先に表示）...")
-
-								def _bg_save_cache(cf=cache_filepath, ov=overlap_precomputed,
-								                   oa=overlap_areas_precomputed, od=overlap_depths_precomputed,
-								                   hm=heatmap_precomputed):
-									try:
-										self._save_overlap_cache(cf, ov, oa, od, hm)
-										print(f"[キャッシュ] ★バックグラウンド保存 完了: {cf}")
-									except Exception as _e:
-										print(f"[キャッシュ] バックグラウンド保存エラー: {_e}")
-
-								threading.Thread(target=_bg_save_cache, daemon=True).start()
+								print(f"[キャッシュ] 新規計算したヒートマップをキャッシュに保存します...")
+								self._save_overlap_cache(cache_filepath, overlap_precomputed, overlap_areas_precomputed, overlap_depths_precomputed, heatmap_precomputed)
 							
-							print(f"[事前計算] 完了: {len(overlap_precomputed)}フレーム分のオーバーラップ, {len(heatmap_precomputed)}フレーム分のヒートマップ")
+							messagebox.showinfo("完了", f"事前計算が完了しました。\n{len(overlap_precomputed)}フレーム分のオーバーラップと\n{len(heatmap_precomputed)}フレーム分のヒートマップを生成しました。")
 
 					# --- FEM接触解析の事前計算（関節領域で実行） ---
 					fem_pressure_precomputed = []  # List of (pressure_array, results_summary_dict) per frame
@@ -13173,7 +9727,7 @@ class MainMenuGUI(_BaseWindow):
 										dist_joint_transformed = self._apply_transform(dist_joint_region.copy(), matrix)
 										dist_fem_surface = dist_joint_transformed.extract_surface() if hasattr(dist_joint_transformed, 'extract_surface') else dist_joint_transformed
 										# FEM解析を実行
-										solver = FEMContactSolver(material=material, contact=contact, verbose=False, shared_cache=self._shared_fem_cache)
+										solver = FEMContactSolver(material=material, contact=contact, verbose=False)
 										results = solver.analyze(
 											prox_fem_surface.copy(), dist_fem_surface.copy(),
 											boundary_mode=self.fem_boundary_mode.get(),
@@ -13204,27 +9758,9 @@ class MainMenuGUI(_BaseWindow):
 										update_progress(i + 1, len(transform_data), f"FEM解析: フレーム {i+1}/{len(transform_data)}")
 								n_success = sum(1 for x in fem_pressure_precomputed if x is not None)
 								print(f"[FEM事前計算] 完了: {n_success}/{len(transform_data)}フレーム成功")
-								# FEMメタデータ保存
-								if self._shared_fem_cache and n_success > 0:
-									try:
-										xlsx_name = os.path.basename(self.transform_group_path.get())
-										prox_name = os.path.basename(self.prox_model_path.get())
-										dist_name = os.path.basename(self.dist_model_path.get())
-										meta_key = compute_content_hash(xlsx_name, prox_name, dist_name)
-										meta = {
-											'type': 'fem',
-											'xlsx': xlsx_name,
-											'prox_stl': prox_name,
-											'dist_stl': dist_name,
-											'frames': len(transform_data),
-											'frames_cached': n_success,
-											'date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
-										}
-										self._shared_fem_cache.save_metadata(meta_key, meta)
-									except Exception as _e:
-										print(f"[FEM] メタデータ保存エラー（無視）: {_e}")
 							except Exception as e:
 								print(f"[FEM事前計算] 初期化エラー: {e}")
+								import traceback
 								traceback.print_exc()
 								fem_pressure_precomputed = []
 						else:
@@ -13334,36 +9870,37 @@ class MainMenuGUI(_BaseWindow):
 				heatmap_mesh['distance'] = np.array([0.0])
 				print(f"[デバッグ] ヒートマップメッシュをダミーで初期化（データなし）")
 			
-			# カラースケール: 範囲 [-10, 0] mm 固定。めり込み(負)=赤(深いほど濃い) → 接触(0)=緑。
-			# 離間(正=範囲外)は透明にして素のモデルを見せる（above-range透明）。
-			CLIM_LO, CLIM_HI = -10.0, 0.0
-			heatmap_cmap = 'RdYlGn'
-			try:
-				from matplotlib.colors import LinearSegmentedColormap
-				heatmap_cmap = LinearSegmentedColormap.from_list(
-					'contact_pen',
-					[(0.0, (0.75, 0.0, 0.0)),   # -10mm: 濃い赤
-					 (0.5, (1.0, 0.6, 0.0)),    # -5mm:  オレンジ
-					 (1.0, (0.1, 0.75, 0.1))])  # 0mm(接触): 緑
-			except Exception:
-				heatmap_cmap = 'RdYlGn'
+			# カラースケール（符号付き距離対応: 0を中心に対称）
+			if len(heatmap_precomputed) > 0 and 'distance' in heatmap_precomputed[0].array_names:
+				try:
+					# 全フレームの距離範囲を走査してスケールを安定化
+					mins = []
+					maxs = []
+					for hm in heatmap_precomputed:
+						if hm is not None and hm.n_points > 0 and 'distance' in hm.array_names:
+							d = np.asarray(hm['distance'])
+							if d.size:
+								mins.append(np.nanmin(d))
+								maxs.append(np.nanmax(d))
+					min_val = np.nanmin(mins) if mins else 0.0
+					max_val = np.nanmax(maxs) if maxs else 1.0
+					max_abs = float(max(abs(min_val), abs(max_val)))
+					if max_abs <= 1e-6:
+						max_abs = 1.0
+				except Exception:
+					max_abs = 5.0
+			else:
+				max_abs = 5.0
 
 			heatmap_actor = anim_plotter.add_mesh(
 				heatmap_mesh,
 				scalars='distance',
-				cmap=heatmap_cmap,     # -10mm=赤 → 0mm=緑
-				clim=[CLIM_LO, CLIM_HI],
-				opacity=1.0,           # 全体不透明度（Heatmapスライダーで調整）
+				cmap='jet_r',  # 符号付き距離向けの発散カラーマップ
+				clim=[-5, 5],  # 0を中心に対称範囲
 				show_edges=False,
+				opacity=1.0,  # 1.0にしてフィッティング側と合わせる
 				label='Heatmap',
 			)
-			# 範囲外(離間 >0mm)は透明 → 素のモデルを見せる
-			try:
-				_hm_lut = heatmap_actor.GetMapper().GetLookupTable()
-				_hm_lut.SetUseAboveRangeColor(True)
-				_hm_lut.SetAboveRangeColor(0.0, 0.0, 0.0, 0.0)
-			except Exception:
-				pass
 			
 			# Z-fighting対策：マッパーの設定でPolygonOffsetを有効化
 			heatmap_mapper = heatmap_actor.GetMapper()
@@ -13714,8 +10251,7 @@ class MainMenuGUI(_BaseWindow):
 			control_window = tk.Toplevel(self)
 			control_window.title("再生コントロール")
 			control_window.geometry("850x360")
-			control_window.resizable(True, True)  # リサイズ可能（Mac対応）
-			control_window.minsize(400, 200)       # 最小サイズを設定
+			control_window.resizable(False, False)
 			control_window.attributes('-topmost', True)  # 常に最前面に表示
 			
 			# 情報表示フレーム
@@ -13791,10 +10327,11 @@ class MainMenuGUI(_BaseWindow):
 				from_=0,
 				to=len(transform_data)-1,
 				orient=tk.HORIZONTAL,
+				length=810,
 				label="Frame Position",
 				command=lambda val: on_playback_scale_change(int(val))
 			)
-			playback_scale.pack(pady=5, padx=10, fill=tk.X)
+			playback_scale.pack(pady=5, padx=10)
 			
 			# マウスイベントをバインド
 			playback_scale.bind("<ButtonPress-1>", on_scale_button_press)
@@ -13817,11 +10354,12 @@ class MainMenuGUI(_BaseWindow):
 				to=10.0,
 				resolution=0.25,
 				orient=tk.HORIZONTAL,
+				length=810,
 				label="Playback Speed (0.25x - 10x)",
 				command=on_speed_change
 			)
 			speed_scale.set(1.0)  # 初期値: 等倍速
-			speed_scale.pack(pady=5, padx=10, fill=tk.X)
+			speed_scale.pack(pady=5, padx=10)
 			
 			# 一時停止/再生ボタン
 			button_frame = ttk.Frame(control_window)
@@ -14432,6 +10970,7 @@ class MainMenuGUI(_BaseWindow):
 				except Exception as e:
 					# エラー内容を詳細に表示
 					print(f"[致命的エラー] フレーム{frame_idx}でshow_frame()がクラッシュ: {e}")
+					import traceback
 					traceback.print_exc()
 					if not force_render:
 						is_animation_active[0] = False
@@ -14653,108 +11192,23 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			messagebox.showerror("エラー", f"アニメーション実行中にエラーが発生しました:\n{e}\n\n{traceback.format_exc()}")
 
-	# ----- Joint labels (関節種別ごとのUIラベル) -----
-	def _joint_label(self, key: str) -> str:
-		"""関節種別 (joint_var) に応じたUIラベル文字列を返す。
-
-		key により対象UI要素を識別する。膝関節では ISB / Grood-Suntay 1983 を採用するため、
-		近位=大腿骨、遠位=脛骨 となる。
-		"""
-		knee = (self.joint_var.get() == 2)
-		table = {
-			"prox_file_frame":  ("近位ファイル選択（大腿骨側）"  if knee else "近位ファイル選択（寛骨臼側）"),
-			"dist_file_frame":  ("遠位ファイル選択（脛骨側）"    if knee else "遠位ファイル選択（大腿骨側）"),
-			"cs_prox_tab":      ("近位（大腿骨）"                if knee else "近位（骨盤）"),
-			"cs_dist_tab":      ("遠位（脛骨）"                  if knee else "遠位（大腿骨）"),
-			"ao_checkbox":      ("大腿骨A-O線と脛骨A-O線を表示する" if knee else "骨盤A-O線と大腿骨A-Oを表示する"),
-			# PPファイル選択行のラベル
-			"prox_pp_abcd_label": ("近位特徴点 ABCD (PP)" if knee else "近位特徴点 ABCD (PP)"),
-			"prox_pp_olmn_label": ("近位特徴点 OLMN (PP) ※膝関節では任意" if knee else "近位特徴点 OLMN (PP)"),
-			"dist_pp_abc_label":  ("遠位特徴点 ABCD (PP)" if knee else "遠位特徴点 ABC (PP)"),
-			"dist_pp_olmn_label": ("遠位特徴点 OLMN (PP) ※膝関節では任意" if knee else "遠位特徴点 OLMN (PP)"),
-			# 特徴点の意味を示す凡例
-			"prox_legend": (
-				"特徴点: A=大腿骨頭中心, B=顆間中点(原点), C=内側後顆, D=外側後顆 (ISB / Grood-Suntay 1983)"
-				if knee else
-				"特徴点: A,B,C,D=寛骨臼の参照点, O=原点(寛骨臼中心) — OLMN ファイルに O 等を入れて結合"
-			),
-			"dist_legend": (
-				"特徴点: A=顆間隆起中点(原点), B=足関節中心, C=内側プラトー, D=外側プラトー (ISB / Grood-Suntay 1983)"
-				if knee else
-				"特徴点: A,B=大腿骨頭軸の参照点, O=原点(大腿骨頭中心) — OLMN ファイルに O 等を入れて結合"
-			),
-		}
-		return table.get(key, key)
-
-	def _apply_joint_labels(self) -> None:
-		"""joint_var に応じて、登録済みウィジェットのラベルを更新する。"""
-		w = self._joint_widgets
-		try:
-			if "prox_file_frame" in w:
-				w["prox_file_frame"].configure(text=self._joint_label("prox_file_frame"))
-			if "dist_file_frame" in w:
-				w["dist_file_frame"].configure(text=self._joint_label("dist_file_frame"))
-			if "cs_notebook" in w and "cs_prox_tab" in w and "cs_dist_tab" in w:
-				w["cs_notebook"].tab(w["cs_prox_tab"], text=self._joint_label("cs_prox_tab"))
-				w["cs_notebook"].tab(w["cs_dist_tab"], text=self._joint_label("cs_dist_tab"))
-			if "fem_prox_header" in w:
-				w["fem_prox_header"].configure(text=f"【{self._joint_label('cs_prox_tab')}】")
-			if "fem_dist_header" in w:
-				w["fem_dist_header"].configure(text=f"【{self._joint_label('cs_dist_tab')}】")
-			# PPファイル行のラベル
-			for key in ("prox_pp_abcd_label", "prox_pp_olmn_label",
-			            "dist_pp_abc_label", "dist_pp_olmn_label",
-			            "prox_legend", "dist_legend"):
-				if key in w:
-					w[key].configure(text=self._joint_label(key))
-		except Exception as e:
-			print(f"[ラベル更新] 失敗: {e}")
-
-	def _on_joint_changed(self) -> None:
-		"""関節種別ラジオボタンが切り替わった時のハンドラ。
-
-		現在の状態を保存してから、新しい関節の状態ファイルがあれば読み込む。
-		ラベルとボタン状態も更新する。
-		"""
-		# 直前の関節の状態を保存（_prev_joint が無ければ初回切替なのでスキップ）
-		prev = getattr(self, "_prev_joint", None)
-		new = self.joint_var.get()
-		if prev is not None and prev != new and prev in (1, 2):
-			try:
-				self._save_state_for_joint(prev)
-			except Exception as e:
-				print(f"[関節切替] 直前状態の保存に失敗: {e}")
-		# 新しい関節の状態ファイルがあれば読み込む（パス変数等を上書き）
-		if new in (1, 2) and prev != new:
-			try:
-				self._load_paths_for_joint(new)
-			except Exception as e:
-				print(f"[関節切替] 新状態の読込に失敗: {e}")
-		self._prev_joint = new
-		self._apply_joint_labels()
-		self.update_button_states()
-
 	# ----- State control -----
 	def update_button_states(self) -> None:
 		# 可視化条件
-		# 膝関節 (ISB仕様) では OLMN ファイルは不要なのでオプション扱い
-		knee_mode = (self.joint_var.get() == 2)
-		olmn_prox_ok = knee_mode or bool(self.prox_pp_olmn_path.get())
-		olmn_dist_ok = knee_mode or bool(self.dist_pp_olmn_path.get())
 		all_files_selected = (
 			bool(self.prox_model_path.get())
 			and bool(self.prox_pp_abcd_path.get())
-			and olmn_prox_ok
+			and bool(self.prox_pp_olmn_path.get())
 			and bool(self.dist_model_path.get())
 			and bool(self.dist_pp_abc_path.get())
-			and olmn_dist_ok
+			and bool(self.dist_pp_olmn_path.get())
 		)
 		joint_selected = self.joint_var.get() in (1, 2)
 		# 近位のみ
-		prox_ready = joint_selected and bool(self.prox_model_path.get()) and bool(self.prox_pp_abcd_path.get()) and olmn_prox_ok
+		prox_ready = joint_selected and bool(self.prox_model_path.get()) and bool(self.prox_pp_abcd_path.get()) and bool(self.prox_pp_olmn_path.get())
 		self.visualize_prox_button.state(["!disabled"] if prox_ready else ["disabled"])
 		# 遠位のみ
-		dist_ready = joint_selected and bool(self.dist_model_path.get()) and bool(self.dist_pp_abc_path.get()) and olmn_dist_ok
+		dist_ready = joint_selected and bool(self.dist_model_path.get()) and bool(self.dist_pp_abc_path.get()) and bool(self.dist_pp_olmn_path.get())
 		self.visualize_dist_button.state(["!disabled"] if dist_ready else ["disabled"])
 		# 全体
 		all_ready = joint_selected and all_files_selected
@@ -14845,211 +11299,16 @@ class MainMenuGUI(_BaseWindow):
 		self.c_fix_transform_dist_button.state(["!disabled"] if dist_files_selected else ["disabled"])
 
 	# ----- Persistence -----
-	def _presets_file_path(self) -> Path:
-		"""姿勢・シーケンスプリセットの保存先ファイルパス。"""
-		import platform
-		filename = "frs2015_presets.json"
-		if platform.system() == "Darwin":
-			state_dir = Path.home() / ".frs_simulator"
-			state_dir.mkdir(parents=True, exist_ok=True)
-			return state_dir / filename
-		else:
-			return Path(__file__).with_name(filename)
+	def _state_file_path(self) -> Path:
+		return Path(__file__).with_name("frs2015_gui_state.json")
 
-	def _load_presets(self) -> dict:
-		"""プリセットファイルを読み込む。存在しない場合は空の構造を返す。"""
-		p = self._presets_file_path()
-		default = {"poses": [], "sequences": []}
-		if not p.exists():
-			return default
+	def _load_state(self) -> None:
 		try:
-			data = json.load(p.open("r", encoding="utf-8"))
-			if not isinstance(data, dict):
-				return default
-			data.setdefault("poses", [])
-			data.setdefault("sequences", [])
-			return data
-		except Exception as e:
-			print(f"[プリセット読込] 失敗: {e}")
-			return default
-
-	def _save_presets(self, data: dict) -> None:
-		"""プリセットをファイルに保存。"""
-		p = self._presets_file_path()
-		try:
-			with p.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
-		except Exception as e:
-			print(f"[プリセット保存] 失敗: {e}")
-
-	def _state_file_path(self, joint: int = None) -> Path:
-		"""関節種別ごとの状態ファイルパスを返す。
-
-		joint=None の場合は現在の joint_var を使用。
-		- joint==2 (膝関節): frs2015_gui_state_knee.json
-		- それ以外: frs2015_gui_state.json （股関節・既存ファイル）
-		"""
-		import platform
-		if joint is None:
-			joint = self.joint_var.get()
-		filename = "frs2015_gui_state_knee.json" if joint == 2 else "frs2015_gui_state.json"
-		if platform.system() == "Darwin":
-			# macOS: ホームディレクトリ配下の隠しフォルダに保存（スクリプトディレクトリが書き込み不可の場合に対応）
-			state_dir = Path.home() / ".frs_simulator"
-			state_dir.mkdir(parents=True, exist_ok=True)
-			return state_dir / filename
-		else:
-			return Path(__file__).with_name(filename)
-
-	# ----- knee simulator 専用の状態保存（hipの関節ラジオと独立） -----
-	def _knee_state_file_path(self) -> Path:
-		"""knee simulator タブ専用の状態ファイルパス。"""
-		import platform
-		filename = "frs2015_gui_state_knee_sim.json"
-		if platform.system() == "Darwin":
-			state_dir = Path.home() / ".frs_simulator"
-			state_dir.mkdir(parents=True, exist_ok=True)
-			return state_dir / filename
-		return Path(__file__).with_name(filename)
-
-	def _knee_state_vars(self) -> dict:
-		"""保存/復元する knee 変数を {キー: (var, 型)} で返す。"""
-		d = {
-			"knee_initial_scan": (self.knee_initial_scan_path, str),
-			"knee_initial_pp": (self.knee_initial_pp_path, str),
-			"knee_femur_model": (self.knee_femur_model_path, str),
-			"knee_tibia_model": (self.knee_tibia_model_path, str),
-			"knee_transform": (self.knee_transform_path, str),
-			"knee_reg_femur_src": (self.knee_reg_femur_src_path, str),
-			"knee_reg_femur_tgt": (self.knee_reg_femur_tgt_path, str),
-			"knee_reg_tibia_src": (self.knee_reg_tibia_src_path, str),
-			"knee_reg_tibia_tgt": (self.knee_reg_tibia_tgt_path, str),
-			"knee_side": (self.knee_side_var, int),
-			"knee_w_scan_deg": (self.knee_w_scan_deg, float),
-			"knee_femur_color": (self.knee_femur_color_var, str),
-			"knee_tibia_color": (self.knee_tibia_color_var, str),
-		}
-		# 骨ごとの位置合わせパラメータ・方式・プリセット選択
-		for bone in ("femur", "tibia"):
-			for key, kind, default, _lbl in self._knee_param_spec():
-				d[f"knee_{bone}_{key}"] = (self.knee_reg_pvars[bone][key], int if kind == "int" else float)
-			d[f"knee_{bone}_method"] = (self.knee_reg_method_var[bone], str)
-			d[f"knee_{bone}_scaling"] = (self.knee_reg_scaling_var[bone], bool)
-			d[f"knee_{bone}_preview"] = (self.knee_reg_preview_var[bone], bool)
-			d[f"knee_{bone}_preset_sel"] = (self.knee_preset_sel[bone], str)
-		return d
-
-	def _save_knee_state(self) -> None:
-		"""knee simulator の全「試験タブ」を専用ファイルへ保存する。"""
-		# アクティブタブを最新状態に更新
-		try:
-			if getattr(self, "_knee_tabs", None):
-				self._knee_tabs[self._knee_active_tab]['snapshot'] = self._knee_snapshot_current()
-		except Exception:
-			pass
-		data = {
-			"tabs": getattr(self, "_knee_tabs", []),
-			"active": getattr(self, "_knee_active_tab", 0),
-		}
-		try:
-			p = self._knee_state_file_path()
-			with p.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[knee状態保存] {p}（{len(data['tabs'])}タブ）")
-		except Exception as e:
-			print(f"[knee状態保存] 失敗: {e}")
-
-	def _load_knee_state(self) -> None:
-		"""knee simulator の状態を専用ファイルから復元する（複数タブ対応・旧形式互換）。"""
-		try:
-			p = self._knee_state_file_path()
+			p = self._state_file_path()
 			if not p.exists():
 				return
 			data = json.load(p.open("r", encoding="utf-8"))
-		except Exception as e:
-			print(f"[knee状態復元] 失敗: {e}")
-			return
-
-		# 新形式: 複数タブ
-		if isinstance(data, dict) and isinstance(data.get("tabs"), list) and data["tabs"]:
-			self._knee_tabs = data["tabs"]
-			try:
-				self._knee_active_tab = int(data.get("active", 0))
-			except Exception:
-				self._knee_active_tab = 0
-			if self._knee_active_tab < 0 or self._knee_active_tab >= len(self._knee_tabs):
-				self._knee_active_tab = 0
-			# アクティブタブの状態をライブ変数へ反映（UI構築は後段だが変数は既に存在）
-			self._knee_restore_snapshot(self._knee_tabs[self._knee_active_tab].get("snapshot", {}))
-			return
-
-		# 旧形式(フラット): ライブ変数へ復元（後段の _knee_init_tabs が「試験1」化する）
-		for key, (var, typ) in self._knee_state_vars().items():
-			if key not in data:
-				continue
-			try:
-				val = data[key]
-				if typ is bool:
-					var.set(bool(val))
-				elif typ is int:
-					var.set(int(val))
-				elif typ is float:
-					var.set(float(val))
-				else:
-					var.set(str(val))
-			except Exception:
-				pass
-		for key, attr in (("_femur_reg_T", "_knee_femur_reg_T"), ("_tibia_reg_T", "_knee_tibia_reg_T")):
-			if data.get(key) is not None:
-				try:
-					setattr(self, attr, np.array(data[key], dtype=float))
-				except Exception:
-					pass
-
-	# パス系（関節依存）の状態キー一覧
-	_JOINT_PATH_KEYS = (
-		"prox_model", "prox_pp_abcd", "prox_pp_olmn",
-		"dist_model", "dist_pp_abc", "dist_pp_olmn",
-		"transform_group",
-		"prox_cartilage_model", "dist_cartilage_model",
-		"fem_prox_bone", "fem_prox_cartilage",
-		"fem_dist_bone", "fem_dist_cartilage",
-		"cs_prox_model1_whole", "cs_prox_model1_region",
-		"cs_prox_model2_whole", "cs_prox_model2_region",
-		"cs_dist_model1_whole", "cs_dist_model1_region",
-		"cs_dist_model2_whole", "cs_dist_model2_region",
-	)
-
-	def _load_state(self) -> None:
-		# まず股関節ファイル（既存メイン）を読み、joint_var を取得
-		main_path = self._state_file_path(joint=1)
-		data = None
-		try:
-			if main_path.exists():
-				data = json.load(main_path.open("r", encoding="utf-8"))
 		except Exception:
-			data = None
-
-		# joint_var の暫定値を判定
-		j_initial = 0
-		if data is not None:
-			try:
-				j_initial = int(data.get("joint", 0))
-				if j_initial not in (0, 1, 2):
-					j_initial = 0
-			except Exception:
-				j_initial = 0
-
-		# 膝関節モードなら膝関節ファイルを読み直し（存在すれば）
-		if j_initial == 2:
-			knee_path = self._state_file_path(joint=2)
-			try:
-				if knee_path.exists():
-					data = json.load(knee_path.open("r", encoding="utf-8"))
-			except Exception:
-				pass
-
-		if data is None:
 			return
 
 		# 反映（妥当性チェックは軽め）
@@ -15283,23 +11542,6 @@ class MainMenuGUI(_BaseWindow):
 		try: self.show_fem_analysis.set(bool(data.get("show_fem_analysis", False)))
 		except (ValueError, TypeError): self.show_fem_analysis.set(False)
 
-		# 共有キャッシュ設定の復元（キャッシュ初期化は _load_state() 呼び出し元が行う）
-		self.cache_nas_path.set(str(data.get("cache_nas_path", "")))
-		try: self.cache_enabled.set(bool(data.get("cache_enabled", True)))
-		except (ValueError, TypeError): self.cache_enabled.set(True)
-
-		# 可視化ウィンドウの表示/非表示
-		for key, var in (
-			("viz_show_prox_model", self.viz_show_prox_model),
-			("viz_show_prox_pp",    self.viz_show_prox_pp),
-			("viz_show_prox_axes",  self.viz_show_prox_axes),
-			("viz_show_dist_model", self.viz_show_dist_model),
-			("viz_show_dist_pp",    self.viz_show_dist_pp),
-			("viz_show_dist_axes",  self.viz_show_dist_axes),
-		):
-			try: var.set(bool(data.get(key, True)))
-			except (ValueError, TypeError): var.set(True)
-
 	def _save_state(self) -> None:
 		data = {
 			"joint": self.joint_var.get(),
@@ -15388,135 +11630,17 @@ class MainMenuGUI(_BaseWindow):
 			"fem_show_dist_mesh": self.fem_show_dist_mesh.get(),
 			"fem_show_bone": self.fem_show_bone.get(),
 			"show_fem_analysis": self.show_fem_analysis.get(),
-			# 共有キャッシュ設定
-			"cache_nas_path": self.cache_nas_path.get(),
-			"cache_enabled": self.cache_enabled.get(),
-			# 可視化ウィンドウの表示/非表示
-			"viz_show_prox_model": self.viz_show_prox_model.get(),
-			"viz_show_prox_pp":    self.viz_show_prox_pp.get(),
-			"viz_show_prox_axes":  self.viz_show_prox_axes.get(),
-			"viz_show_dist_model": self.viz_show_dist_model.get(),
-			"viz_show_dist_pp":    self.viz_show_dist_pp.get(),
-			"viz_show_dist_axes":  self.viz_show_dist_axes.get(),
 		}
-		joint = self.joint_var.get()
 		try:
 			p = self._state_file_path()
 			with p.open("w", encoding="utf-8") as f:
 				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[状態保存] {p}")
-		except Exception as e:
-			print(f"[状態保存] 失敗: {e}")
-
-		# 膝関節モードで保存した場合、メイン（股関節）ファイルの joint フィールドだけ
-		# 更新しておく（次回起動時に「最後は膝関節だった」と判定するため）
-		if joint == 2:
-			try:
-				main_path = self._state_file_path(joint=1)
-				if main_path.exists():
-					main_data = json.load(main_path.open("r", encoding="utf-8"))
-				else:
-					main_data = {}
-				main_data["joint"] = 2
-				with main_path.open("w", encoding="utf-8") as f:
-					json.dump(main_data, f, ensure_ascii=False, indent=2)
-			except Exception as e:
-				print(f"[メイン joint更新] 失敗: {e}")
-
-	def _save_state_for_joint(self, joint: int) -> None:
-		"""指定された関節用のファイルに、現在のパス変数群を保存する。
-		関節切替時に「切替前の状態」を保存する用途。joint_var とは独立して動く。
-		"""
-		# 一時的に joint_var を切替前の値に見立てて _save_state を呼ぶのは副作用が大きい。
-		# 代わりに、ターゲットファイル単位で書き込む。
-		# パス系のキーのみを書き込む（共通設定は現状の _save_state が担当）
-		target = self._state_file_path(joint=joint)
-		try:
-			# 既存ファイルがあれば一度読み込んで、その上にパスを上書き
-			if target.exists():
-				try:
-					data = json.load(target.open("r", encoding="utf-8"))
-				except Exception:
-					data = {}
-			else:
-				data = {}
-			data["joint"] = joint
-			data["prox_model"] = self.prox_model_path.get()
-			data["prox_pp_abcd"] = self.prox_pp_abcd_path.get()
-			data["prox_pp_olmn"] = self.prox_pp_olmn_path.get()
-			data["dist_model"] = self.dist_model_path.get()
-			data["dist_pp_abc"] = self.dist_pp_abc_path.get()
-			data["dist_pp_olmn"] = self.dist_pp_olmn_path.get()
-			data["transform_group"] = self.transform_group_path.get()
-			data["prox_cartilage_model"] = self.prox_cartilage_model_path.get()
-			data["dist_cartilage_model"] = self.dist_cartilage_model_path.get()
-			data["fem_prox_bone"] = self.fem_prox_bone_path.get()
-			data["fem_prox_cartilage"] = self.fem_prox_cartilage_path.get()
-			data["fem_dist_bone"] = self.fem_dist_bone_path.get()
-			data["fem_dist_cartilage"] = self.fem_dist_cartilage_path.get()
-			data["cs_prox_model1_whole"] = self.cs_prox_model1_whole_path.get()
-			data["cs_prox_model1_region"] = self.cs_prox_model1_region_path.get()
-			data["cs_prox_model2_whole"] = self.cs_prox_model2_whole_path.get()
-			data["cs_prox_model2_region"] = self.cs_prox_model2_region_path.get()
-			data["cs_dist_model1_whole"] = self.cs_dist_model1_whole_path.get()
-			data["cs_dist_model1_region"] = self.cs_dist_model1_region_path.get()
-			data["cs_dist_model2_whole"] = self.cs_dist_model2_whole_path.get()
-			data["cs_dist_model2_region"] = self.cs_dist_model2_region_path.get()
-			with target.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[関節別状態保存] joint={joint} → {target}")
-		except Exception as e:
-			print(f"[関節別状態保存] 失敗: {e}")
-
-	def _load_paths_for_joint(self, joint: int) -> None:
-		"""指定された関節用のファイルからパス変数を読み込む。
-		存在しない場合はパス系変数を空文字にリセットする。
-		"""
-		target = self._state_file_path(joint=joint)
-		if not target.exists():
-			# 関節別ファイルが無い場合、パス変数をリセット（前の関節の値が残らないように）
-			for v in (self.prox_model_path, self.prox_pp_abcd_path, self.prox_pp_olmn_path,
-					  self.dist_model_path, self.dist_pp_abc_path, self.dist_pp_olmn_path,
-					  self.transform_group_path,
-					  self.prox_cartilage_model_path, self.dist_cartilage_model_path,
-					  self.fem_prox_bone_path, self.fem_prox_cartilage_path,
-					  self.fem_dist_bone_path, self.fem_dist_cartilage_path,
-					  self.cs_prox_model1_whole_path, self.cs_prox_model1_region_path,
-					  self.cs_prox_model2_whole_path, self.cs_prox_model2_region_path,
-					  self.cs_dist_model1_whole_path, self.cs_dist_model1_region_path,
-					  self.cs_dist_model2_whole_path, self.cs_dist_model2_region_path):
-				v.set("")
-			return
-		try:
-			data = json.load(target.open("r", encoding="utf-8"))
-		except Exception as e:
-			print(f"[関節別パス読込] 失敗: {e}")
-			return
-		self.prox_model_path.set(str(data.get("prox_model", "")))
-		self.prox_pp_abcd_path.set(str(data.get("prox_pp_abcd", "")))
-		self.prox_pp_olmn_path.set(str(data.get("prox_pp_olmn", "")))
-		self.dist_model_path.set(str(data.get("dist_model", "")))
-		self.dist_pp_abc_path.set(str(data.get("dist_pp_abc", "")))
-		self.dist_pp_olmn_path.set(str(data.get("dist_pp_olmn", "")))
-		self.transform_group_path.set(str(data.get("transform_group", "")))
-		self.prox_cartilage_model_path.set(str(data.get("prox_cartilage_model", "")))
-		self.dist_cartilage_model_path.set(str(data.get("dist_cartilage_model", "")))
-		self.fem_prox_bone_path.set(str(data.get("fem_prox_bone", "")))
-		self.fem_prox_cartilage_path.set(str(data.get("fem_prox_cartilage", "")))
-		self.fem_dist_bone_path.set(str(data.get("fem_dist_bone", "")))
-		self.fem_dist_cartilage_path.set(str(data.get("fem_dist_cartilage", "")))
-		self.cs_prox_model1_whole_path.set(str(data.get("cs_prox_model1_whole", "")))
-		self.cs_prox_model1_region_path.set(str(data.get("cs_prox_model1_region", "")))
-		self.cs_prox_model2_whole_path.set(str(data.get("cs_prox_model2_whole", "")))
-		self.cs_prox_model2_region_path.set(str(data.get("cs_prox_model2_region", "")))
-		self.cs_dist_model1_whole_path.set(str(data.get("cs_dist_model1_whole", "")))
-		self.cs_dist_model1_region_path.set(str(data.get("cs_dist_model1_region", "")))
-		self.cs_dist_model2_whole_path.set(str(data.get("cs_dist_model2_whole", "")))
-		self.cs_dist_model2_region_path.set(str(data.get("cs_dist_model2_region", "")))
+		except Exception:
+			# 保存失敗は致命的でないため無視
+			pass
 
 	def _on_close(self) -> None:
 		self._save_state()
-		self._save_knee_state()
 		self.destroy()
 	
 	def _save_initial_geometry(self) -> None:
@@ -15747,118 +11871,6 @@ class MainMenuGUI(_BaseWindow):
 				fallback['distance'] = np.array([100.0])
 			return fallback
 
-	def _precompute_heatmaps_o3d(self, prox_joint_region, dist_surface, prox_points, transform_data,
-	                             update_progress, cancel_var):
-		"""全フレームの符号付き距離ヒートマップを Open3D の BVH(RaycastingScene) で高速計算する。
-
-		BVHにより O(N log M) で、GPU総当たり(O(N×M))やVTK per-frameより大幅に高速。
-		剛体不変性を利用し、遠位メッシュ(固定)にシーンを一度だけ構築し、近位点を各フレームの
-		inv(T_f) で逆変換してまとめて問い合わせる。値は VTK compute_implicit_distance と一致。
-
-		Returns: フレームごとの pv.PolyData(prox領域 + 'distance') のリスト。
-		"""
-		import open3d as o3d
-		# 遠位表面の三角形（固定・元姿勢）でシーンを1回だけ構築
-		dm = dist_surface
-		if not isinstance(dm, pv.PolyData):
-			dm = dm.extract_surface()
-		dm = dm.triangulate()
-		dverts = np.asarray(dm.points, dtype=np.float32)
-		dfaces_raw = np.asarray(dm.faces)
-		if dfaces_raw.size < 4:
-			raise ValueError("遠位メッシュに三角形がありません")
-		dfaces = dfaces_raw.reshape(-1, 4)[:, 1:4].astype(np.int32)
-		scene = o3d.t.geometry.RaycastingScene()
-		scene.add_triangles(o3d.t.geometry.TriangleMesh(
-			o3d.core.Tensor(dverts, o3d.core.float32),
-			o3d.core.Tensor(dfaces, o3d.core.int32)))
-
-		pts = np.asarray(prox_points) if prox_points is not None else np.asarray(prox_joint_region.points)
-		n_pts = len(pts)
-		if n_pts == 0:
-			return []
-		homog = np.hstack([pts, np.ones((n_pts, 1))]).astype(np.float64)  # (P,4)
-		same_struct = (prox_points is None or n_pts == prox_joint_region.n_points)
-
-		n_frames = len(transform_data)
-		# 距離配列だけを貯める（メッシュは作らない）。全フレーム同一形状なので遅延リストで返す。
-		results_d = [None] * n_frames
-		# 近位点を逆変換して複数フレームをまとめて問い合わせ（目安: 約800万点/チャンク）
-		frames_per_chunk = max(1, min(256, max(1, 8_000_000 // max(n_pts, 1))))
-		for start in range(0, n_frames, frames_per_chunk):
-			if cancel_var.get():
-				break
-			chunk = transform_data[start:start + frames_per_chunk]
-			big = np.empty((len(chunk) * n_pts, 3), dtype=np.float32)
-			for k, tf in enumerate(chunk):
-				Tinv = np.linalg.inv(np.asarray(tf['matrix'], dtype=float))
-				big[k * n_pts:(k + 1) * n_pts] = (Tinv @ homog.T).T[:, :3].astype(np.float32)
-			sd = scene.compute_signed_distance(o3d.core.Tensor(big, o3d.core.float32)).numpy()
-			for k in range(len(chunk)):
-				# float32で保持（可視化には十分。容量・保存/読込時間を半減）。viewでなくcopyで独立化
-				results_d[start + k] = np.array(sd[k * n_pts:(k + 1) * n_pts], dtype=np.float32)
-			done = min(start + len(chunk), n_frames)
-			if not update_progress(done, n_frames, f"[高速] ヒートマップ計算中: {done}/{n_frames}"):
-				break
-		# 共通ジオメトリ（近位領域メッシュ）＋各フレーム距離配列 の遅延リストを返す
-		base_mesh = prox_joint_region if same_struct else pv.PolyData(pts)
-		distances = [d for d in results_d if d is not None]
-		return _LazyHeatmapList(base_mesh, distances)
-
-	def _precompute_heatmaps_gpu(self, prox_joint_region, dist_surface, prox_points, transform_data,
-	                             update_progress, cancel_var):
-		"""全フレームの符号付き距離ヒートマップをGPUで一括計算する（frs_gpu使用）。
-
-		剛体変換の不変性を利用: 遠位メッシュ(固定)に対し、近位点を各フレームの inv(T_f) で
-		逆変換して符号付き距離を求める。これにより遠位三角形をGPUに一度載せるだけで、
-		全フレームをまとめてGPU計算できる。値はVTK compute_implicit_distanceと一致。
-
-		Returns: フレームごとの pv.PolyData(prox領域 + 'distance') のリスト。
-		"""
-		import frs_gpu
-		# 遠位表面の三角形（固定・元姿勢）
-		dm = dist_surface
-		if not isinstance(dm, pv.PolyData):
-			dm = dm.extract_surface()
-		dm = dm.triangulate()
-		dverts = np.asarray(dm.points, dtype=np.float64)
-		dfaces_raw = np.asarray(dm.faces)
-		if dfaces_raw.size < 4:
-			raise ValueError("遠位メッシュに三角形がありません")
-		dfaces = dfaces_raw.reshape(-1, 4)[:, 1:4].astype(np.int64)
-
-		pts = np.asarray(prox_points) if prox_points is not None else np.asarray(prox_joint_region.points)
-		n_pts = len(pts)
-		if n_pts == 0:
-			return []
-		homog = np.hstack([pts, np.ones((n_pts, 1))])  # (P,4)
-		same_struct = (prox_points is None or n_pts == prox_joint_region.n_points)
-
-		n_frames = len(transform_data)
-		results = [None] * n_frames
-		# 近位点を逆変換して、複数フレームをまとめてGPUへ（目安: 約600万点/チャンク）
-		frames_per_chunk = max(1, min(128, max(1, 6_000_000 // max(n_pts, 1))))
-		for start in range(0, n_frames, frames_per_chunk):
-			if cancel_var.get():
-				break
-			chunk = transform_data[start:start + frames_per_chunk]
-			big = np.empty((len(chunk) * n_pts, 3), dtype=np.float64)
-			for k, tf in enumerate(chunk):
-				Tinv = np.linalg.inv(np.asarray(tf['matrix'], dtype=float))
-				big[k * n_pts:(k + 1) * n_pts] = (Tinv @ homog.T).T[:, :3]
-			signed = frs_gpu.signed_point_to_mesh_distance(big, dverts, dfaces, batch=256)
-			if signed is None:
-				raise RuntimeError("GPU符号付き距離が利用できません")
-			for k in range(len(chunk)):
-				d = signed[k * n_pts:(k + 1) * n_pts]
-				hm = prox_joint_region.copy(deep=False) if same_struct else pv.PolyData(pts)
-				hm['distance'] = np.asarray(d, dtype=float)
-				results[start + k] = hm
-			done = min(start + len(chunk), n_frames)
-			if not update_progress(done, n_frames, f"[GPU] ヒートマップ計算中: {done}/{n_frames}"):
-				break
-		return [h for h in results if h is not None]
-
 		
 		# 変換を適用
 		transformed_points = (transform_matrix @ points_homo.T).T[:, :3]
@@ -15920,18 +11932,16 @@ class MainMenuGUI(_BaseWindow):
 
 	# ----- Utils: Coordinate System Builder -----
 	def _build_coordinate_system(self, points, labels):
-		"""近位側の座標系を構築。
-
-		joint_var に応じて股関節/膝関節（ISB / Grood-Suntay 1983）を切替える。
-		- 股関節: A, B, C, D, O の5点から構築（既存仕様）
-		- 膝関節 (大腿骨): A, B, C, D の4点から ISB 仕様で構築
-		  - A = 大腿骨頭中心（近位機械軸端）
-		  - B = 大腿骨遠位機械軸端（顆間中点）= 原点
-		  - C = 内側後顆点
-		  - D = 外側後顆点
+		"""A, B, C, D, O点から座標系を構築
+		
+		原点: O
+		Z軸: B→Aの方向
+		X軸: Zに直交かつ、CとDの中点からAB線への垂線
+		Y軸: Z×X軸
+		
+		Returns:
+			origin, x_axis, y_axis, z_axis (各軸は単位ベクトル)
 		"""
-		if self.joint_var.get() == 2:
-			return self._build_coordinate_system_knee_femur(points, labels)
 		import numpy as np
 		
 		# ラベルから点を取得
@@ -15986,18 +11996,16 @@ class MainMenuGUI(_BaseWindow):
 		return origin, x_axis, y_axis, z_axis
 
 	def _build_coordinate_system_dist(self, points, labels):
-		"""遠位側の座標系を構築。
-
-		joint_var に応じて股関節/膝関節（ISB / Grood-Suntay 1983）を切替える。
-		- 股関節: A, B, O の3点から構築（既存仕様）
-		- 膝関節 (脛骨): A, B, C, D の4点から ISB 仕様で構築
-		  - A = 顆間隆起中点（近位機械軸端）= 原点
-		  - B = 足関節中心（遠位機械軸端）
-		  - C = 内側脛骨プラトー中心
-		  - D = 外側脛骨プラトー中心
+		"""A, B, O点から遠位用座標系を構築
+		
+		原点: O
+		Z軸: B→Aの方向
+		Y軸: BとAの中点からOに向かうベクトル（Z軸に直交）
+		X軸: Y×Z軸
+		
+		Returns:
+			origin, x_axis, y_axis, z_axis (各軸は単位ベクトル)
 		"""
-		if self.joint_var.get() == 2:
-			return self._build_coordinate_system_knee_tibia(points, labels)
 		import numpy as np
 		
 		# ラベルから点を取得
@@ -16041,126 +12049,7 @@ class MainMenuGUI(_BaseWindow):
 		# X軸: Y×Z軸
 		x_axis = np.cross(y_axis, z_axis)
 		x_axis = x_axis / np.linalg.norm(x_axis)  # 正規化
-
-		return origin, x_axis, y_axis, z_axis
-
-	# ----- Utils: Knee Coordinate System (ISB / Grood-Suntay 1983) -----
-	def _build_coordinate_system_knee_femur(self, points, labels):
-		"""膝関節 大腿骨側の ISB 座標系を構築。
-
-		Grood & Suntay (1983) に準拠:
-		- 原点: B (大腿骨遠位機械軸端 = 顆間中点)
-		- Z軸 (機械軸): B→A方向（近位正）
-		- Y軸 (前方): 前額面の法線。CD後顆連結線とZ軸の外積から導出
-		- X軸 (屈曲軸): Y×Z軸（右膝で外側正）
-
-		Args:
-			points: 各点の座標 [(x,y,z), ...]
-			labels: 各点のラベル ["A", "B", "C", "D", ...]
-				A = 大腿骨頭中心
-				B = 顆間中点（最遠位）
-				C = 内側後顆点
-				D = 外側後顆点
-		"""
-		import numpy as np
-		point_dict = {}
-		for i, label in enumerate(labels):
-			lab = label.strip().upper()
-			if lab in ['A', 'B', 'C', 'D']:
-				point_dict[lab] = points[i]
-		required = ['A', 'B', 'C', 'D']
-		missing = [p for p in required if p not in point_dict]
-		if missing:
-			raise ValueError(f"膝関節(大腿骨)に必要な点が見つかりません: {', '.join(missing)}")
-
-		A = np.array(point_dict['A'], dtype=float)
-		B = np.array(point_dict['B'], dtype=float)
-		C = np.array(point_dict['C'], dtype=float)
-		D = np.array(point_dict['D'], dtype=float)
-
-		# 原点: B (顆間中点 = 大腿骨遠位機械軸端)
-		origin = B
-
-		# Z軸: 機械軸（近位正方向 = B→A）
-		z_vec = A - B
-		if np.linalg.norm(z_vec) < 1e-10:
-			raise ValueError("A (大腿骨頭中心) と B (顆間中点) が一致しているため、Z軸を定義できません")
-		z_axis = z_vec / np.linalg.norm(z_vec)
-
-		# 後顆連結線 D-C (内側→外側)
-		cd_vec = D - C
-		if np.linalg.norm(cd_vec) < 1e-10:
-			raise ValueError("C (内側後顆) と D (外側後顆) が一致しているため、座標系を定義できません")
-
-		# Y軸 (前方): cross(Z, D-C). 右膝で前方を向く
-		y_vec = np.cross(z_axis, cd_vec)
-		if np.linalg.norm(y_vec) < 1e-10:
-			raise ValueError("後顆連結線が機械軸と平行のため、Y軸を定義できません")
-		y_axis = y_vec / np.linalg.norm(y_vec)
-
-		# X軸 (屈曲軸): Y×Z (右手系完成)
-		x_axis = np.cross(y_axis, z_axis)
-		x_axis = x_axis / np.linalg.norm(x_axis)
-
-		return origin, x_axis, y_axis, z_axis
-
-	def _build_coordinate_system_knee_tibia(self, points, labels):
-		"""膝関節 脛骨側の ISB 座標系を構築。
-
-		Grood & Suntay (1983) に準拠:
-		- 原点: A (顆間隆起中点 = 脛骨近位機械軸端)
-		- z軸 (機械軸): B→A方向（近位正）
-		- y軸 (前方): プラトー連結線CDとz軸の外積から導出
-		- x軸: y×z（右膝で外側正）
-
-		Args:
-			points: 各点の座標
-			labels: 各点のラベル
-				A = 顆間隆起中点（最近位）
-				B = 足関節中心（最遠位）
-				C = 内側プラトー中心
-				D = 外側プラトー中心
-		"""
-		import numpy as np
-		point_dict = {}
-		for i, label in enumerate(labels):
-			lab = label.strip().upper()
-			if lab in ['A', 'B', 'C', 'D']:
-				point_dict[lab] = points[i]
-		required = ['A', 'B', 'C', 'D']
-		missing = [p for p in required if p not in point_dict]
-		if missing:
-			raise ValueError(f"膝関節(脛骨)に必要な点が見つかりません: {', '.join(missing)}")
-
-		A = np.array(point_dict['A'], dtype=float)
-		B = np.array(point_dict['B'], dtype=float)
-		C = np.array(point_dict['C'], dtype=float)
-		D = np.array(point_dict['D'], dtype=float)
-
-		# 原点: A (顆間隆起中点)
-		origin = A
-
-		# z軸: 機械軸（近位正方向 = B→A）
-		z_vec = A - B
-		if np.linalg.norm(z_vec) < 1e-10:
-			raise ValueError("A (顆間隆起中点) と B (足関節中心) が一致しているため、z軸を定義できません")
-		z_axis = z_vec / np.linalg.norm(z_vec)
-
-		# プラトー連結線 D-C (内側→外側)
-		cd_vec = D - C
-		if np.linalg.norm(cd_vec) < 1e-10:
-			raise ValueError("C (内側プラトー) と D (外側プラトー) が一致しているため、座標系を定義できません")
-
-		# y軸 (前方): cross(z, D-C)
-		y_vec = np.cross(z_axis, cd_vec)
-		if np.linalg.norm(y_vec) < 1e-10:
-			raise ValueError("プラトー連結線が機械軸と平行のため、y軸を定義できません")
-		y_axis = y_vec / np.linalg.norm(y_vec)
-
-		# x軸: y×z
-		x_axis = np.cross(y_axis, z_axis)
-		x_axis = x_axis / np.linalg.norm(x_axis)
-
+		
 		return origin, x_axis, y_axis, z_axis
 
 	def _try_auto_set_offset(self, points, labels, origin, x_axis, y_axis, z_axis, off_x_var, off_y_var, off_z_var):
