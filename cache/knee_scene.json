@@ -2,7 +2,7 @@
   "version": 2,
   "scenes": {
     "試験1": {
-      "w_scan_deg": 46.089,
+      "w_scan_deg": -72.865,
       "side": 1,
       "femur_reg_T": [
         [
@@ -61,15 +61,15 @@
       "hash_initial_pp": "620b981b3b275d63",
       "hash_femur_model": "a0e55969d640d2c4",
       "hash_tibia_model": "41557fa3b65041b3",
-      "hash_transform": "8449609f227515c4",
+      "hash_transform": "1a84222d746444bd",
       "file_hints": {
         "initial_scan": "ロボットに取り付けたscan.stl",
         "initial_pp": "scan_picked_points.pp",
         "femur_model": "分解後大腿骨scan_for_view.stl",
         "tibia_model": "分解後脛骨scan_for_view.stl",
-        "transform": "FE30_AP                       0000000001.KKR"
+        "transform": "FE_round_trip                 0000000003.KKR"
       },
-      "saved_at": "2026-07-09 22:08:35"
+      "saved_at": "2026-07-13 22:03:25"
     }
   }
 }

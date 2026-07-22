@@ -1621,7 +1621,7 @@ class MainMenuGUI(_BaseWindow):
 
 		plotter.add_text("Cf: X=red Y=green Z=blue  | 点: MCL=red LCL=blue L=green M=orange N=purple",
 		                 position="upper_left", font_size=10, color="black")
-		plotter.show()
+		self._show_plotter_coop(plotter)
 
 	def _knee_load_o3d_pcd(self, path: str, n_points: int):
 		"""STL/OBJ/PLY を VTK/PyVista で読み込み、Open3D の点群として返す。
@@ -4905,6 +4905,58 @@ class MainMenuGUI(_BaseWindow):
 				print(f"[DnD] 登録に失敗しました（以降のDnDは無効化されます）: {e}")
 				self._dnd_warn_shown = True
 
+	# ----- PyVista プロッタ 協調表示ヘルパー -----
+	def _show_plotter_coop(self, plotter) -> None:
+		"""pv.Plotter を Tk mainloop と協調しながら非同期表示する。
+
+		macOS では Tk と VTK(Cocoa) のイベントループが競合し、
+		Tk コールバック内から plotter.show() を呼ぶとハングする。
+		本ヘルパーは既存 on_visualize_all / on_animate と同一パターン
+		（interactive_update=True + Tk after() による update() ポンプ）を
+		用いてハングを回避する。Windows/Linux でも副作用は無い
+		（UIの応答性が上がる副次効果のみ）。
+		"""
+		# 非同期表示モードに切替（古い pyvista では auto_close のみ）
+		try:
+			plotter.show(auto_close=False, interactive_update=True)
+		except TypeError:
+			plotter.show(auto_close=False)
+
+		# プロッタ本体を GC から守る（closureが持つが念のため保険）
+		if not hasattr(self, "_active_plotters"):
+			self._active_plotters = []
+		self._active_plotters.append(plotter)
+
+		alive = [True]
+
+		def _on_exit(*_a):
+			alive[0] = False
+
+		try:
+			plotter.iren.add_observer('ExitEvent', _on_exit)
+		except Exception:
+			pass
+
+		def _tick():
+			if not alive[0]:
+				try:
+					self._active_plotters.remove(plotter)
+				except (ValueError, AttributeError):
+					pass
+				return
+			try:
+				plotter.update()
+			except Exception:
+				alive[0] = False
+				try:
+					self._active_plotters.remove(plotter)
+				except (ValueError, AttributeError):
+					pass
+				return
+			self.after(30, _tick)
+
+		self.after(30, _tick)
+
 	def _add_file_row(self, parent: ttk.Frame, row: int, label_text: str, textvariable: tk.StringVar, command):
 		"""Add a file selection row with label, readonly entry (showing filename only), and browse button.
 		ドラッグ&ドロップにも対応（tkinterdnd2が利用可能な場合）。
@@ -6185,7 +6237,7 @@ class MainMenuGUI(_BaseWindow):
 
 		# 不要な装飾は追加しない（grid/axes/bounds未追加）
 		# 自動でカメラをフィット
-		plotter.show()  # ユーザーはマウスで視点操作可能
+		self._show_plotter_coop(plotter)  # ユーザーはマウスで視点操作可能
 
 	def on_visualize_dist(self) -> None:
 		# 遠位モデルと遠位PPを表示（PyVista）
@@ -6445,7 +6497,7 @@ class MainMenuGUI(_BaseWindow):
 
 		# 不要な装飾は追加しない（grid/axes/bounds未追加）
 		# 自動でカメラをフィット
-		dist_plotter.show()  # ユーザーはマウスで視点操作可能
+		self._show_plotter_coop(dist_plotter)  # ユーザーはマウスで視点操作可能
 
 	def on_visualize_all(self) -> None:
 		# 近位・遠位モデルと特徴点を同時表示（PyVista）
@@ -13365,10 +13417,15 @@ class MainMenuGUI(_BaseWindow):
 			except Exception:
 				pass
 			
-			# Z-fighting対策：マッパーの設定でPolygonOffsetを有効化
+			# Z-fighting対策：骨の透明度=1.0でもヒートマップが隠れないよう強めのオフセット + Translucent強制
+			# （bones を opaque パスで描いた後、heatmap を translucent パスで手前寄せして描く）
 			heatmap_mapper = heatmap_actor.GetMapper()
 			heatmap_mapper.SetResolveCoincidentTopologyToPolygonOffset()
-			heatmap_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0, -5) # 負の値で手前に引き寄せる
+			heatmap_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
+			try:
+				heatmap_actor.ForceTranslucentOn()  # opaque bones の後に描画されるので確実に前面
+			except Exception:
+				pass
 
 			# 境界線（0mm等高線）を近位抽出領域メッシュ表面に張り付けて表示
 			print(f"[初期化] 境界線（等高線）の初期化を開始...")
@@ -13428,7 +13485,15 @@ class MainMenuGUI(_BaseWindow):
 				render_lines_as_tubes=True,
 				lighting=False
 			)
-			
+			# 骨の透明度=1.0でも境界線が隠れないよう手前寄せ + Translucent強制
+			try:
+				_b_mapper = boundary_actor.GetMapper()
+				_b_mapper.SetResolveCoincidentTopologyToPolygonOffset()
+				_b_mapper.SetRelativeCoincidentTopologyLineOffsetParameters(-3.0, -200.0)
+				boundary_actor.ForceTranslucentOn()
+			except Exception:
+				pass
+
 			print(f"[初期化] 境界線actor作成完了: type={type(boundary_actor)}")
 			
 			print(f"[初期化] 表示設定を構成中...")
@@ -13500,10 +13565,14 @@ class MainMenuGUI(_BaseWindow):
 							label='FEM接触圧'
 						)
 
-						# Z-fighting対策
+						# Z-fighting対策（骨の透明度=1.0でも接触圧が隠れないよう強めに手前寄せ）
 						p_mapper = pressure_actor.GetMapper()
 						p_mapper.SetResolveCoincidentTopologyToPolygonOffset()
-						p_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0, -6)
+						p_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
+						try:
+							pressure_actor.ForceTranslucentOn()
+						except Exception:
+							pass
 
 						pressure_actor.SetVisibility(False)
 						print(f"[初期化] FEM接触圧メッシュを初期化: {pressure_mesh.n_points}点, p_max={p_max:.2f}MPa")
@@ -13673,6 +13742,17 @@ class MainMenuGUI(_BaseWindow):
 			dist_x_axis_initial = np.array([1.0, 0.0, 0.0])
 			dist_y_axis_initial = np.array([0.0, 1.0, 0.0])
 			dist_z_axis_initial = np.array([0.0, 0.0, 1.0])
+
+			# 近位メッシュ・軟骨・座標系の初期状態を保存（「脛骨を固定」モードで inv(M) を適用するため）
+			prox_mesh_for_anim = prox_mesh.copy()
+			prox_cartilage_for_anim = prox_cartilage_mesh.copy() if prox_cartilage_mesh is not None else None
+			prox_origin_initial = np.array([0.0, 0.0, 0.0])
+			prox_x_axis_initial = np.array([1.0, 0.0, 0.0])
+			prox_y_axis_initial = np.array([0.0, 1.0, 0.0])
+			prox_z_axis_initial = np.array([0.0, 0.0, 1.0])
+
+			# 脛骨固定モード（True: 脛骨=dist を固定・大腿骨=prox が動く / False: 従来通り prox 固定・dist 動く）
+			fix_tibia_mode = [False]
 
 			# 遠位関節領域の初期状態を保存（メッシュと初期点群）
 			dist_region_for_anim = dist_joint_region.copy()  # dist_region_meshではなくdist_joint_regionから
@@ -13922,6 +14002,22 @@ class MainMenuGUI(_BaseWindow):
 			export_model_button = ttk.Button(button_frame, text="このモデルを出力", width=18, command=export_current_frame_model)
 			export_model_button.pack(side=tk.LEFT, padx=5)
 
+			# --- 「脛骨を固定」トグル（大腿骨=prox / 脛骨=dist の視覚的な固定側を入替） ---
+			fix_tibia_button = ttk.Button(button_frame, text="脛骨を固定", width=18)
+			def toggle_fix_tibia():
+				fix_tibia_mode[0] = not fix_tibia_mode[0]
+				if fix_tibia_mode[0]:
+					fix_tibia_button.config(text="脛骨固定中 (元に戻す)")
+				else:
+					fix_tibia_button.config(text="脛骨を固定")
+				# 現在のフレームで即座に再描画してモード切替を反映
+				try:
+					show_frame(current_frame[0], force_render=True)
+				except Exception as e:
+					print(f"[脛骨固定トグル] 再描画失敗: {e}")
+			fix_tibia_button.config(command=toggle_fix_tibia)
+			fix_tibia_button.pack(side=tk.LEFT, padx=5)
+
 			# --- FEM接触解析ボタン（関節領域がある場合に表示）---
 			if _HAS_FEM and prox_joint_region.n_points > 0 and dist_joint_region.n_points > 0:
 				def run_fem_current_frame():
@@ -14145,58 +14241,85 @@ class MainMenuGUI(_BaseWindow):
 						ap=trans[1],   # AP
 						pd=trans[2]    # PD
 					)
-					
-					# 遠位メッシュを変換（スライダーと同じロジック）
-					# 1. 遠位座標系の原点を中心に配置
-					centered_points = dist_mesh_for_anim.points.copy() - dist_origin_initial
-					
-					# 2. 同次座標に変換
-					ones = np.ones((centered_points.shape[0], 1))
-					points_homogeneous = np.hstack([centered_points, ones])
-					
-					# 3. 同次変換行列を適用
-					transformed_homogeneous = (matrix @ points_homogeneous.T).T
-					transformed_points = transformed_homogeneous[:, :3]
-					
-					# 4. 原点に戻す
-					transformed_points = transformed_points + dist_origin_initial
-					
-					# 5. メッシュの頂点を更新
-					dist_mesh.points = transformed_points
 
-					# 5b. 遠位軟骨メッシュも同じ変換を適用
-					if dist_cartilage_for_anim is not None and dist_cartilage_mesh is not None:
-						cart_centered = dist_cartilage_for_anim.points.copy() - dist_origin_initial
-						cart_ones = np.ones((cart_centered.shape[0], 1))
-						cart_homo = np.hstack([cart_centered, cart_ones])
-						cart_trans = (matrix @ cart_homo.T).T[:, :3] + dist_origin_initial
-						dist_cartilage_mesh.points = cart_trans
+					# 「脛骨を固定」モードの分岐:
+					#   通常 (False): 大腿骨=prox 固定・脛骨=dist を matrix で駆動（従来通り）
+					#   固定 (True):  脛骨=dist 固定・大腿骨=prox を inv(matrix) で駆動（相対姿勢は等価）
+					if fix_tibia_mode[0]:
+						try:
+							inv_matrix = np.linalg.inv(matrix)
+						except Exception:
+							inv_matrix = np.eye(4)
+						dist_M = None       # dist は初期位置に戻す
+						prox_M = inv_matrix # prox に逆変換を適用
+					else:
+						dist_M = matrix
+						prox_M = None       # prox は初期位置のまま
 
-					# --- 遠位関節領域（抽出球）の更新（オフセット確認用）---
-					# 初期位置から計算
-					if dist_region_for_anim.n_points > 0:
-						region_centered = dist_region_for_anim.points.copy() - dist_origin_initial
-						region_homo = np.hstack([region_centered, np.ones((region_centered.shape[0], 1))])
-						region_trans_homo = (matrix @ region_homo.T).T
-						region_trans_points = region_trans_homo[:, :3] + dist_origin_initial
-						dist_region_actor_mesh.points = region_trans_points
+					# ピボット付き 4x4 変換を点群に適用するローカルヘルパー
+					def _apply_pivot(pts_arr, M4, pivot):
+						centered = pts_arr - pivot
+						homo = np.hstack([centered, np.ones((centered.shape[0], 1))])
+						return (M4 @ homo.T).T[:, :3] + pivot
 
-					# 遠位座標系の軸を更新
-					# 原点を変換
-					origin_centered = np.array([0, 0, 0, 1])
-					transformed_origin = (matrix @ origin_centered)[:3]
-					transformed_origin = transformed_origin + dist_origin_initial
-					
-					# 軸を変換
-					rotation_matrix = matrix[:3, :3]
-					transformed_x_axis = rotation_matrix @ dist_x_axis_initial
-					transformed_y_axis = rotation_matrix @ dist_y_axis_initial
-					transformed_z_axis = rotation_matrix @ dist_z_axis_initial
-					
 					axis_length = 50.0
-					dist_x_line.points = np.array([transformed_origin, transformed_origin + transformed_x_axis * axis_length])
-					dist_y_line.points = np.array([transformed_origin, transformed_origin + transformed_y_axis * axis_length])
-					dist_z_line.points = np.array([transformed_origin, transformed_origin + transformed_z_axis * axis_length])
+
+					# --- 遠位メッシュの更新（dist_M があれば変換、無ければ初期位置に戻す） ---
+					if dist_M is not None:
+						dist_mesh.points = _apply_pivot(dist_mesh_for_anim.points.copy(), dist_M, dist_origin_initial)
+					else:
+						dist_mesh.points = dist_mesh_for_anim.points.copy()
+
+					# 遠位軟骨メッシュ
+					if dist_cartilage_for_anim is not None and dist_cartilage_mesh is not None:
+						if dist_M is not None:
+							dist_cartilage_mesh.points = _apply_pivot(dist_cartilage_for_anim.points.copy(), dist_M, dist_origin_initial)
+						else:
+							dist_cartilage_mesh.points = dist_cartilage_for_anim.points.copy()
+
+					# --- 遠位関節領域（抽出球）---
+					if dist_region_for_anim.n_points > 0:
+						if dist_M is not None:
+							dist_region_actor_mesh.points = _apply_pivot(dist_region_for_anim.points.copy(), dist_M, dist_origin_initial)
+						else:
+							dist_region_actor_mesh.points = dist_region_for_anim.points.copy()
+
+					# --- 遠位座標系の軸 ---
+					if dist_M is not None:
+						td_origin = (dist_M @ np.array([0, 0, 0, 1]))[:3] + dist_origin_initial
+						td_rot = dist_M[:3, :3]
+						tdx = td_rot @ dist_x_axis_initial
+						tdy = td_rot @ dist_y_axis_initial
+						tdz = td_rot @ dist_z_axis_initial
+						dist_x_line.points = np.array([td_origin, td_origin + tdx * axis_length])
+						dist_y_line.points = np.array([td_origin, td_origin + tdy * axis_length])
+						dist_z_line.points = np.array([td_origin, td_origin + tdz * axis_length])
+					else:
+						dist_x_line.points = np.array([dist_origin_initial, dist_origin_initial + dist_x_axis_initial * axis_length])
+						dist_y_line.points = np.array([dist_origin_initial, dist_origin_initial + dist_y_axis_initial * axis_length])
+						dist_z_line.points = np.array([dist_origin_initial, dist_origin_initial + dist_z_axis_initial * axis_length])
+
+					# --- 近位側（脛骨固定モードでのみ動く） ---
+					if prox_M is not None:
+						prox_mesh.points = _apply_pivot(prox_mesh_for_anim.points.copy(), prox_M, dist_origin_initial)
+						if prox_cartilage_for_anim is not None and prox_cartilage_mesh is not None:
+							prox_cartilage_mesh.points = _apply_pivot(prox_cartilage_for_anim.points.copy(), prox_M, dist_origin_initial)
+						tp_origin = (prox_M @ np.array([0, 0, 0, 1]))[:3] + dist_origin_initial
+						tp_rot = prox_M[:3, :3]
+						tpx = tp_rot @ prox_x_axis_initial
+						tpy = tp_rot @ prox_y_axis_initial
+						tpz = tp_rot @ prox_z_axis_initial
+						prox_x_line.points = np.array([tp_origin, tp_origin + tpx * axis_length])
+						prox_y_line.points = np.array([tp_origin, tp_origin + tpy * axis_length])
+						prox_z_line.points = np.array([tp_origin, tp_origin + tpz * axis_length])
+					else:
+						# 通常モード: 近位は初期位置のまま（再アサインで確実に戻す）
+						prox_mesh.points = prox_mesh_for_anim.points.copy()
+						if prox_cartilage_for_anim is not None and prox_cartilage_mesh is not None:
+							prox_cartilage_mesh.points = prox_cartilage_for_anim.points.copy()
+						prox_x_line.points = np.array([prox_origin_initial, prox_origin_initial + prox_x_axis_initial * axis_length])
+						prox_y_line.points = np.array([prox_origin_initial, prox_origin_initial + prox_y_axis_initial * axis_length])
+						prox_z_line.points = np.array([prox_origin_initial, prox_origin_initial + prox_z_axis_initial * axis_length])
 					
 					# 重複体積の更新ロジックは削除
 					
@@ -14219,8 +14342,20 @@ class MainMenuGUI(_BaseWindow):
 								
 								# メッシュを安全に更新
 								try:
-									# shallow_copyを使用してメッシュを更新
-									if hasattr(heatmap_mesh, 'copy_structure'):
+									# 【重要】heatmap_data は _LazyHeatmapList 由来で _base メッシュの
+									# vtkPoints を shallow 共有している。copy_structure すると
+									# heatmap_mesh も同じ vtkPoints を指してしまい、
+									# 「heatmap_mesh.points = ...」の代入で _base 側まで書換わり、
+									# 次フレーム以降に変換が累積してメッシュが飛んでいく（葉のように舞う）。
+									# → deep_copy で独立した vtkPoints を持たせ、安全に変換を適用する。
+									if prox_M is not None and hasattr(heatmap_mesh, 'deep_copy'):
+										# 脛骨固定モード: 独立コピー → 逆変換を適用
+										heatmap_mesh.deep_copy(heatmap_data)
+										heatmap_mesh.points = _apply_pivot(
+											np.asarray(heatmap_mesh.points), prox_M, dist_origin_initial
+										)
+									elif hasattr(heatmap_mesh, 'copy_structure'):
+										# 通常モード: 変換不要なので shallow でOK（軽量）
 										heatmap_mesh.copy_structure(heatmap_data)
 										heatmap_mesh.point_data['distance'] = heatmap_data['distance']
 									else:
@@ -14230,7 +14365,10 @@ class MainMenuGUI(_BaseWindow):
 										if hasattr(heatmap_data, 'faces') and heatmap_data.faces is not None:
 											if hasattr(heatmap_mesh, 'faces'):
 												heatmap_mesh.faces = heatmap_data.faces.copy()
-										
+										if prox_M is not None:
+											heatmap_mesh.points = _apply_pivot(
+												np.asarray(heatmap_mesh.points), prox_M, dist_origin_initial
+											)
 								except Exception as hm_err:
 									if frame_idx == 0:
 										print(f"[エラー] フレーム{frame_idx}: メッシュ更新失敗: {hm_err}")
@@ -14269,6 +14407,11 @@ class MainMenuGUI(_BaseWindow):
 												boundary_mesh.points = contour_mesh.points.copy()
 												if hasattr(contour_mesh, 'lines') and contour_mesh.lines is not None:
 													boundary_mesh.lines = contour_mesh.lines.copy()
+											# 脛骨固定モードでは、境界線も prox と一緒に inv(matrix) で移動
+											if prox_M is not None:
+												boundary_mesh.points = _apply_pivot(
+													np.asarray(boundary_mesh.points), prox_M, dist_origin_initial
+												)
 											# actorを表示
 											if boundary_actor is not None:
 												try:
@@ -14348,14 +14491,20 @@ class MainMenuGUI(_BaseWindow):
 								pressure_arr, summary = fem_data
 								# pressure_meshはheatmap_meshと同じ点を持つので、点を更新
 								pressure_mesh.points = heatmap_mesh.points.copy()
-								# 圧力値をマッピング
+								# 圧力値をマッピング（KDTree は prox 初期フレームで作られているので、
+								# 脛骨固定モードでもクエリ点は「変換前 heatmap 位置」を用いる）
 								if prox_fem_surface is not None:
 									if len(pressure_arr) == pressure_mesh.n_points:
 										pressure_mesh['contact_pressure'] = pressure_arr.copy()
 									else:
 										from scipy.spatial import cKDTree
 										tree = cKDTree(prox_fem_surface.points)
-										_, idx = tree.query(pressure_mesh.points, k=1)
+										query_pts = (
+											heatmap_data.points
+											if 'heatmap_data' in locals() and heatmap_data is not None
+											else pressure_mesh.points
+										)
+										_, idx = tree.query(query_pts, k=1)
 										pressure_mesh['contact_pressure'] = pressure_arr[idx]
 								else:
 									pressure_mesh['contact_pressure'] = pressure_arr.copy()
