@@ -1,0 +1,133 @@
+{
+  "tabs": [
+    {
+      "name": "260810_テスト",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/depthcamera_data/ankle_d405_20260807_172914.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_50",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "(未選択)",
+        "ankle_heatmap_dist": "(未選択)",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 0,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@15",
+        "ankle_rs_discard_frames": 63,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "_bones": [
+          {
+            "name": "test1",
+            "aruco_id": 0,
+            "model_path": "",
+            "post_scan_path": "",
+            "color": "#DEB887",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null
+          },
+          {
+            "name": "test2",
+            "aruco_id": 1,
+            "model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null
+          },
+          {
+            "name": "test3",
+            "aruco_id": 2,
+            "model_path": "",
+            "post_scan_path": "",
+            "color": "#98FB98",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "試験2",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_50",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "(未選択)",
+        "ankle_heatmap_dist": "(未選択)",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 0,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@15",
+        "ankle_rs_discard_frames": 63,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "_bones": [
+          {
+            "name": "test1",
+            "aruco_id": 0,
+            "model_path": "",
+            "post_scan_path": "",
+            "color": "#DEB887",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null
+          },
+          {
+            "name": "test2",
+            "aruco_id": 1,
+            "model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null
+          },
+          {
+            "name": "test3",
+            "aruco_id": 2,
+            "model_path": "",
+            "post_scan_path": "",
+            "color": "#98FB98",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null
+          }
+        ],
+        "_selected_bone": 0
+      }
+    }
+  ],
+  "active": 0
+}

@@ -25,3 +25,9 @@ tkinterdnd2>=0.3.0
 #
 # ※ torch は現状ヒートマップには使用しない（BVHの方が総当たりGPUより桁違いに速いため）。
 #    必要な場合のみ任意で:  pip install torch
+
+# --- ankle simulator（ArUcoマーカートラッキング）---
+# ArUco検出+PnPには cv2.aruco (contrib版) が必要 (Stage 3以降)
+opencv-contrib-python>=4.7
+# Intel RealSense .bag ファイルを直接読む場合に必要 (D400/D405など)
+pyrealsense2>=2.55

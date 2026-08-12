@@ -450,6 +450,72 @@ class MainMenuGUI(_BaseWindow):
 		self._knee_tab_buttons = []     # タブバー上のボタン（並び順=タブ順、ドラッグ入替の座標判定用）
 		self._knee_tab_drag = None      # ドラッグ中の入替情報 {'from', 'x', 'moved'}
 
+		# ============================================================
+		# ankle simulator（足関節・ArUcoマーカートラッキング方式）
+		# 特徴: 膝/股関節と異なり「近位/遠位2骨」ではなく、任意N本(脛骨,距骨,他)の
+		# 動きをRGB-Dカメラ+骨に刺したピン+ArUcoマーカーで追跡する。
+		# データフロー:
+		#   1) 骨にM3ピンを刺しArUcoプレートを固定 → 初期状態スキャン
+		#   2) RGB-D動画で背屈/底屈を撮影
+		#   3) ArUco検出→PnPで各マーカーの6DOFを時系列取得
+		#   4) 試験後解剖: 各骨を個別スキャンし「マーカー座標系→骨座標系」の
+		#      剛体変換(marker_to_bone_T)を算出
+		#   5) マーカー時系列に marker_to_bone_T を掛けて骨の動きを復元
+		#   6) 骨ペア間の接触面ヒートマップ(膝と同じLUT)
+		# ============================================================
+		self.ankle_initial_scan_path = tk.StringVar(value="")  # 初期状態(ピン+マーカー装着後)スキャン
+		self.ankle_video_path = tk.StringVar(value="")         # RGBビデオ(mp4/avi)
+		self.ankle_depth_path = tk.StringVar(value="")         # 深度データ(bag/npz/mkv等)
+		self.ankle_camera_intrinsics_path = tk.StringVar(value="")  # カメラ内部パラメータ(json/yaml)
+		self.ankle_aruco_dict_var = tk.StringVar(value="DICT_4X4_50")  # ArUco辞書
+		self.ankle_marker_size_mm = tk.DoubleVar(value=20.0)   # マーカー実寸(mm)
+		self.ankle_pose_series_path = tk.StringVar(value="")   # 事前計算済み姿勢時系列(任意, npz/csv)
+		# RealSense D405 ライブ撮影設定 (友人 make_date_movie_D405.py の設定を既定値化)
+		self.ankle_rs_resolution = tk.StringVar(value="1280x720@15")   # 解像度@fps
+		self.ankle_rs_discard_frames = tk.IntVar(value=45)             # 録画開始前の破棄フレーム
+		self.ankle_rs_manual_exposure = tk.BooleanVar(value=False)     # 深度手動露光
+		self.ankle_rs_exposure_val = tk.IntVar(value=5000)             # 手動露光値
+		self.ankle_rs_status = tk.StringVar(value="(未接続)")
+		# タブ共通の位置合わせパラメータ (膝と同構造・全骨で共有)
+		self.ankle_reg_ransac_distance = tk.DoubleVar(value=1.0)     # RANSAC距離(mm)
+		self.ankle_reg_ransac_max_iter = tk.IntVar(value=1000)       # RANSAC反復
+		self.ankle_reg_ransac_confidence = tk.DoubleVar(value=0.99)  # RANSAC信頼度
+		self.ankle_reg_icp_threshold = tk.DoubleVar(value=5.0)       # ICP距離(mm)
+		self.ankle_reg_icp_max_iter = tk.IntVar(value=2000)          # ICP反復
+		self.ankle_reg_sample_points = tk.IntVar(value=100000)       # サンプル点数
+		self.ankle_reg_voxel_size = tk.DoubleVar(value=0.0)          # ボクセル(mm, 0=自動)
+		self.ankle_reg_preview_var = tk.BooleanVar(value=True)       # 位置合わせ経過表示
+		# N本可変の骨リスト: 各要素は dict
+		#   {name, aruco_id, model_path, post_scan_path, color,
+		#    method('ransac'|'pca'|'manual'), enable_scaling(bool),
+		#    marker_to_bone_T(4x4 list or None), reg_T(4x4 list or None)}
+		self.ankle_bones = []
+		self._ankle_selected_bone = 0  # 現在選択中の骨index
+		# 骨ヒートマップ骨対: 骨ラベル文字列で保持 (「(未選択)」または「N. 骨名」)
+		self.ankle_heatmap_prox_var = tk.StringVar(value="(未選択)")
+		self.ankle_heatmap_dist_var = tk.StringVar(value="(未選択)")
+		# 骨リスト編集UIの参照（構築時に格納）
+		self._ankle_bones_listbox = None
+		self._ankle_bone_editor_widgets = {}
+		# 位置合わせ結果はankle_bonesの各要素内 reg_T に保持
+		# ArUco/PnP検出パラメータ
+		self.ankle_ref_frame = tk.IntVar(value=0)         # 参照フレーム t=0 (Stage 5で使用)
+		self.ankle_detect_stride = tk.IntVar(value=1)     # フレーム間引き (1=全フレーム)
+		self.ankle_detection_status = tk.StringVar(value="(未実行)")
+		# 姿勢時系列キャッシュ: {tab_name: {frame_count, timestamps, intrinsics, marker_size_mm,
+		#   aruco_dict, source, bones: {aruco_id: {poses(N,4,4), detected(N,), reproj_err(N,)}}}}
+		self._ankle_pose_cache = {}
+		# 検出処理のキャンセルフラグ (progress dialog)
+		self._ankle_detect_cancel = False
+
+		# 既定値スナップショット（新規タブ用）を確保
+		self._ankle_default_snap = self._ankle_snapshot_current()
+		self._ankle_tabs = []            # [{'name': str, 'snapshot': dict}]
+		self._ankle_active_tab = 0
+		self._ankle_tabbar_frame = None
+		self._ankle_tab_buttons = []
+		self._ankle_tab_drag = None
+
 		# 関節種別ごとに切替えるUIウィジェットの参照（ラベル変更用）
 		self._joint_widgets = {}
 
@@ -457,6 +523,8 @@ class MainMenuGUI(_BaseWindow):
 		self._load_state()
 		# knee simulator の状態復元（hipの関節ラジオと独立）
 		self._load_knee_state()
+		# ankle simulator の状態復元（膝/股と独立）
+		self._load_ankle_state()
 		# 直前の関節種別を記録（関節切替時の差分判定用）
 		self._prev_joint = self.joint_var.get()
 
@@ -497,6 +565,10 @@ class MainMenuGUI(_BaseWindow):
 		# タブ1b: knee simulator（FRS-2015 ロボット準拠 膝関節用可視化）
 		self.knee_simulator_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.knee_simulator_tab, text="knee simulator")
+
+		# タブ1c: ankle simulator（足関節・ArUcoマーカートラッキング方式）
+		self.ankle_simulator_tab = ttk.Frame(self.notebook, padding=12)
+		self.notebook.add(self.ankle_simulator_tab, text="ankle simulator")
 
 		# タブ2: Cache Settings
 		self.cache_tab = ttk.Frame(self.notebook, padding=12)
@@ -564,6 +636,9 @@ class MainMenuGUI(_BaseWindow):
 
 		# knee simulatorタブのコンテンツを作成
 		self._create_knee_simulator_tab()
+
+		# ankle simulatorタブのコンテンツを作成
+		self._create_ankle_simulator_tab()
 
 		# Fittingタブのコンテンツを作成
 		self._create_fitting_tab()
@@ -2412,6 +2487,3106 @@ class MainMenuGUI(_BaseWindow):
 			e.set('name', str(lab))
 		ET.ElementTree(root).write(str(path), encoding="utf-8", xml_declaration=True)
 	# endregion knee simulator
+
+	# ================================================================
+	# region ankle simulator（足関節・ArUcoマーカートラッキング方式）
+	# ================================================================
+	# データフロー（膝/股と異なる: 近位/遠位2骨ではなく N骨）:
+	#   ① 初期状態スキャン (ピン+マーカー装着後)
+	#   ② RGB-D計測データ (video + depth + camera intrinsics + ArUco設定)
+	#   ③ 骨リスト (N本可変) — 骨ごとに ArUco ID / 試験後スキャン /
+	#       マーカー-骨キャリブレーション / 位置合わせ / 表示色
+	#   ④ ArUco検出 → PnP → 姿勢時系列を計算/キャッシュ
+	#   ⑤ 可視化・アニメーション・骨対ヒートマップ (膝のLUT流用)
+
+	_ANKLE_DEFAULT_BONE_COLORS = (
+		"#DEB887", "#ADD8E6", "#98FB98", "#FFB6C1", "#DDA0DD",
+		"#FFD700", "#87CEFA", "#F4A460", "#B0E0E6", "#FFA07A")
+
+	_ANKLE_ARUCO_DICT_CHOICES = (
+		"DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
+		"DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
+		"DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+		"DICT_APRILTAG_36h11")
+
+	def _ankle_default_bone(self, index: int) -> dict:
+		"""新規骨のデフォルト値。"""
+		color = self._ANKLE_DEFAULT_BONE_COLORS[index % len(self._ANKLE_DEFAULT_BONE_COLORS)]
+		return {
+			"name": f"骨{index + 1}",
+			"aruco_id": index,
+			"model_path": "",
+			"post_scan_path": "",
+			"color": color,
+			"method": "ransac",         # 'ransac' | 'pca' | 'manual'
+			"enable_scaling": False,
+			"marker_to_bone_T": None,
+			"reg_T": None,
+		}
+
+	def _create_ankle_simulator_tab(self) -> None:
+		"""ankle simulator タブのUIを構築（ArUcoマーカートラッキング方式）。"""
+		tabbar_row = tk.Frame(self.ankle_simulator_tab)
+		tabbar_row.pack(side="top", fill="x", padx=4, pady=(4, 0))
+		tk.Label(tabbar_row, text="試験タブ:", font=(self.ui_font_family, 9)).pack(side="left", padx=(0, 4))
+		self._ankle_tabbar_frame = tk.Frame(tabbar_row)
+		self._ankle_tabbar_frame.pack(side="left", fill="x")
+
+		canvas = tk.Canvas(self.ankle_simulator_tab, highlightthickness=0)
+		scrollbar = ttk.Scrollbar(self.ankle_simulator_tab, orient="vertical", command=canvas.yview)
+		scrollable_frame = ttk.Frame(canvas)
+		scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+		canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+		canvas.configure(yscrollcommand=scrollbar.set)
+		canvas.pack(side="left", fill="both", expand=True)
+		scrollbar.pack(side="right", fill="y")
+
+		def _on_mousewheel(event):
+			step = _mousewheel_units(event)
+			if step:
+				canvas.yview_scroll(step, "units")
+		canvas.bind("<Enter>", lambda e: (canvas.bind_all("<MouseWheel>", _on_mousewheel),
+		                                   canvas.bind_all("<Button-4>", _on_mousewheel),
+		                                   canvas.bind_all("<Button-5>", _on_mousewheel)))
+		canvas.bind("<Leave>", lambda e: (canvas.unbind_all("<MouseWheel>"),
+		                                   canvas.unbind_all("<Button-4>"),
+		                                   canvas.unbind_all("<Button-5>")))
+
+		container = scrollable_frame
+		container.columnconfigure(0, weight=1)
+
+		ttk.Label(container, text="ankle simulator（足関節・ArUcoマーカートラッキング）",
+		          font=(self.ui_font_family, 12, "bold")).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 2))
+		ttk.Label(container,
+		          text="骨に刺したM3ピン+ArUcoマーカーをRGB-Dカメラで追跡し、任意N本(脛骨,距骨,他)の"
+		               "6自由度姿勢を復元。試験後解剖時に取得したマーカー-骨変換で骨自体の動きに変換します。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 8))
+
+		# ⓪ RealSense D405 ライブ撮影 (①より前 = 実試験で最初に使うため)
+		rs_frame = ttk.LabelFrame(container, text="⓪ RealSense D405 ライブ撮影 (.db3を直接生成)", style="Bold.TLabelframe")
+		rs_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+		rs_frame.columnconfigure(0, weight=1)
+		rf1 = ttk.Frame(rs_frame)
+		rf1.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
+		ttk.Label(rf1, text="解像度@fps:").grid(row=0, column=0, sticky="w")
+		ttk.Combobox(rf1, textvariable=self.ankle_rs_resolution, width=16, state="readonly",
+		             values=["848x480@60", "1280x720@30", "1280x720@15", "640x480@30", "640x480@15"]
+		             ).grid(row=0, column=1, sticky="w", padx=(4, 12))
+		ttk.Label(rf1, text="開始前 破棄フレーム:").grid(row=0, column=2, sticky="w")
+		ttk.Spinbox(rf1, from_=0, to=200, textvariable=self.ankle_rs_discard_frames, width=6
+		            ).grid(row=0, column=3, sticky="w", padx=(4, 12))
+		ttk.Checkbutton(rf1, text="深度手動露光", variable=self.ankle_rs_manual_exposure
+		                ).grid(row=0, column=4, sticky="w", padx=(0, 4))
+		ttk.Entry(rf1, textvariable=self.ankle_rs_exposure_val, width=8
+		          ).grid(row=0, column=5, sticky="w")
+		rf2 = ttk.Frame(rs_frame)
+		rf2.grid(row=1, column=0, sticky="w", padx=12, pady=(2, 4))
+		ttk.Button(rf2, text="接続確認", command=self.on_ankle_rs_test_connection
+		           ).grid(row=0, column=0, padx=(0, 8))
+		ttk.Button(rf2, text="プレビュー+録画 (.db3保存)", command=self.on_ankle_rs_capture
+		           ).grid(row=0, column=1, padx=(0, 8))
+		ttk.Label(rs_frame, textvariable=self.ankle_rs_status,
+		          foreground="#005580", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 2))
+		ttk.Label(rs_frame,
+		          text="接続確認: pipeline起動+カメラ情報表示 / "
+		               "録画: プレビュー→スペースで開始→スペース(またはESC)で停止 → .db3 を ankle_depth_path に自動セット。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
+
+		# ① 初期状態スキャン
+		init_frame = ttk.LabelFrame(container, text="① 初期状態スキャン（ピン+マーカー装着後）", style="Bold.TLabelframe")
+		init_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+		for i in range(3):
+			init_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		self._add_file_row(init_frame, 0, "初期状態スキャン (STL/OBJ)", self.ankle_initial_scan_path,
+		                   lambda: self._ankle_choose(self.ankle_initial_scan_path, "初期状態スキャンを選択", "model"))
+		ttk.Label(init_frame, text="※ 全骨がピン+マーカーを装着した状態でスキャンされたもの。"
+		          "各骨は③の骨リストで個別に登録します。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
+		# ② 計測データ
+		meas_frame = ttk.LabelFrame(container, text="② RGB-D計測データ / ArUco設定", style="Bold.TLabelframe")
+		meas_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+		for i in range(3):
+			meas_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		self._add_file_row(meas_frame, 0, "RGBビデオ (mp4/avi)", self.ankle_video_path,
+		                   lambda: self._ankle_choose(self.ankle_video_path, "RGBビデオを選択", "video"))
+		self._add_file_row(meas_frame, 1, "深度データ (bag/npz/mkv)", self.ankle_depth_path,
+		                   lambda: self._ankle_choose(self.ankle_depth_path, "深度データを選択", "depth"))
+		self._add_file_row(meas_frame, 2, "カメラ内部パラメータ (json/yaml)", self.ankle_camera_intrinsics_path,
+		                   lambda: self._ankle_choose(self.ankle_camera_intrinsics_path, "カメラ内部パラメータを選択", "intrinsics"))
+		af = ttk.Frame(meas_frame)
+		af.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 4))
+		ttk.Label(af, text="ArUco辞書:").grid(row=0, column=0, sticky="w")
+		ttk.Combobox(af, textvariable=self.ankle_aruco_dict_var, width=18, state="readonly",
+		             values=list(self._ANKLE_ARUCO_DICT_CHOICES)).grid(row=0, column=1, sticky="w", padx=(4, 12))
+		ttk.Label(af, text="マーカー実寸 (mm):").grid(row=0, column=2, sticky="w")
+		ttk.Entry(af, textvariable=self.ankle_marker_size_mm, width=8).grid(row=0, column=3, sticky="w", padx=(4, 12))
+		self._add_file_row(meas_frame, 4, "姿勢時系列 (事前計算済, 任意)", self.ankle_pose_series_path,
+		                   lambda: self._ankle_choose(self.ankle_pose_series_path, "姿勢時系列ファイル(npz/csv)を選択", "pose"))
+
+		# ③ 骨リスト
+		bones_frame = ttk.LabelFrame(container, text="③ 骨リスト（N本可変：脛骨・距骨・他）", style="Bold.TLabelframe")
+		bones_frame.grid(row=5, column=0, sticky="nsew", pady=(0, 8))
+		bones_frame.columnconfigure(0, weight=0)
+		bones_frame.columnconfigure(1, weight=1)
+
+		left = ttk.Frame(bones_frame)
+		left.grid(row=0, column=0, sticky="ns", padx=(8, 4), pady=6)
+		ttk.Label(left, text="骨リスト", font=(self.ui_font_family, 9, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+		self._ankle_bones_listbox = tk.Listbox(left, height=8, width=22, exportselection=False,
+		                                        font=(self.ui_font_family, 9))
+		self._ankle_bones_listbox.grid(row=1, column=0, columnspan=3, sticky="ns", pady=(2, 4))
+		self._ankle_bones_listbox.bind("<<ListboxSelect>>", lambda e: self._ankle_on_bone_select())
+		self._ankle_bones_listbox.bind("<Double-Button-1>", lambda e: self.on_ankle_bone_rename())
+		btnrow = ttk.Frame(left)
+		btnrow.grid(row=2, column=0, columnspan=3, sticky="w")
+		ttk.Button(btnrow, text="＋追加", width=6, command=self.on_ankle_bone_add).grid(row=0, column=0, padx=1)
+		ttk.Button(btnrow, text="複製", width=5, command=self.on_ankle_bone_duplicate).grid(row=0, column=1, padx=1)
+		ttk.Button(btnrow, text="削除", width=5, command=self.on_ankle_bone_delete).grid(row=0, column=2, padx=1)
+		btnrow2 = ttk.Frame(left)
+		btnrow2.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+		ttk.Button(btnrow2, text="↑", width=3, command=lambda: self.on_ankle_bone_move(-1)).grid(row=0, column=0, padx=1)
+		ttk.Button(btnrow2, text="↓", width=3, command=lambda: self.on_ankle_bone_move(1)).grid(row=0, column=1, padx=1)
+		ttk.Button(btnrow2, text="名前変更", width=9, command=self.on_ankle_bone_rename).grid(row=0, column=2, padx=1)
+
+		editor = ttk.LabelFrame(bones_frame, text="選択中の骨", style="Bold.TLabelframe")
+		editor.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=6)
+		for i in range(3):
+			editor.columnconfigure(i, weight=[0, 1, 0][i])
+		row = 0
+		ttk.Label(editor, text="骨名:").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		name_var = tk.StringVar(value="")
+		ttk.Entry(editor, textvariable=name_var, width=18).grid(row=row, column=1, sticky="w", pady=2)
+		ttk.Button(editor, text="適用", width=5,
+		           command=lambda: self._ankle_apply_editor_field("name", name_var.get())
+		           ).grid(row=row, column=2, sticky="w", padx=4)
+		self._ankle_bone_editor_widgets["name_var"] = name_var
+
+		row += 1
+		ttk.Label(editor, text="ArUco ID:").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		aruco_var = tk.IntVar(value=0)
+		ttk.Spinbox(editor, from_=0, to=999, textvariable=aruco_var, width=6).grid(row=row, column=1, sticky="w", pady=2)
+		ttk.Button(editor, text="適用", width=5,
+		           command=lambda: self._ankle_apply_editor_field("aruco_id", int(aruco_var.get()))
+		           ).grid(row=row, column=2, sticky="w", padx=4)
+		self._ankle_bone_editor_widgets["aruco_var"] = aruco_var
+
+		row += 1
+		ttk.Label(editor, text="表示色:").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		color_btn = tk.Button(editor, width=4, relief="ridge",
+		                       command=self._ankle_choose_bone_color)
+		color_btn.grid(row=row, column=1, sticky="w", pady=2)
+		self._ankle_bone_editor_widgets["color_btn"] = color_btn
+
+		row += 1
+		ttk.Label(editor, text="骨モデル (試験後スキャン):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		model_var = tk.StringVar(value="")
+		ttk.Entry(editor, textvariable=model_var, state="readonly", width=40).grid(row=row, column=1, sticky="ew", pady=2)
+		ttk.Button(editor, text="参照", width=5,
+		           command=lambda: self._ankle_pick_bone_file("model_path", "骨モデルを選択", "model")
+		           ).grid(row=row, column=2, sticky="w", padx=4)
+		self._ankle_bone_editor_widgets["model_var"] = model_var
+
+		row += 1
+		ttk.Label(editor, text="初期スキャン側 骨領域 (位置合わせ先):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		post_var = tk.StringVar(value="")
+		ttk.Entry(editor, textvariable=post_var, state="readonly", width=40).grid(row=row, column=1, sticky="ew", pady=2)
+		ttk.Button(editor, text="参照", width=5,
+		           command=lambda: self._ankle_pick_bone_file("post_scan_path", "初期スキャン側の骨領域を選択", "model")
+		           ).grid(row=row, column=2, sticky="w", padx=4)
+		self._ankle_bone_editor_widgets["post_var"] = post_var
+
+		# 位置合わせ方式・スケーリング(骨ごと)
+		row += 1
+		mf = ttk.Frame(editor)
+		mf.grid(row=row, column=0, columnspan=3, sticky="w", padx=(8, 4), pady=(2, 2))
+		ttk.Label(mf, text="位置合わせ方式:").grid(row=0, column=0, sticky="w")
+		method_var = tk.StringVar(value="ransac")
+		ttk.Radiobutton(mf, text="RANSAC", value="ransac", variable=method_var,
+		                command=lambda: self._ankle_apply_editor_field("method", method_var.get())
+		                ).grid(row=0, column=1, sticky="w", padx=(6, 6))
+		ttk.Radiobutton(mf, text="主軸PCA", value="pca", variable=method_var,
+		                command=lambda: self._ankle_apply_editor_field("method", method_var.get())
+		                ).grid(row=0, column=2, sticky="w", padx=(0, 6))
+		ttk.Radiobutton(mf, text="手動3点", value="manual", variable=method_var,
+		                command=lambda: self._ankle_apply_editor_field("method", method_var.get())
+		                ).grid(row=0, column=3, sticky="w", padx=(0, 12))
+		scaling_var = tk.BooleanVar(value=False)
+		ttk.Checkbutton(mf, text="スケール補正", variable=scaling_var,
+		                command=lambda: self._ankle_apply_editor_field("enable_scaling", bool(scaling_var.get()))
+		                ).grid(row=0, column=4, sticky="w")
+		self._ankle_bone_editor_widgets["method_var"] = method_var
+		self._ankle_bone_editor_widgets["scaling_var"] = scaling_var
+
+		row += 1
+		status_lbl = ttk.Label(editor, text="", foreground="gray", font=(self.ui_font_family, 8))
+		status_lbl.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 4))
+		self._ankle_bone_editor_widgets["status_lbl"] = status_lbl
+
+		row += 1
+		opsf = ttk.Frame(editor)
+		opsf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
+		ttk.Button(opsf, text="マーカー-骨キャリブ",
+		           command=self.on_ankle_calibrate_marker_to_bone).grid(row=0, column=0, padx=(0, 4))
+		ttk.Button(opsf, text="初期スキャンへ位置合わせ",
+		           command=self.on_ankle_register_bone).grid(row=0, column=1, padx=(0, 4))
+		ttk.Button(opsf, text="キャリブをクリア",
+		           command=lambda: self._ankle_apply_editor_field("marker_to_bone_T", None)
+		           ).grid(row=0, column=2, padx=(0, 4))
+		ttk.Button(opsf, text="位置合わせをクリア",
+		           command=lambda: self._ankle_apply_editor_field("reg_T", None)
+		           ).grid(row=0, column=3, padx=(0, 4))
+
+		# 位置合わせパラメータ (タブ共通)
+		param_frame = ttk.LabelFrame(bones_frame, text="位置合わせパラメータ (このタブの全骨で共有)",
+		                              style="Bold.TLabelframe")
+		param_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(8, 8), pady=(0, 6))
+		pf = ttk.Frame(param_frame)
+		pf.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 2))
+		ank_reg_spec = [
+			("RANSAC距離(mm):", self.ankle_reg_ransac_distance),
+			("RANSAC反復:", self.ankle_reg_ransac_max_iter),
+			("RANSAC信頼度:", self.ankle_reg_ransac_confidence),
+			("ICP距離(mm):", self.ankle_reg_icp_threshold),
+			("ICP反復:", self.ankle_reg_icp_max_iter),
+			("サンプル点数:", self.ankle_reg_sample_points),
+			("ボクセル(mm,0=自動):", self.ankle_reg_voxel_size),
+		]
+		col = 0; r = 0
+		for lbl, var in ank_reg_spec:
+			ttk.Label(pf, text=lbl).grid(row=r, column=col * 2, sticky="w", padx=(0, 2), pady=1)
+			ttk.Entry(pf, textvariable=var, width=8).grid(row=r, column=col * 2 + 1, sticky="w", padx=(0, 10), pady=1)
+			col += 1
+			if col >= 3:
+				col = 0; r += 1
+		ttk.Checkbutton(param_frame, text="経過を表示 (点群重ね合わせプレビュー)",
+		                variable=self.ankle_reg_preview_var
+		                ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 4))
+		bulkf = ttk.Frame(param_frame)
+		bulkf.grid(row=2, column=0, sticky="w", padx=12, pady=(2, 6))
+		ttk.Button(bulkf, text="全骨を一括位置合わせ",
+		           command=self.on_ankle_register_all_bones).grid(row=0, column=0, padx=(0, 8))
+		ttk.Button(bulkf, text="位置合わせ結果を確認 (プレビュー)",
+		           command=self.on_ankle_preview_registration).grid(row=0, column=1, padx=(0, 8))
+
+		# 🔨 マーカー準備 (印刷) — 事前準備用: ③のID/名前と②の辞書/実寸から印刷ファイル生成
+		prep_frame = ttk.LabelFrame(container, text="🔨 マーカー準備 (印刷用ファイル生成)",
+		                             style="Bold.TLabelframe")
+		prep_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
+		prep_frame.columnconfigure(0, weight=1)
+		prep_btn = ttk.Frame(prep_frame)
+		prep_btn.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
+		ttk.Button(prep_btn, text="マーカー印刷用PDF (実寸・推奨)",
+		           command=self.on_ankle_save_marker_pdf).grid(row=0, column=0, padx=(0, 8))
+		ttk.Button(prep_btn, text="マーカー画像を保存 (PNG)",
+		           command=self.on_ankle_save_marker_images).grid(row=0, column=1, padx=(0, 8))
+		ttk.Label(prep_frame,
+		          text="事前準備用: ③のArUco IDと②の辞書・マーカー実寸から印刷ファイルを生成します。\n"
+		               "PDFは「実際のサイズ / 100%」で印刷 → ノギスで実寸確認 → ②に反映。\n"
+		               "印刷後、骨にマーカーを装着 → ①で初期スキャン → ⓪で撮影、の順で本試験に進みます。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, sticky="w", padx=12, pady=(2, 6))
+
+		# ④ ArUco/PnP 実行
+		det_frame = ttk.LabelFrame(container, text="④ ArUco検出 / PnPで6DOF姿勢時系列を計算", style="Bold.TLabelframe")
+		det_frame.grid(row=7, column=0, sticky="nsew", pady=(0, 8))
+		det_frame.columnconfigure(0, weight=1)
+		# 検出パラメータ
+		pf = ttk.Frame(det_frame)
+		pf.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
+		ttk.Label(pf, text="フレーム間引き:").grid(row=0, column=0, sticky="w")
+		ttk.Spinbox(pf, from_=1, to=100, textvariable=self.ankle_detect_stride, width=6
+		            ).grid(row=0, column=1, sticky="w", padx=(4, 12))
+		ttk.Label(pf, text="参照フレーム t=0:").grid(row=0, column=2, sticky="w")
+		ttk.Spinbox(pf, from_=0, to=100000, textvariable=self.ankle_ref_frame, width=8
+		            ).grid(row=0, column=3, sticky="w", padx=(4, 0))
+		ttk.Label(pf, text="(Stage 5 でアニメ基準に使用)",
+		          foreground="gray", font=(self.ui_font_family, 8)
+		          ).grid(row=0, column=4, sticky="w", padx=(6, 0))
+		# 実行ボタン
+		dbtn = ttk.Frame(det_frame)
+		dbtn.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 4))
+		ttk.Button(dbtn, text="ArUco検出+PnP実行", command=self.on_ankle_detect_markers).grid(row=0, column=0, padx=(0, 8))
+		ttk.Button(dbtn, text="姿勢時系列を保存", command=self.on_ankle_save_pose_series).grid(row=0, column=1, padx=(0, 8))
+		ttk.Button(dbtn, text="姿勢時系列を読込", command=self.on_ankle_load_pose_series).grid(row=0, column=2, padx=(0, 8))
+		ttk.Button(dbtn, text="マーカー軌跡を可視化 (骨モデル不要)",
+		           command=self.on_ankle_visualize_pose_series).grid(row=0, column=3, padx=(16, 8))
+		# 検出結果ステータス
+		ttk.Label(det_frame, textvariable=self.ankle_detection_status,
+		          foreground="#005580", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 4))
+		ttk.Label(det_frame,
+		          text="対応データ形式: RealSense .bag (自動で色/深度/内部パラメータを抽出) / "
+		               "汎用 mp4+npz深度+jsonパラメータ。SOLVEPNP_IPPE_SQUAREで両姿勢解を計算し、"
+		               "深度で表裏を選択。要 opencv-contrib-python (+.bag使用時 pyrealsense2)。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
+
+		# ⑤ 可視化・アニメ
+		vis_frame = ttk.LabelFrame(container, text="⑤ 可視化・アニメーション・骨対ヒートマップ", style="Bold.TLabelframe")
+		vis_frame.grid(row=8, column=0, sticky="nsew", pady=(0, 8))
+		vis_frame.columnconfigure(0, weight=1)
+		vbtn = ttk.Frame(vis_frame)
+		vbtn.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 4))
+		ttk.Button(vbtn, text="初期状態を可視化", command=self.on_ankle_visualize_initial).grid(row=0, column=0, padx=(0, 8))
+		ttk.Button(vbtn, text="全骨を可視化", command=self.on_ankle_visualize_all).grid(row=0, column=1, padx=(0, 8))
+		ttk.Button(vbtn, text="シミュレーション実行", command=self.on_ankle_animate).grid(row=0, column=2, padx=(0, 8))
+		hf = ttk.Frame(vis_frame)
+		hf.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 6))
+		ttk.Label(hf, text="ヒートマップ対象 骨A:").grid(row=0, column=0, sticky="w")
+		self._ankle_heatmap_prox_combo = ttk.Combobox(hf, textvariable=self.ankle_heatmap_prox_var,
+		                                               width=20, state="readonly")
+		self._ankle_heatmap_prox_combo.grid(row=0, column=1, sticky="w", padx=(4, 12))
+		ttk.Label(hf, text="骨B:").grid(row=0, column=2, sticky="w")
+		self._ankle_heatmap_dist_combo = ttk.Combobox(hf, textvariable=self.ankle_heatmap_dist_var,
+		                                               width=20, state="readonly")
+		self._ankle_heatmap_dist_combo.grid(row=0, column=3, sticky="w", padx=(4, 0))
+
+		self._ankle_init_tabs()
+
+	# ---- ankle: ファイル/カラーピッカー ----
+	def _ankle_choose(self, var: tk.StringVar, title: str, kind: str) -> None:
+		if kind == "model":
+			ft = [("3Dモデル", "*.obj *.stl *.ply"), ("すべてのファイル", "*.*")]
+		elif kind == "video":
+			ft = [("動画", "*.mp4 *.avi *.mov *.mkv"), ("すべてのファイル", "*.*")]
+		elif kind == "depth":
+			ft = [("深度データ", "*.db3 *.bag *.npz *.mkv *.tiff *.tif"), ("すべてのファイル", "*.*")]
+		elif kind == "intrinsics":
+			ft = [("カメラパラメータ", "*.json *.yaml *.yml"), ("すべてのファイル", "*.*")]
+		elif kind == "pose":
+			ft = [("姿勢時系列", "*.npz *.csv *.json"), ("すべてのファイル", "*.*")]
+		else:
+			ft = [("すべてのファイル", "*.*")]
+		path = filedialog.askopenfilename(title=title, filetypes=ft)
+		if path:
+			var.set(path)
+
+	def _ankle_color_of(self, i: int) -> str:
+		if 0 <= i < len(self.ankle_bones):
+			c = str(self.ankle_bones[i].get("color", "") or "").strip()
+			if len(c) == 7 and c[0] == "#" and all(ch in "0123456789abcdefABCDEF" for ch in c[1:]):
+				return c
+		return self._ANKLE_DEFAULT_BONE_COLORS[max(0, i) % len(self._ANKLE_DEFAULT_BONE_COLORS)]
+
+	# ---- ankle: 骨リスト管理 ----
+	def _ankle_current_bone(self):
+		i = self._ankle_selected_bone
+		if 0 <= i < len(self.ankle_bones):
+			return self.ankle_bones[i]
+		return None
+
+	def _ankle_refresh_bone_listbox(self) -> None:
+		lb = self._ankle_bones_listbox
+		if lb is None:
+			return
+		lb.delete(0, tk.END)
+		for i, b in enumerate(self.ankle_bones):
+			name = b.get("name", f"骨{i+1}")
+			aid = b.get("aruco_id", "?")
+			mk = "M" if b.get("marker_to_bone_T") is not None else "-"
+			rg = "R" if b.get("reg_T") is not None else "-"
+			lb.insert(tk.END, f"{i+1}. {name} [ID={aid}] {mk}{rg}")
+		if self.ankle_bones:
+			idx = max(0, min(self._ankle_selected_bone, len(self.ankle_bones) - 1))
+			self._ankle_selected_bone = idx
+			try:
+				lb.selection_clear(0, tk.END)
+				lb.selection_set(idx)
+				lb.see(idx)
+			except Exception:
+				pass
+		self._ankle_load_editor_from_bone()
+		self._ankle_refresh_heatmap_combos()
+
+	def _ankle_refresh_heatmap_combos(self) -> None:
+		labels = [f"{i+1}. {b.get('name','')}" for i, b in enumerate(self.ankle_bones)]
+		for combo in (getattr(self, "_ankle_heatmap_prox_combo", None),
+		              getattr(self, "_ankle_heatmap_dist_combo", None)):
+			if combo is not None:
+				try:
+					combo["values"] = ["(未選択)"] + labels
+				except Exception:
+					pass
+
+	def _ankle_on_bone_select(self) -> None:
+		lb = self._ankle_bones_listbox
+		if lb is None:
+			return
+		sel = lb.curselection()
+		if not sel:
+			return
+		self._ankle_selected_bone = int(sel[0])
+		self._ankle_load_editor_from_bone()
+
+	def _ankle_load_editor_from_bone(self) -> None:
+		b = self._ankle_current_bone()
+		w = self._ankle_bone_editor_widgets
+		if not w:
+			return
+		if b is None:
+			for key in ("name_var", "model_var", "post_var"):
+				if key in w:
+					try:
+						w[key].set("")
+					except Exception:
+						pass
+			if "aruco_var" in w:
+				try:
+					w["aruco_var"].set(0)
+				except Exception:
+					pass
+			if "status_lbl" in w:
+				w["status_lbl"].configure(text="(骨が未登録です)")
+			if "color_btn" in w:
+				try:
+					w["color_btn"].configure(bg="#cccccc", activebackground="#cccccc")
+				except Exception:
+					pass
+			return
+		try:
+			w["name_var"].set(b.get("name", ""))
+			w["aruco_var"].set(int(b.get("aruco_id", 0)))
+			w["model_var"].set(b.get("model_path", "") or "")
+			w["post_var"].set(b.get("post_scan_path", "") or "")
+			if "method_var" in w:
+				w["method_var"].set(str(b.get("method", "ransac")))
+			if "scaling_var" in w:
+				w["scaling_var"].set(bool(b.get("enable_scaling", False)))
+			c = self._ankle_color_of(self._ankle_selected_bone)
+			w["color_btn"].configure(bg=c, activebackground=c)
+			mk_ok = b.get("marker_to_bone_T") is not None
+			reg_ok = b.get("reg_T") is not None
+			w["status_lbl"].configure(
+				text=f"マーカー-骨キャリブ: {'済' if mk_ok else '未'} / 位置合わせ: {'済' if reg_ok else '未'}")
+		except Exception:
+			pass
+
+	def _ankle_apply_editor_field(self, key: str, value) -> None:
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		b[key] = value
+		self._ankle_refresh_bone_listbox()
+
+	def _ankle_pick_bone_file(self, key: str, title: str, kind: str) -> None:
+		b = self._ankle_current_bone()
+		if b is None:
+			messagebox.showinfo("骨選択", "先に骨を選択してください。")
+			return
+		if kind == "model":
+			ft = [("3Dモデル", "*.obj *.stl *.ply"), ("すべてのファイル", "*.*")]
+		else:
+			ft = [("すべてのファイル", "*.*")]
+		path = filedialog.askopenfilename(title=title, filetypes=ft)
+		if path:
+			b[key] = path
+			self._ankle_load_editor_from_bone()
+
+	def _ankle_choose_bone_color(self) -> None:
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		i = self._ankle_selected_bone
+		color = colorchooser.askcolor(initialcolor=self._ankle_color_of(i), title=f"{b.get('name','')}の表示色")
+		if color and color[1]:
+			b["color"] = color[1]
+			self._ankle_load_editor_from_bone()
+			self._ankle_refresh_bone_listbox()
+
+	def on_ankle_bone_add(self) -> None:
+		new_bone = self._ankle_default_bone(len(self.ankle_bones))
+		existing = {b.get("name", "") for b in self.ankle_bones}
+		n = len(self.ankle_bones) + 1
+		while new_bone["name"] in existing:
+			n += 1
+			new_bone["name"] = f"骨{n}"
+		existing_ids = {int(b.get("aruco_id", -1)) for b in self.ankle_bones}
+		aid = new_bone["aruco_id"]
+		while aid in existing_ids:
+			aid += 1
+		new_bone["aruco_id"] = aid
+		self.ankle_bones.append(new_bone)
+		self._ankle_selected_bone = len(self.ankle_bones) - 1
+		self._ankle_refresh_bone_listbox()
+
+	def on_ankle_bone_duplicate(self) -> None:
+		b = self._ankle_current_bone()
+		if b is None:
+			messagebox.showinfo("骨複製", "先に骨を選択してください。")
+			return
+		nb = copy.deepcopy(b)
+		existing = {x.get("name", "") for x in self.ankle_bones}
+		base = nb.get("name", "骨")
+		k = 2
+		nb["name"] = f"{base}({k})"
+		while nb["name"] in existing:
+			k += 1
+			nb["name"] = f"{base}({k})"
+		existing_ids = {int(x.get("aruco_id", -1)) for x in self.ankle_bones}
+		aid = int(nb.get("aruco_id", 0))
+		while aid in existing_ids:
+			aid += 1
+		nb["aruco_id"] = aid
+		self.ankle_bones.insert(self._ankle_selected_bone + 1, nb)
+		self._ankle_selected_bone += 1
+		self._ankle_refresh_bone_listbox()
+
+	def on_ankle_bone_delete(self) -> None:
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		if not messagebox.askyesno("骨削除", f"骨「{b.get('name','')}」を削除しますか？"):
+			return
+		del self.ankle_bones[self._ankle_selected_bone]
+		if self._ankle_selected_bone >= len(self.ankle_bones):
+			self._ankle_selected_bone = max(0, len(self.ankle_bones) - 1)
+		self._ankle_refresh_bone_listbox()
+
+	def on_ankle_bone_rename(self) -> None:
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		cur = b.get("name", "")
+		new = simpledialog.askstring("骨名変更", "新しい骨名:", initialvalue=cur, parent=self)
+		if not new:
+			return
+		new = new.strip()
+		if not new:
+			return
+		existing = {x.get("name", "") for i, x in enumerate(self.ankle_bones) if i != self._ankle_selected_bone}
+		if new in existing:
+			messagebox.showwarning("骨名変更", f"「{new}」は既に使われています。")
+			return
+		b["name"] = new
+		self._ankle_refresh_bone_listbox()
+
+	def on_ankle_bone_move(self, delta: int) -> None:
+		i = self._ankle_selected_bone
+		j = i + int(delta)
+		if not (0 <= i < len(self.ankle_bones) and 0 <= j < len(self.ankle_bones)) or i == j:
+			return
+		self.ankle_bones[i], self.ankle_bones[j] = self.ankle_bones[j], self.ankle_bones[i]
+		self._ankle_selected_bone = j
+		self._ankle_refresh_bone_listbox()
+
+	# ---- ankle: 多試験タブ ----
+	def _ankle_state_vars(self) -> dict:
+		return {
+			"ankle_initial_scan": (self.ankle_initial_scan_path, str),
+			"ankle_video": (self.ankle_video_path, str),
+			"ankle_depth": (self.ankle_depth_path, str),
+			"ankle_camera_intrinsics": (self.ankle_camera_intrinsics_path, str),
+			"ankle_aruco_dict": (self.ankle_aruco_dict_var, str),
+			"ankle_marker_size_mm": (self.ankle_marker_size_mm, float),
+			"ankle_pose_series": (self.ankle_pose_series_path, str),
+			"ankle_heatmap_prox": (self.ankle_heatmap_prox_var, str),
+			"ankle_heatmap_dist": (self.ankle_heatmap_dist_var, str),
+			# 位置合わせパラメータ (タブ共通)
+			"ankle_reg_ransac_distance": (self.ankle_reg_ransac_distance, float),
+			"ankle_reg_ransac_max_iter": (self.ankle_reg_ransac_max_iter, int),
+			"ankle_reg_ransac_confidence": (self.ankle_reg_ransac_confidence, float),
+			"ankle_reg_icp_threshold": (self.ankle_reg_icp_threshold, float),
+			"ankle_reg_icp_max_iter": (self.ankle_reg_icp_max_iter, int),
+			"ankle_reg_sample_points": (self.ankle_reg_sample_points, int),
+			"ankle_reg_voxel_size": (self.ankle_reg_voxel_size, float),
+			"ankle_reg_preview_var": (self.ankle_reg_preview_var, bool),
+			# ArUco/PnP検出パラメータ
+			"ankle_ref_frame": (self.ankle_ref_frame, int),
+			"ankle_detect_stride": (self.ankle_detect_stride, int),
+			# D405 ライブ撮影
+			"ankle_rs_resolution": (self.ankle_rs_resolution, str),
+			"ankle_rs_discard_frames": (self.ankle_rs_discard_frames, int),
+			"ankle_rs_manual_exposure": (self.ankle_rs_manual_exposure, bool),
+			"ankle_rs_exposure_val": (self.ankle_rs_exposure_val, int),
+		}
+
+	def _ankle_snapshot_current(self) -> dict:
+		snap = {}
+		for key, (var, _t) in self._ankle_state_vars().items():
+			try:
+				snap[key] = var.get()
+			except Exception:
+				pass
+		snap["_bones"] = copy.deepcopy(self.ankle_bones)
+		snap["_selected_bone"] = int(self._ankle_selected_bone)
+		return snap
+
+	def _ankle_restore_snapshot(self, snap: dict) -> None:
+		if not isinstance(snap, dict):
+			return
+		default = self._ankle_default_snap if isinstance(getattr(self, "_ankle_default_snap", None), dict) else {}
+		for key, (var, typ) in self._ankle_state_vars().items():
+			if key in snap:
+				v = snap[key]
+			elif key in default:
+				v = default[key]
+			else:
+				continue
+			try:
+				if typ is bool:
+					var.set(bool(v))
+				elif typ is int:
+					var.set(int(v))
+				elif typ is float:
+					var.set(float(v))
+				else:
+					var.set(str(v))
+			except Exception:
+				pass
+		bones = snap.get("_bones", None)
+		if isinstance(bones, list):
+			self.ankle_bones = copy.deepcopy(bones)
+		else:
+			self.ankle_bones = []
+		try:
+			self._ankle_selected_bone = int(snap.get("_selected_bone", 0))
+		except Exception:
+			self._ankle_selected_bone = 0
+		if self.ankle_bones and self._ankle_selected_bone >= len(self.ankle_bones):
+			self._ankle_selected_bone = 0
+		self._ankle_refresh_bone_listbox()
+
+	def _ankle_rebuild_tabbar(self) -> None:
+		fr = self._ankle_tabbar_frame
+		if fr is None:
+			return
+		for w in fr.winfo_children():
+			w.destroy()
+		self._ankle_tab_buttons = []
+		for i, tab in enumerate(self._ankle_tabs):
+			active = (i == self._ankle_active_tab)
+			b = tk.Button(
+				fr, text=tab.get('name', f"試験{i+1}"),
+				relief=('sunken' if active else 'raised'),
+				bg=('#cfe3ff' if active else '#f0f0f0'),
+				font=(self.ui_font_family, 9, 'bold' if active else 'normal'),
+				command=lambda i=i: self.on_ankle_tab_select(i), padx=8, pady=2)
+			b.pack(side='left', padx=2)
+			b.bind("<Button-3>", lambda e, i=i: self._ankle_tab_context_menu(e, i))
+			b.bind("<ButtonPress-1>", lambda e, i=i: self._ankle_tab_drag_start(e, i))
+			b.bind("<B1-Motion>", self._ankle_tab_drag_motion)
+			b.bind("<ButtonRelease-1>", self._ankle_tab_drag_release)
+			self._ankle_tab_buttons.append(b)
+		plus = tk.Button(fr, text="＋", command=self.on_ankle_tab_add, padx=6, pady=2)
+		plus.pack(side='left', padx=(8, 2))
+
+	def _ankle_tab_context_menu(self, event, i: int) -> None:
+		menu = tk.Menu(self, tearoff=0)
+		menu.add_command(label="名前変更", command=lambda: self.on_ankle_tab_rename(i))
+		menu.add_command(label="削除", command=lambda: self.on_ankle_tab_delete(i))
+		menu.add_separator()
+		menu.add_command(label="← 左へ移動", command=lambda: self._ankle_tab_move(i, i - 1),
+		                 state=("normal" if i > 0 else "disabled"))
+		menu.add_command(label="→ 右へ移動", command=lambda: self._ankle_tab_move(i, i + 1),
+		                 state=("normal" if i < len(self._ankle_tabs) - 1 else "disabled"))
+		try:
+			menu.tk_popup(event.x_root, event.y_root)
+		finally:
+			menu.grab_release()
+
+	def _ankle_tab_move(self, i: int, j: int) -> None:
+		n = len(self._ankle_tabs)
+		if not (0 <= i < n and 0 <= j < n) or i == j:
+			return
+		tab = self._ankle_tabs.pop(i)
+		self._ankle_tabs.insert(j, tab)
+		a = self._ankle_active_tab
+		if a == i:
+			a = j
+		else:
+			if a > i:
+				a -= 1
+			if a >= j:
+				a += 1
+		self._ankle_active_tab = a
+		self._ankle_rebuild_tabbar()
+
+	def _ankle_tab_drag_start(self, event, i: int) -> None:
+		self._ankle_tab_drag = {"from": i, "x": event.x_root, "moved": False}
+
+	def _ankle_tab_drag_motion(self, event) -> None:
+		d = self._ankle_tab_drag
+		if d is None:
+			return
+		if not d["moved"] and abs(event.x_root - d["x"]) > 12:
+			d["moved"] = True
+			try:
+				event.widget.configure(cursor="sb_h_double_arrow")
+			except Exception:
+				pass
+
+	def _ankle_tab_drag_release(self, event):
+		d = self._ankle_tab_drag
+		self._ankle_tab_drag = None
+		if not d or not d["moved"]:
+			return None
+		try:
+			event.widget.configure(cursor="")
+		except Exception:
+			pass
+		j = self._ankle_tab_index_at(event.x_root)
+		if j is None or j == d["from"]:
+			return None
+		self._ankle_tab_move(d["from"], j)
+		return "break"
+
+	def _ankle_tab_index_at(self, x_root: int):
+		btns = self._ankle_tab_buttons
+		if not btns:
+			return None
+		best = 0
+		for idx, b in enumerate(btns):
+			try:
+				bx = b.winfo_rootx()
+				bw = b.winfo_width()
+			except Exception:
+				continue
+			if x_root >= bx:
+				best = idx
+			if bx <= x_root < bx + bw:
+				return idx
+		return best
+
+	def on_ankle_tab_select(self, i: int) -> None:
+		if i < 0 or i >= len(self._ankle_tabs) or i == self._ankle_active_tab:
+			return
+		self._ankle_tabs[self._ankle_active_tab]['snapshot'] = self._ankle_snapshot_current()
+		self._ankle_active_tab = i
+		self._ankle_restore_snapshot(self._ankle_tabs[i]['snapshot'])
+		self._ankle_rebuild_tabbar()
+		self._ankle_update_detection_status()
+
+	# ④(計測データ)のキー: 新規タブは末尾タブから複製、これらだけリセット
+	_ANKLE_TAB_NO_COPY_KEYS = ("ankle_video", "ankle_depth", "ankle_pose_series")
+
+	def on_ankle_tab_add(self) -> None:
+		if self._ankle_tabs:
+			self._ankle_tabs[self._ankle_active_tab]['snapshot'] = self._ankle_snapshot_current()
+			snap = copy.deepcopy(self._ankle_tabs[-1].get('snapshot') or {})
+			for key in self._ANKLE_TAB_NO_COPY_KEYS:
+				if isinstance(self._ankle_default_snap, dict) and key in self._ankle_default_snap:
+					snap[key] = self._ankle_default_snap[key]
+				else:
+					snap.pop(key, None)
+		else:
+			snap = copy.deepcopy(self._ankle_default_snap or {})
+		self._ankle_tabs.append({'name': self._ankle_unique_tab_name(), 'snapshot': snap})
+		self._ankle_active_tab = len(self._ankle_tabs) - 1
+		self._ankle_restore_snapshot(self._ankle_tabs[self._ankle_active_tab]['snapshot'])
+		self._ankle_rebuild_tabbar()
+
+	def _ankle_unique_tab_name(self, base: str = "試験") -> str:
+		names = {t.get('name', '') for t in self._ankle_tabs}
+		n = len(self._ankle_tabs) + 1
+		while f"{base}{n}" in names:
+			n += 1
+		return f"{base}{n}"
+
+	def on_ankle_tab_delete(self, i: int) -> None:
+		if len(self._ankle_tabs) <= 1:
+			messagebox.showinfo("タブ削除", "最後のタブは削除できません。")
+			return
+		if not messagebox.askyesno("タブ削除", f"タブ「{self._ankle_tabs[i].get('name','')}」を削除しますか？"):
+			return
+		self._ankle_tabs[self._ankle_active_tab]['snapshot'] = self._ankle_snapshot_current()
+		# 削除されるタブの姿勢キャッシュも破棄
+		old_name = self._ankle_tabs[i].get('name', '')
+		if old_name:
+			self._ankle_pose_cache.pop(old_name, None)
+		del self._ankle_tabs[i]
+		if self._ankle_active_tab == i:
+			self._ankle_active_tab = min(i, len(self._ankle_tabs) - 1)
+		elif self._ankle_active_tab > i:
+			self._ankle_active_tab -= 1
+		self._ankle_restore_snapshot(self._ankle_tabs[self._ankle_active_tab]['snapshot'])
+		self._ankle_rebuild_tabbar()
+		self._ankle_update_detection_status()
+
+	def on_ankle_tab_rename(self, i: int) -> None:
+		cur = self._ankle_tabs[i].get('name', '')
+		new = simpledialog.askstring("タブ名変更", "タブ名:", initialvalue=cur, parent=self)
+		if new and new.strip():
+			new = new.strip()
+			others = {t.get('name', '') for k, t in enumerate(self._ankle_tabs) if k != i}
+			if new in others:
+				messagebox.showwarning("タブ名変更", f"「{new}」は既に存在します。")
+				return
+			# 姿勢キャッシュのキーを新名に付け替え
+			if cur in self._ankle_pose_cache:
+				self._ankle_pose_cache[new] = self._ankle_pose_cache.pop(cur)
+			self._ankle_tabs[i]['name'] = new
+			self._ankle_rebuild_tabbar()
+
+	def _ankle_init_tabs(self) -> None:
+		if not self._ankle_tabs:
+			self._ankle_tabs = [{'name': '試験1', 'snapshot': self._ankle_snapshot_current()}]
+			self._ankle_active_tab = 0
+		if self._ankle_active_tab >= len(self._ankle_tabs):
+			self._ankle_active_tab = 0
+		self._ankle_restore_snapshot(self._ankle_tabs[self._ankle_active_tab]['snapshot'])
+		self._ankle_rebuild_tabbar()
+
+	# ---- ankle: 状態永続化 ----
+	def _ankle_state_file_path(self) -> Path:
+		import platform
+		filename = "frs2015_gui_state_ankle_sim.json"
+		if platform.system() == "Darwin":
+			state_dir = Path.home() / ".frs_simulator"
+			state_dir.mkdir(parents=True, exist_ok=True)
+			return state_dir / filename
+		return Path(__file__).with_name(filename)
+
+	def _save_ankle_state(self) -> None:
+		try:
+			if getattr(self, "_ankle_tabs", None):
+				self._ankle_tabs[self._ankle_active_tab]['snapshot'] = self._ankle_snapshot_current()
+		except Exception:
+			pass
+		data = {
+			"tabs": getattr(self, "_ankle_tabs", []),
+			"active": getattr(self, "_ankle_active_tab", 0),
+		}
+		try:
+			p = self._ankle_state_file_path()
+			with p.open("w", encoding="utf-8") as f:
+				json.dump(data, f, ensure_ascii=False, indent=2)
+			print(f"[ankle状態保存] {p}（{len(data['tabs'])}タブ）")
+		except Exception as e:
+			print(f"[ankle状態保存] 失敗: {e}")
+
+	def _load_ankle_state(self) -> None:
+		try:
+			p = self._ankle_state_file_path()
+			if not p.exists():
+				return
+			data = json.load(p.open("r", encoding="utf-8"))
+		except Exception as e:
+			print(f"[ankle状態復元] 失敗: {e}")
+			return
+		if isinstance(data, dict) and isinstance(data.get("tabs"), list) and data["tabs"]:
+			self._ankle_tabs = data["tabs"]
+			try:
+				self._ankle_active_tab = int(data.get("active", 0))
+			except Exception:
+				self._ankle_active_tab = 0
+			if self._ankle_active_tab < 0 or self._ankle_active_tab >= len(self._ankle_tabs):
+				self._ankle_active_tab = 0
+			self._ankle_restore_snapshot(self._ankle_tabs[self._ankle_active_tab].get("snapshot", {}))
+
+	# ---- ankle: Stage 2〜5 プレースホルダ ----
+	def _ankle_not_impl(self, feature: str) -> None:
+		messagebox.showinfo(
+			"未実装",
+			f"「{feature}」は現在Stage 1(UI骨組み)のみ実装済みです。\n"
+			f"次のステージで実装予定:\n"
+			f"  Stage 2 — 骨モデル読込・位置合わせ・静的可視化\n"
+			f"  Stage 3 — ArUco検出+PnPパイプライン\n"
+			f"  Stage 4 — マーカー-骨キャリブレーション\n"
+			f"  Stage 5 — アニメーション・骨対ヒートマップ")
+
+	# ---- Stage 4: マーカー-骨キャリブレーション ----
+	def _ankle_visualize_calibration(self, mesh, picked, T, marker_size_mm: float, title: str) -> None:
+		"""キャリブ結果を可視化: 骨(灰) + ピック点(赤) + 復元マーカー4隅(青枠) + Mk座標軸(RGB)。"""
+		import numpy as np
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title=title, window_size=(int(sw * 0.8), int(sh * 0.8)))
+		plotter.set_background("white")
+		# 骨とスケール
+		try:
+			b = np.array(mesh.bounds).reshape(3, 2)
+			diag = float(np.linalg.norm(b[:, 1] - b[:, 0]))
+			r_sphere = max(diag * 0.005, 0.5)
+		except Exception:
+			r_sphere = 1.0
+		plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True)
+		# ピック点 (赤球+ラベル)
+		for i, pt in enumerate(picked):
+			plotter.add_mesh(pv.Sphere(radius=r_sphere, center=np.asarray(pt)), color="red")
+			plotter.add_point_labels([np.asarray(pt)], [str(i + 1)],
+			                          font_size=16, text_color="red",
+			                          show_points=False, always_visible=True)
+		# 復元マーカー4隅を line で結ぶ
+		obj_pts = self._ankle_marker_obj_points(marker_size_mm)
+		homog = np.hstack([obj_pts, np.ones((4, 1))])
+		corners_L = (np.asarray(T, dtype=float) @ homog.T).T[:, :3]
+		loop = np.vstack([corners_L, corners_L[0:1]])
+		for i in range(4):
+			plotter.add_mesh(pv.Line(loop[i], loop[i + 1]), color="blue", line_width=4)
+		# Mk座標軸 (原点=T[:3,3], X=red, Y=green, Z=blue)
+		axis_len = marker_size_mm * 0.6
+		origin = np.asarray(T[:3, 3], dtype=float)
+		Rmat = np.asarray(T[:3, :3], dtype=float)
+		for j, col in enumerate(("red", "green", "blue")):
+			direction = Rmat[:, j] * axis_len
+			plotter.add_mesh(pv.Arrow(start=origin, direction=direction,
+			                           scale='auto', tip_length=0.15, tip_radius=0.04, shaft_radius=0.015),
+			                 color=col)
+		plotter.add_text(
+			"骨モデル(灰) / ピック点(赤球+番号) / 復元マーカー4隅(青枠) / Mk座標軸(X=R, Y=G, Z=B)",
+			position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	def on_ankle_calibrate_marker_to_bone(self) -> None:
+		"""選択中の骨のモデル上でマーカー4隅をクリック → T_L←Mk を計算し bone['marker_to_bone_T'] に保存。
+
+		前提: 骨モデル(model_path)は試験後スキャンで、マーカー(ArUcoプレート)が骨に取り付いた状態。
+		方式: マーカー4隅の実座標(mm)をユーザーがピック → マーカー座標系での既知4隅と剛体対応付け。
+		結果は Stage 3で使うマーカー座標系→骨ローカル系変換 T_L←Mk (4x4)。
+		"""
+		import numpy as np
+		b = self._ankle_current_bone()
+		if b is None:
+			messagebox.showinfo("マーカー-骨キャリブ", "先に骨を選択してください。")
+			return
+		model_path = str(b.get("model_path", "") or "").strip()
+		if not model_path:
+			messagebox.showwarning("マーカー-骨キャリブ",
+				"骨モデル(試験後スキャン)が未設定です。③で「骨モデル」を選択してください。")
+			return
+		try:
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			marker_size_mm = 20.0
+		if marker_size_mm <= 0:
+			messagebox.showwarning("マーカー-骨キャリブ", "マーカー実寸(mm)を正しく設定してください。")
+			return
+
+		name = b.get("name", "?")
+		messagebox.showinfo(
+			"マーカー-骨キャリブ",
+			f"[{name}] 骨モデル上のArUcoマーカーの4隅を順にクリックしてください。\n\n"
+			f"クリック順序: 左上(TL) → 右上(TR) → 右下(BR) → 左下(BL)\n"
+			f"（マーカー表面を正面から見た向きで）\n\n"
+			f"※ マーカー実寸 = {marker_size_mm:.2f} mm を使用します。\n"
+			f"※ 4点全てクリックしたらウィンドウを閉じてください。")
+
+		try:
+			mesh = pv.read(model_path)
+		except Exception as e:
+			messagebox.showerror("マーカー-骨キャリブ",
+				f"骨モデルの読込に失敗しました:\n{e}"); return
+		if mesh is None or mesh.n_points == 0:
+			messagebox.showerror("マーカー-骨キャリブ", "骨モデルが空です。"); return
+
+		# 膝の点ピッキングを再利用 (PyVistaの surface point picker)
+		picked = self._knee_pick_points(mesh, 4, f"{name}: マーカー4隅 (TL→TR→BR→BL)")
+		if len(picked) < 4:
+			messagebox.showwarning("マーカー-骨キャリブ",
+				f"4点必要ですが {len(picked)} 点しかクリックされていません。やり直してください。")
+			return
+
+		# マーカー座標系での既知4隅 (Stage 3と同じ順 TL,TR,BR,BL, Y下向き)
+		obj_pts_mk = self._ankle_marker_obj_points(marker_size_mm)  # (4,3) float32
+
+		# Umeyama/Kabsch (obj_pts_mk → picked が T_L←Mk)
+		T = self._rigid_from_correspondences(
+			np.asarray(obj_pts_mk, dtype=float),
+			np.asarray(picked, dtype=float),
+			allow_scale=False)
+
+		# 残差 (品質指標)
+		homog = np.hstack([np.asarray(obj_pts_mk, dtype=float), np.ones((4, 1))])
+		predicted_L = (T @ homog.T).T[:, :3]
+		residuals = np.linalg.norm(predicted_L - np.asarray(picked, dtype=float), axis=1)
+		rmse = float(np.sqrt(np.mean(residuals ** 2)))
+		max_r = float(residuals.max())
+
+		# 保存
+		b["marker_to_bone_T"] = T.tolist()
+		self._ankle_refresh_bone_listbox()
+
+		# 品質メッセージ
+		if rmse < 0.5:
+			verdict = "極めて良好"
+		elif rmse < 1.0:
+			verdict = "良好"
+		elif rmse < 2.5:
+			verdict = "許容範囲 (推奨: 再ピッキング)"
+		else:
+			verdict = "要再取得 (RMSEが大きすぎます)"
+		msg = (f"[{name}] マーカー-骨変換 T_L←Mk を保存しました。\n\n"
+		       f"4隅の残差 RMSE = {rmse:.3f} mm\n"
+		       f"最大残差     = {max_r:.3f} mm\n"
+		       f"評価         = {verdict}\n\n"
+		       f"次のダイアログで確認画面を表示します。")
+		messagebox.showinfo(f"{name} キャリブ完了", msg)
+
+		# 確認可視化
+		try:
+			self._ankle_visualize_calibration(
+				mesh, picked, T, marker_size_mm,
+				title=f"{name}: マーカー-骨キャリブ確認")
+		except Exception as e:
+			print(f"[ankle calib] 確認可視化失敗: {e}")
+
+	# ---- Stage 2: 位置合わせ (膝の _knee_register_region を再利用) ----
+	def _ankle_reg_params(self, bone: dict) -> dict:
+		"""指定骨のパラメータdict(タブ共通 + 骨ごとの method/scaling)を返す。"""
+		try:
+			return {
+				"ransac_distance": float(self.ankle_reg_ransac_distance.get()),
+				"ransac_max_iter": int(self.ankle_reg_ransac_max_iter.get()),
+				"ransac_confidence": float(self.ankle_reg_ransac_confidence.get()),
+				"icp_threshold": float(self.ankle_reg_icp_threshold.get()),
+				"icp_max_iter": int(self.ankle_reg_icp_max_iter.get()),
+				"sample_points": int(self.ankle_reg_sample_points.get()),
+				"voxel_size": float(self.ankle_reg_voxel_size.get()),
+				"method": str(bone.get("method", "ransac")),
+				"enable_scaling": bool(bone.get("enable_scaling", False)),
+				"preview": bool(self.ankle_reg_preview_var.get()),
+			}
+		except Exception:
+			return {"method": str(bone.get("method", "ransac"))}
+
+	def _ankle_register_one(self, bone: dict) -> tuple:
+		"""単骨の位置合わせを実行し (T, fit, rmse) を返す。エラーは例外。"""
+		label = bone.get("name", "骨")
+		src = str(bone.get("model_path", "") or "").strip()   # 骨モデル(試験後スキャン, 動かす側)
+		tgt = str(bone.get("post_scan_path", "") or "").strip()  # 初期スキャン側の該当骨領域(合わせる先)
+		if not src:
+			raise ValueError(f"{label}: 骨モデルが選択されていません。")
+		if not tgt:
+			raise ValueError(f"{label}: 位置合わせ先(初期スキャン側 骨領域)が選択されていません。")
+		p = self._ankle_reg_params(bone)
+		method = p.get("method", "ransac")
+		if method == "manual":
+			messagebox.showinfo(
+				"手動3点位置合わせ",
+				f"[{label}] まず『骨モデル』で対応点を3つクリックし、ウィンドウを閉じてください。\n"
+				f"次に『初期スキャン側 骨領域』で、同じ順番・同じ部位の3点をクリックしてください。")
+			src_pts = self._knee_pick_points(pv.read(src), 3, f"{label}: 骨モデル (対応点3つ)")
+			if len(src_pts) < 3:
+				raise ValueError(f"{label}: 骨モデル側の対応点が3つ未満です ({len(src_pts)}点)。")
+			tgt_pts = self._knee_pick_points(pv.read(tgt), 3, f"{label}: 初期スキャン側 骨領域 (同順で3つ)")
+			if len(tgt_pts) < 3:
+				raise ValueError(f"{label}: 初期スキャン側の対応点が3つ未満です ({len(tgt_pts)}点)。")
+			return self._knee_register_region(src, tgt, label, p,
+			                                   manual_src_pts=src_pts, manual_tgt_pts=tgt_pts)
+		return self._knee_register_region(src, tgt, label, p)
+
+	def on_ankle_register_bone(self) -> None:
+		"""選択中の骨だけを位置合わせする。結果は bone['reg_T'] に保存。"""
+		b = self._ankle_current_bone()
+		if b is None:
+			messagebox.showinfo("位置合わせ", "先に骨を選択してください。")
+			return
+		try:
+			T, fit, rmse = self._ankle_register_one(b)
+		except Exception as e:
+			messagebox.showerror("位置合わせエラー", f"{b.get('name','?')}の位置合わせに失敗しました:\n{e}")
+			return
+		b["reg_T"] = np.asarray(T, dtype=float).tolist()
+		self._ankle_refresh_bone_listbox()
+		messagebox.showinfo(
+			f"{b.get('name','')} 位置合わせ完了",
+			f"fitness={fit:.4f} (1に近いほど良好), RMSE={rmse:.4f} mm\n\n"
+			"「位置合わせ結果を確認 (プレビュー)」で重ね合わせを確認できます。")
+
+	def on_ankle_register_all_bones(self) -> None:
+		"""全骨を順に位置合わせ。既に成功した骨はスキップ確認する。"""
+		if not self.ankle_bones:
+			messagebox.showinfo("一括位置合わせ", "骨リストが空です。まず骨を追加してください。")
+			return
+		targets = []
+		for b in self.ankle_bones:
+			label = b.get("name", "骨")
+			if not (b.get("model_path") and b.get("post_scan_path")):
+				print(f"[ankle reg-all] skip {label}: 入力ファイル未設定")
+				continue
+			if b.get("reg_T") is not None:
+				if not messagebox.askyesno("上書き確認",
+					f"骨「{label}」は既に位置合わせ済です。再計算しますか？"):
+					continue
+			targets.append(b)
+		if not targets:
+			messagebox.showinfo("一括位置合わせ", "実行対象の骨がありません。")
+			return
+		results = []
+		for b in targets:
+			label = b.get("name", "骨")
+			try:
+				T, fit, rmse = self._ankle_register_one(b)
+				b["reg_T"] = np.asarray(T, dtype=float).tolist()
+				results.append((label, True, fit, rmse, ""))
+			except Exception as e:
+				results.append((label, False, 0.0, 0.0, str(e)))
+		self._ankle_refresh_bone_listbox()
+		msg = "\n".join(
+			f"{'✓' if ok else '×'} {name}: "
+			+ (f"fitness={fit:.4f}, RMSE={rmse:.4f}mm" if ok else f"失敗 — {err}")
+			for name, ok, fit, rmse, err in results)
+		messagebox.showinfo("一括位置合わせ 結果", msg)
+
+	def on_ankle_preview_registration(self) -> None:
+		"""初期スキャン(灰半透明) + 位置合わせ済み全骨を重ねて表示する。"""
+		scan_path = self.ankle_initial_scan_path.get().strip()
+		if not scan_path:
+			messagebox.showwarning("プレビュー", "①初期状態スキャンを選択してください。")
+			return
+		registered = [b for b in self.ankle_bones if b.get("reg_T") is not None and b.get("model_path")]
+		if not registered:
+			messagebox.showwarning("プレビュー", "位置合わせ済みの骨がありません。先に位置合わせを実行してください。")
+			return
+		try:
+			scan_mesh = pv.read(scan_path)
+		except Exception as e:
+			messagebox.showerror("読み込み失敗", f"初期状態スキャンの読み込みに失敗しました:\n{e}")
+			return
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="ankle: 位置合わせ結果 プレビュー",
+		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
+		plotter.set_background("white")
+		plotter.add_mesh(scan_mesh, color="lightgray", opacity=0.35, smooth_shading=True)
+		names = []
+		for b in registered:
+			try:
+				m = pv.read(b["model_path"])
+				T = np.asarray(b["reg_T"], dtype=float)
+				self._knee_apply_T(m, T)
+				plotter.add_mesh(m, color=self._ankle_color_of(self.ankle_bones.index(b)),
+				                 opacity=1.0, smooth_shading=True)
+				names.append(b.get("name", "?"))
+			except Exception as e:
+				print(f"[ankle preview] {b.get('name','?')} 表示失敗: {e}")
+		plotter.add_text(f"初期スキャン(灰・半透明) + 位置合わせ済み: {', '.join(names)}",
+		                 position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	def on_ankle_register(self) -> None:
+		# 後方互換: プレースホルダーAPI (未使用)
+		self.on_ankle_register_bone()
+
+	# ---- Stage 3: ArUco検出 + PnP パイプライン ----
+	def _ankle_check_cv2(self) -> bool:
+		"""cv2/aruco が使えるか確認。無ければ案内。"""
+		try:
+			import cv2  # noqa: F401
+			import cv2.aruco  # noqa: F401
+			return True
+		except ImportError:
+			messagebox.showerror(
+				"OpenCV未導入",
+				"ArUco検出には opencv-contrib-python が必要です。\n\n"
+				"venv で以下を実行してください:\n"
+				"  pip install opencv-contrib-python")
+			return False
+
+	def _ankle_check_rs(self) -> bool:
+		"""pyrealsense2 (RealSense .bag読込) が使えるか確認。"""
+		try:
+			import pyrealsense2  # noqa: F401
+			return True
+		except ImportError:
+			messagebox.showerror(
+				"pyrealsense2未導入",
+				"RealSense .bag ファイルの読込には pyrealsense2 が必要です。\n\n"
+				"venv で以下を実行してください:\n"
+				"  pip install pyrealsense2\n\n"
+				"※ .bag以外(mp4+depth+json)なら pyrealsense2 は不要です。")
+			return False
+
+	def _ankle_resolve_aruco_dict(self, name: str):
+		"""'DICT_4X4_50' のような名前を cv2 の辞書オブジェクトへ解決。"""
+		import cv2
+		const = getattr(cv2.aruco, name, None)
+		if const is None:
+			raise ValueError(f"未対応のArUco辞書名: {name}")
+		return cv2.aruco.getPredefinedDictionary(const)
+
+	def _ankle_marker_obj_points(self, marker_size_mm: float):
+		"""マーカー座標系での4隅座標 (mm単位)。
+
+		cv2.aruco.detectMarkers の返すコーナー順 (画像座標系で TL→TR→BR→BL, Y下向き)
+		と一致させるため、マーカー座標系も Y下向き (=画像座標系互換) にする。
+		結果: solvePnPで得られる rvec,tvec は「マーカー→カメラ」変換。
+		"""
+		s = float(marker_size_mm) / 2.0
+		import numpy as np
+		return np.array([
+			[-s, -s, 0.0],   # TL
+			[ s, -s, 0.0],   # TR
+			[ s,  s, 0.0],   # BR
+			[-s,  s, 0.0],   # BL
+		], dtype=np.float32)
+
+	def _ankle_make_detector(self, aruco_dict_name: str):
+		"""ArUco Detectorインスタンスを返す (新旧API対応)。"""
+		import cv2
+		dictionary = self._ankle_resolve_aruco_dict(aruco_dict_name)
+		try:
+			params = cv2.aruco.DetectorParameters()
+			# サブピクセル精緻化を有効化
+			try:
+				params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+				params.cornerRefinementWinSize = 5
+				params.cornerRefinementMaxIterations = 30
+				params.cornerRefinementMinAccuracy = 0.01
+			except Exception:
+				pass
+			return cv2.aruco.ArucoDetector(dictionary, params), dictionary, params, True
+		except AttributeError:
+			# 旧API
+			params = cv2.aruco.DetectorParameters_create()
+			return None, dictionary, params, False
+
+	def _ankle_detect_markers_in_frame(self, gray, depth_arr, K, dist,
+	                                   obj_pts, marker_size_mm,
+	                                   depth_scale_mm, target_ids, detector, dictionary, params, use_new_api):
+		"""1フレームでArUcoを検出し、target_ids に含まれるIDだけ姿勢を返す。
+
+		Returns dict {aruco_id: {"pose": 4x4, "reproj_err": float}}
+		"""
+		import cv2
+		import numpy as np
+		if use_new_api and detector is not None:
+			corners, ids, _ = detector.detectMarkers(gray)
+		else:
+			corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
+		out = {}
+		if ids is None:
+			return out
+		for corner, mid_arr in zip(corners, ids):
+			mid = int(mid_arr[0] if hasattr(mid_arr, '__len__') else mid_arr)
+			if mid not in target_ids:
+				continue
+			img_pts = corner.reshape(-1, 2).astype(np.float64)
+			obj_pts_f64 = np.asarray(obj_pts, dtype=np.float64)
+			# solvePnPGeneric + IPPE で平面マーカーの両姿勢解を取得
+			# 注: cv2 5.0.0 の SOLVEPNP_IPPE_SQUARE には結果が不正になる不具合がある。
+			# 汎用の SOLVEPNP_IPPE は同じく2解を返し、正常動作する。
+			try:
+				retval, rvecs, tvecs, reproj = cv2.solvePnPGeneric(
+					obj_pts_f64, img_pts, K, dist, flags=cv2.SOLVEPNP_IPPE)
+				num_sols = int(retval) if retval else len(rvecs)
+			except Exception:
+				ok, rvec, tvec = cv2.solvePnP(obj_pts_f64, img_pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+				if not ok:
+					continue
+				rvecs = [rvec]; tvecs = [tvec]; reproj = np.zeros((1, 1), dtype=np.float32); num_sols = 1
+			# 深度で表裏を選ぶ
+			best_idx = 0
+			best_score = float("inf")
+			for si in range(num_sols):
+				R_mat, _ = cv2.Rodrigues(rvecs[si])
+				tv = np.asarray(tvecs[si], dtype=np.float64).flatten()
+				corners_cam = (R_mat @ obj_pts.T).T + tv   # (4,3) mm
+				pred_depth = corners_cam[:, 2]              # mm
+				observed = []
+				H, W = depth_arr.shape[:2]
+				for pt in img_pts:
+					u, v = int(round(pt[0])), int(round(pt[1]))
+					if 0 <= u < W and 0 <= v < H:
+						d_raw = float(depth_arr[v, u])
+						if d_raw > 0:
+							observed.append(d_raw * depth_scale_mm)
+							continue
+					observed.append(np.nan)
+				observed = np.array(observed)
+				mask = ~np.isnan(observed)
+				if mask.sum() >= 2:
+					score = float(np.sqrt(np.mean((pred_depth[mask] - observed[mask]) ** 2)))
+				else:
+					score = float(reproj[si].item()) if hasattr(reproj[si], 'item') else float(reproj[si])
+				if score < best_score:
+					best_score = score
+					best_idx = si
+			R_mat, _ = cv2.Rodrigues(rvecs[best_idx])
+			tv = np.asarray(tvecs[best_idx], dtype=np.float64).flatten()
+			T = np.eye(4)
+			T[:3, :3] = R_mat
+			T[:3, 3] = tv
+			try:
+				err_val = float(reproj[best_idx].item())
+			except Exception:
+				err_val = float(reproj[best_idx])
+			out[mid] = {"pose": T, "reproj_err": err_val, "depth_score": best_score}
+		return out
+
+	def _ankle_detect_from_bag(self, bag_path: str, aruco_dict_name: str,
+	                            marker_size_mm: float, target_ids: set,
+	                            stride: int, progress_cb, cancel_check) -> dict:
+		"""RealSense .bag から色/深度を読み、ArUco姿勢時系列を返す。"""
+		import cv2
+		import numpy as np
+		import pyrealsense2 as rs
+		obj_pts = self._ankle_marker_obj_points(marker_size_mm)
+		detector, dictionary, params, use_new_api = self._ankle_make_detector(aruco_dict_name)
+
+		pipeline = rs.pipeline()
+		config = rs.config()
+		rs.config.enable_device_from_file(config, bag_path, repeat_playback=False)
+		config.enable_stream(rs.stream.color)
+		config.enable_stream(rs.stream.depth)
+		profile = pipeline.start(config)
+		try:
+			playback = profile.get_device().as_playback()
+			playback.set_real_time(False)
+		except Exception:
+			playback = None
+
+		color_profile = profile.get_stream(rs.stream.color)
+		intr = color_profile.as_video_stream_profile().get_intrinsics()
+		K = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]], dtype=np.float64)
+		dist = np.array(intr.coeffs, dtype=np.float64)
+		depth_sensor = profile.get_device().first_depth_sensor()
+		depth_scale = float(depth_sensor.get_depth_scale())
+		depth_scale_mm = depth_scale * 1000.0
+
+		align = rs.align(rs.stream.color)
+
+		poses = {aid: [] for aid in target_ids}
+		detected = {aid: [] for aid in target_ids}
+		reproj = {aid: [] for aid in target_ids}
+		timestamps = []
+		frame_idx = 0
+		processed = 0
+		try:
+			while True:
+				if cancel_check and cancel_check():
+					break
+				try:
+					frames = pipeline.wait_for_frames(timeout_ms=2000)
+				except RuntimeError:
+					break  # EOF
+				aligned = align.process(frames)
+				color = aligned.get_color_frame()
+				depth = aligned.get_depth_frame()
+				if not color or not depth:
+					break
+				if frame_idx % max(stride, 1) != 0:
+					frame_idx += 1
+					continue
+				rgb = np.asanyarray(color.get_data())
+				depth_arr = np.asanyarray(depth.get_data())
+				timestamps.append(color.get_timestamp() / 1000.0)
+				gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if rgb.ndim == 3 else rgb
+				det = self._ankle_detect_markers_in_frame(
+					gray, depth_arr, K, dist, obj_pts, marker_size_mm,
+					depth_scale_mm, target_ids, detector, dictionary, params, use_new_api)
+				for aid in target_ids:
+					if aid in det:
+						poses[aid].append(det[aid]["pose"])
+						detected[aid].append(True)
+						reproj[aid].append(det[aid]["reproj_err"])
+					else:
+						poses[aid].append(np.full((4, 4), np.nan))
+						detected[aid].append(False)
+						reproj[aid].append(float("nan"))
+				processed += 1
+				frame_idx += 1
+				if progress_cb and processed % 5 == 0:
+					progress_cb(processed, frame_idx, timestamps[-1] if timestamps else 0.0)
+		finally:
+			try:
+				pipeline.stop()
+			except Exception:
+				pass
+
+		return {
+			"frame_count": len(timestamps),
+			"timestamps": np.array(timestamps, dtype=np.float64),
+			"intrinsics": {"fx": float(intr.fx), "fy": float(intr.fy),
+			                "cx": float(intr.ppx), "cy": float(intr.ppy),
+			                "width": int(intr.width), "height": int(intr.height),
+			                "dist": [float(x) for x in intr.coeffs],
+			                "depth_scale_mm": float(depth_scale_mm)},
+			"marker_size_mm": float(marker_size_mm),
+			"aruco_dict": aruco_dict_name,
+			"source": str(bag_path),
+			"bones": {aid: {"poses": np.array(poses[aid]),
+			                 "detected": np.array(detected[aid]),
+			                 "reproj_err": np.array(reproj[aid])}
+			           for aid in target_ids},
+		}
+
+	def _ankle_load_intrinsics_json(self, path: str) -> tuple:
+		"""JSON/YAML から (K, dist, depth_scale_mm) を読み込む。
+		期待キー: fx, fy, cx, cy, dist(list), depth_scale_mm (mm/unit)"""
+		import numpy as np
+		p = Path(path)
+		ext = p.suffix.lower()
+		with p.open("r", encoding="utf-8") as f:
+			if ext in (".yaml", ".yml"):
+				try:
+					import yaml
+					data = yaml.safe_load(f)
+				except ImportError:
+					raise ValueError("YAML読込には pyyaml が必要です。")
+			else:
+				data = json.load(f)
+		K = np.array([[float(data["fx"]), 0, float(data["cx"])],
+		              [0, float(data["fy"]), float(data["cy"])],
+		              [0, 0, 1]], dtype=np.float64)
+		dist = np.array([float(x) for x in data.get("dist", [0, 0, 0, 0, 0])], dtype=np.float64)
+		depth_scale_mm = float(data.get("depth_scale_mm", 1.0))  # デフォルト: raw値=mm
+		return K, dist, depth_scale_mm
+
+	def _ankle_detect_from_video(self, video_path: str, depth_path: str, intrinsics_path: str,
+	                              aruco_dict_name: str, marker_size_mm: float, target_ids: set,
+	                              stride: int, progress_cb, cancel_check) -> dict:
+		"""mp4/avi + 深度npz + 内部パラメータjson から検出する汎用パス。
+
+		深度npz は 'frames' キーで (N, H, W) 配列(uint16 raw or float32 mm)。
+		"""
+		import cv2
+		import numpy as np
+		K, dist, depth_scale_mm = self._ankle_load_intrinsics_json(intrinsics_path)
+		obj_pts = self._ankle_marker_obj_points(marker_size_mm)
+		detector, dictionary, params, use_new_api = self._ankle_make_detector(aruco_dict_name)
+
+		cap = cv2.VideoCapture(video_path)
+		if not cap.isOpened():
+			raise ValueError(f"動画を開けません: {video_path}")
+		fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+
+		depth_npz = np.load(depth_path)
+		if "frames" not in depth_npz.files:
+			raise ValueError(f"npzに 'frames' キーがありません: {depth_path}")
+		depth_frames = depth_npz["frames"]
+
+		poses = {aid: [] for aid in target_ids}
+		detected = {aid: [] for aid in target_ids}
+		reproj = {aid: [] for aid in target_ids}
+		timestamps = []
+		frame_idx = 0
+		processed = 0
+		while True:
+			if cancel_check and cancel_check():
+				break
+			ok, rgb = cap.read()
+			if not ok:
+				break
+			if frame_idx >= len(depth_frames):
+				break
+			if frame_idx % max(stride, 1) != 0:
+				frame_idx += 1
+				continue
+			depth_arr = depth_frames[frame_idx]
+			gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+			timestamps.append(frame_idx / fps)
+			det = self._ankle_detect_markers_in_frame(
+				gray, depth_arr, K, dist, obj_pts, marker_size_mm,
+				depth_scale_mm, target_ids, detector, dictionary, params, use_new_api)
+			for aid in target_ids:
+				if aid in det:
+					poses[aid].append(det[aid]["pose"])
+					detected[aid].append(True)
+					reproj[aid].append(det[aid]["reproj_err"])
+				else:
+					poses[aid].append(np.full((4, 4), np.nan))
+					detected[aid].append(False)
+					reproj[aid].append(float("nan"))
+			processed += 1
+			frame_idx += 1
+			if progress_cb and processed % 5 == 0:
+				progress_cb(processed, frame_idx, timestamps[-1])
+		cap.release()
+
+		return {
+			"frame_count": len(timestamps),
+			"timestamps": np.array(timestamps, dtype=np.float64),
+			"intrinsics": {"fx": float(K[0, 0]), "fy": float(K[1, 1]),
+			                "cx": float(K[0, 2]), "cy": float(K[1, 2]),
+			                "width": int(rgb.shape[1]) if rgb is not None else 0,
+			                "height": int(rgb.shape[0]) if rgb is not None else 0,
+			                "dist": [float(x) for x in dist],
+			                "depth_scale_mm": float(depth_scale_mm)},
+			"marker_size_mm": float(marker_size_mm),
+			"aruco_dict": aruco_dict_name,
+			"source": str(video_path),
+			"bones": {aid: {"poses": np.array(poses[aid]),
+			                 "detected": np.array(detected[aid]),
+			                 "reproj_err": np.array(reproj[aid])}
+			           for aid in target_ids},
+		}
+
+	# ---- 進捗ダイアログ ----
+	def _ankle_open_progress(self, title: str):
+		"""検出用の進捗ダイアログを開き、更新用closureを返す。"""
+		win = tk.Toplevel(self)
+		win.title(title)
+		win.transient(self)
+		win.geometry("+%d+%d" % (self.winfo_rootx() + 60, self.winfo_rooty() + 60))
+		tk.Label(win, text=title, font=(self.ui_font_family, 10, "bold")).pack(padx=12, pady=(10, 4))
+		status_var = tk.StringVar(value="開始中…")
+		tk.Label(win, textvariable=status_var, width=52, anchor="w").pack(padx=12, pady=2)
+		pbar = ttk.Progressbar(win, mode="indeterminate", length=380)
+		pbar.pack(padx=12, pady=(4, 4))
+		pbar.start(80)
+		self._ankle_detect_cancel = False
+		def _cancel():
+			self._ankle_detect_cancel = True
+			status_var.set("キャンセル要求…完了を待機中")
+		tk.Button(win, text="キャンセル", command=_cancel).pack(padx=12, pady=(4, 10))
+		win.protocol("WM_DELETE_WINDOW", _cancel)
+		def update(processed, frame_idx, t_sec):
+			status_var.set(f"処理済 {processed} フレーム (元frame_idx={frame_idx}, t≈{t_sec:.2f}s)")
+			win.update_idletasks()
+		def close():
+			try:
+				pbar.stop()
+				win.destroy()
+			except Exception:
+				pass
+		return update, close, lambda: self._ankle_detect_cancel
+
+	# ---- キャッシュ (per-tab) ヘルパ ----
+	def _ankle_current_tab_key(self) -> str:
+		if not self._ankle_tabs:
+			return ""
+		return self._ankle_tabs[self._ankle_active_tab].get("name", "")
+
+	def _ankle_get_current_cache(self):
+		return self._ankle_pose_cache.get(self._ankle_current_tab_key())
+
+	def _ankle_set_current_cache(self, cache) -> None:
+		key = self._ankle_current_tab_key()
+		if not key:
+			return
+		if cache is None:
+			self._ankle_pose_cache.pop(key, None)
+		else:
+			self._ankle_pose_cache[key] = cache
+
+	def _ankle_cache_status_text(self, cache) -> str:
+		if not cache:
+			return "(未実行)"
+		N = int(cache.get("frame_count", 0))
+		bones = cache.get("bones", {}) or {}
+		lines = [f"検出完了: {N}フレーム / ソース={Path(str(cache.get('source',''))).name}"]
+		for aid, b in sorted(bones.items()):
+			det = b.get("detected", None)
+			if det is None or len(det) == 0:
+				continue
+			rate = 100.0 * float(det.sum()) / len(det)
+			re = b.get("reproj_err", None)
+			re_med = ""
+			if re is not None and len(re) > 0:
+				import numpy as np
+				valid = re[~np.isnan(re)] if hasattr(re, 'dtype') else np.array([r for r in re if r == r])
+				if len(valid) > 0:
+					re_med = f", 再投影誤差(中央値)={float(np.median(valid)):.2f}px"
+			lines.append(f"  ID={aid}: 検出率 {rate:.1f}%{re_med}")
+		return "\n".join(lines)
+
+	def _ankle_update_detection_status(self) -> None:
+		try:
+			self.ankle_detection_status.set(self._ankle_cache_status_text(self._ankle_get_current_cache()))
+		except Exception:
+			pass
+
+	# ---- UIアクション ----
+	def on_ankle_detect_markers(self) -> None:
+		"""現在の入力に基づき ArUco検出+PnPを実行する。"""
+		if not self._ankle_check_cv2():
+			return
+		# 骨リストからArUco IDを収集
+		target_ids = set()
+		for b in self.ankle_bones:
+			try:
+				target_ids.add(int(b.get("aruco_id", -1)))
+			except Exception:
+				pass
+		target_ids.discard(-1)
+		if not target_ids:
+			messagebox.showwarning("検出", "骨リストが空、またはArUco IDが未設定です。③でIDを設定してください。")
+			return
+		aruco_dict_name = self.ankle_aruco_dict_var.get()
+		try:
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			marker_size_mm = 20.0
+		if marker_size_mm <= 0:
+			messagebox.showwarning("検出", "マーカー実寸(mm)を正しく入力してください。")
+			return
+		try:
+			stride = max(1, int(self.ankle_detect_stride.get()))
+		except Exception:
+			stride = 1
+
+		# --- ソース選択ダイアログ (キャンセルなら②の設定を使用) ---
+		# .db3/.bag なら 単独ソース、.mp4等なら②の深度+内部パラメータと組み合わせ
+		cur_depth = self.ankle_depth_path.get().strip()
+		cur_video = self.ankle_video_path.get().strip()
+		_initial = cur_depth or cur_video
+		if _initial:
+			_initdir = str(Path(_initial).parent)
+			_initfile = Path(_initial).name
+		else:
+			_initdir = str(Path(__file__).parent / "cache")
+			_initfile = ""
+		picked = filedialog.askopenfilename(
+			title="ArUco検出のソースを選択 (キャンセルで②の設定を使用)",
+			initialdir=_initdir,
+			initialfile=_initfile,
+			filetypes=[
+				("すべての対応形式", "*.db3 *.bag *.mp4 *.avi *.mov *.mkv"),
+				("RealSense録画 (単独ソース)", "*.db3 *.bag"),
+				("動画のみ (深度+内部パラメータは②で指定)", "*.mp4 *.avi *.mov *.mkv"),
+				("すべてのファイル", "*.*"),
+			])
+		if picked:
+			_ext = Path(picked).suffix.lower()
+			if _ext in (".db3", ".bag"):
+				# RealSense録画 → 深度パスにセット (色/深度/内部パラメータ全部内包)
+				self.ankle_depth_path.set(picked)
+				print(f"[ankle detect] ソース更新: 深度データ (.db3/.bag) = {picked}")
+			elif _ext in (".mp4", ".avi", ".mov", ".mkv"):
+				self.ankle_video_path.set(picked)
+				print(f"[ankle detect] ソース更新: RGBビデオ = {picked}")
+			else:
+				# 不明な拡張子: とりあえず深度データに入れる (ユーザー判断)
+				self.ankle_depth_path.set(picked)
+				print(f"[ankle detect] ソース更新: 深度データ (未知拡張子) = {picked}")
+
+		video = self.ankle_video_path.get().strip()
+		depth = self.ankle_depth_path.get().strip()
+		intr = self.ankle_camera_intrinsics_path.get().strip()
+
+		# 入力形式の判定 (.bag / .db3 なら pyrealsense2、それ以外は mp4+npz+json)
+		use_bag = False
+		bag_path = ""
+		_RS_EXTS = (".bag", ".db3")
+		if depth.lower().endswith(_RS_EXTS):
+			use_bag = True; bag_path = depth
+		elif video.lower().endswith(_RS_EXTS):
+			use_bag = True; bag_path = video
+
+		if use_bag:
+			if not self._ankle_check_rs():
+				return
+			if not Path(bag_path).exists():
+				messagebox.showwarning("検出", f"ファイルが見つかりません: {bag_path}"); return
+			update_cb, close_cb, cancel_cb = self._ankle_open_progress(f"ArUco検出中 (bag): {Path(bag_path).name}")
+			try:
+				cache = self._ankle_detect_from_bag(
+					bag_path, aruco_dict_name, marker_size_mm, target_ids, stride, update_cb, cancel_cb)
+			except Exception as e:
+				close_cb()
+				messagebox.showerror("検出エラー", f"検出処理でエラーが発生しました:\n{e}")
+				return
+			close_cb()
+		else:
+			# 汎用パス: 動画 + 深度npz + 内部パラメータjson
+			missing = [n for n, v in (("RGBビデオ", video), ("深度データ", depth), ("内部パラメータ", intr)) if not v]
+			if missing:
+				messagebox.showwarning("検出", "以下が未指定です: " + ", ".join(missing)); return
+			for label, p in (("ビデオ", video), ("深度", depth), ("内部パラメータ", intr)):
+				if not Path(p).exists():
+					messagebox.showwarning("検出", f"{label}ファイルが見つかりません: {p}"); return
+			update_cb, close_cb, cancel_cb = self._ankle_open_progress(f"ArUco検出中: {Path(video).name}")
+			try:
+				cache = self._ankle_detect_from_video(
+					video, depth, intr, aruco_dict_name, marker_size_mm, target_ids, stride, update_cb, cancel_cb)
+			except Exception as e:
+				close_cb()
+				messagebox.showerror("検出エラー", f"検出処理でエラーが発生しました:\n{e}")
+				return
+			close_cb()
+
+		# キャッシュ保存 + ステータス更新
+		self._ankle_set_current_cache(cache)
+		self._ankle_update_detection_status()
+		messagebox.showinfo("検出完了", self._ankle_cache_status_text(cache))
+
+	# ---- 姿勢時系列 保存/読込 (.npz) ----
+	def _ankle_save_pose_cache_npz(self, path: str, cache: dict) -> None:
+		"""キャッシュを .npz に保存。"""
+		import numpy as np
+		payload = {}
+		payload["timestamps"] = cache["timestamps"]
+		meta = {k: v for k, v in cache.items() if k not in ("timestamps", "bones")}
+		payload["meta_json"] = np.array(json.dumps(meta, ensure_ascii=False), dtype=object)
+		for aid, b in cache["bones"].items():
+			prefix = f"id_{int(aid)}_"
+			payload[prefix + "poses"] = b["poses"]
+			payload[prefix + "detected"] = b["detected"]
+			payload[prefix + "reproj_err"] = b["reproj_err"]
+		np.savez_compressed(path, **payload)
+
+	def _ankle_load_pose_cache_npz(self, path: str) -> dict:
+		"""'.npz' から姿勢キャッシュを読み込む。"""
+		import numpy as np
+		data = np.load(path, allow_pickle=True)
+		meta = json.loads(str(data["meta_json"].item()))
+		cache = dict(meta)
+		cache["timestamps"] = data["timestamps"]
+		cache["bones"] = {}
+		ids = set()
+		for key in data.files:
+			if key.startswith("id_") and key.endswith("_poses"):
+				aid = int(key.split("_")[1])
+				ids.add(aid)
+		for aid in sorted(ids):
+			prefix = f"id_{aid}_"
+			cache["bones"][aid] = {
+				"poses": data[prefix + "poses"],
+				"detected": data[prefix + "detected"],
+				"reproj_err": data[prefix + "reproj_err"],
+			}
+		return cache
+
+	def on_ankle_visualize_pose_series(self) -> None:
+		"""検出済み姿勢時系列 T_C←Mk(t) を3D軌跡としてPyVistaで表示 (骨モデル・スキャン不要)。
+
+		用途: スキャナ無しでの追跡動作確認。マーカーがカメラ座標系でどう動いたかが見える。
+		"""
+		import numpy as np
+		cache = self._ankle_get_current_cache()
+		if not cache:
+			messagebox.showwarning("マーカー軌跡",
+				"姿勢時系列がありません。先に「ArUco検出+PnP実行」または「姿勢時系列を読込」してください。")
+			return
+		bones_cache = cache.get("bones", {}) or {}
+		if not bones_cache:
+			messagebox.showwarning("マーカー軌跡", "検出データがありません。")
+			return
+
+		# 骨リストから ID → 名前/色 の対応表を作る
+		id_to_idx = {}
+		for i, b in enumerate(self.ankle_bones):
+			try:
+				id_to_idx[int(b.get("aruco_id", -1))] = i
+			except Exception:
+				pass
+
+		# マーカー位置範囲を把握 (軸長さ推定用)
+		all_pts = []
+		trajectories = []  # [(aid, name, color, pts_all, detected)]
+		for aid_raw, b in bones_cache.items():
+			aid = int(aid_raw)
+			poses = np.asarray(b.get("poses", []))
+			detected = np.asarray(b.get("detected", []))
+			if poses.size == 0 or len(detected) == 0:
+				continue
+			pts = poses[:, :3, 3]   # (N, 3)  未検出フレームはNaNのはず
+			pts_det = pts[detected]
+			if len(pts_det) == 0:
+				continue
+			idx = id_to_idx.get(aid)
+			if idx is not None and 0 <= idx < len(self.ankle_bones):
+				name = self.ankle_bones[idx].get("name", f"ID{aid}")
+				color = self._ankle_color_of(idx)
+			else:
+				name = f"ID{aid}"
+				color = self._ANKLE_DEFAULT_BONE_COLORS[aid % len(self._ANKLE_DEFAULT_BONE_COLORS)]
+			trajectories.append((aid, name, color, pts, detected))
+			all_pts.append(pts_det)
+
+		if not trajectories:
+			messagebox.showwarning("マーカー軌跡", "検出フレームが1つもありません。検出率0%です。")
+			return
+
+		all_arr = np.vstack(all_pts)
+		bbox_min = all_arr.min(axis=0); bbox_max = all_arr.max(axis=0)
+		diag = float(np.linalg.norm(bbox_max - bbox_min))
+		axis_len = max(diag * 0.15, 30.0)
+		sphere_r = max(diag * 0.005, 1.5)
+
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="ankle: マーカー軌跡 (T_C←Mk, カメラ系, mm)",
+		                     window_size=(int(sw * 0.85), int(sh * 0.85)))
+		plotter.set_background("white")
+
+		# カメラ座標軸 (原点=カメラ)
+		origin = np.zeros(3)
+		for j, col in enumerate(("red", "green", "blue")):
+			direction = np.zeros(3); direction[j] = axis_len
+			plotter.add_mesh(
+				pv.Arrow(start=origin, direction=direction, scale='auto',
+				         tip_length=0.15, tip_radius=0.04, shaft_radius=0.015),
+				color=col)
+		plotter.add_mesh(pv.Sphere(radius=sphere_r * 1.5, center=origin), color="black")
+		plotter.add_point_labels([origin], ["Camera"], font_size=14,
+		                          text_color="black", show_points=False, always_visible=True)
+
+		summary_lines = ["マーカー軌跡 (カメラ座標系, mm)", "軸: X=赤, Y=緑, Z=青(奥)"]
+		# 各マーカーの軌跡
+		for aid, name, color, pts, detected in trajectories:
+			pts_det = pts[detected]
+			if len(pts_det) < 2:
+				# 単一点だけならスフィアだけ
+				plotter.add_mesh(pv.Sphere(radius=sphere_r, center=pts_det[0]), color=color)
+				continue
+			line = pv.lines_from_points(pts_det)
+			plotter.add_mesh(line, color=color, line_width=2)
+			# 始点/終点
+			plotter.add_mesh(pv.Sphere(radius=sphere_r, center=pts_det[0]), color=color)
+			plotter.add_mesh(pv.Sphere(radius=sphere_r * 1.3, center=pts_det[-1]), color=color)
+			plotter.add_point_labels([pts_det[0]], [f"{name} (start)"], font_size=11,
+			                          text_color=color, show_points=False, always_visible=True)
+			# 統計
+			rate = 100.0 * float(np.sum(detected)) / len(detected)
+			span = float(np.linalg.norm(pts_det.max(axis=0) - pts_det.min(axis=0)))
+			summary_lines.append(f"  ID={aid} ({name}): 検出率{rate:.1f}%, 移動範囲={span:.1f}mm")
+
+		plotter.add_text("\n".join(summary_lines), position="upper_left",
+		                 font_size=10, color="black")
+		plotter.show()
+
+	def on_ankle_save_marker_pdf(self) -> None:
+		"""骨リストのマーカーを A4 PDF (物理実寸で印刷可能) にまとめて保存する。
+
+		PDFはページに物理サイズが埋め込まれるので、PDFビューアで「実際のサイズ / 100%」
+		で印刷すれば必ず指定mmになる。PNGの「ページに合わせる」自動拡大バグを回避。
+		"""
+		import numpy as np
+		if not self._ankle_check_cv2():
+			return
+		if not self.ankle_bones:
+			messagebox.showinfo("マーカーPDF", "骨リストが空です。③でまず骨を追加してください。")
+			return
+		items = []
+		for b in self.ankle_bones:
+			try:
+				aid = int(b.get("aruco_id", -1))
+			except Exception:
+				continue
+			if aid < 0:
+				continue
+			items.append((aid, str(b.get("name", "")).strip()))
+		if not items:
+			messagebox.showinfo("マーカーPDF", "有効なArUco IDがありません。")
+			return
+		aruco_dict_name = self.ankle_aruco_dict_var.get()
+		try:
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			marker_size_mm = 20.0
+		if marker_size_mm <= 0 or marker_size_mm > 200:
+			messagebox.showwarning("マーカーPDF", "マーカー実寸は0〜200mmの範囲で指定してください。")
+			return
+		try:
+			import matplotlib
+			matplotlib.use('Agg')
+			import matplotlib.pyplot as plt
+			from matplotlib.backends.backend_pdf import PdfPages
+		except ImportError:
+			messagebox.showerror("マーカーPDF",
+				"matplotlibが必要です。venvで pip install matplotlib を実行してください。")
+			return
+		import cv2
+		try:
+			dictionary = self._ankle_resolve_aruco_dict(aruco_dict_name)
+		except Exception as e:
+			messagebox.showerror("マーカーPDF", f"辞書解決失敗: {e}"); return
+		path = filedialog.asksaveasfilename(
+			title="マーカーPDF 保存先",
+			defaultextension=".pdf",
+			initialfile=f"aruco_markers_{marker_size_mm:.0f}mm_{aruco_dict_name}.pdf",
+			filetypes=[("PDF", "*.pdf"), ("すべてのファイル", "*.*")])
+		if not path:
+			return
+		# A4 (mm) / インチ変換
+		A4_MM = (210.0, 297.0)
+		A4_INCH = (A4_MM[0] / 25.4, A4_MM[1] / 25.4)
+		# 各マーカー領域: quiet zone(マーカー20%相当) + ラベル
+		quiet_zone_mm = max(marker_size_mm * 0.2, 3.0)
+		cell_mm = marker_size_mm + 2 * quiet_zone_mm
+		label_h_mm = 6.0
+		unit_w_mm = cell_mm
+		unit_h_mm = cell_mm + label_h_mm
+		margin_mm = 12.0
+		usable_w = A4_MM[0] - 2 * margin_mm
+		usable_h = A4_MM[1] - 2 * margin_mm - 8   # 上部の説明分
+		n_col = max(1, int(usable_w // unit_w_mm))
+		n_row = max(1, int(usable_h // unit_h_mm))
+		per_page = n_col * n_row
+		# マーカー描画解像度 (高いほうがエッジきれい)
+		render_px = 600
+		n_pages = 0
+		try:
+			with PdfPages(path) as pdf:
+				idx = 0
+				while idx < len(items):
+					n_pages += 1
+					fig = plt.figure(figsize=A4_INCH)
+					# ページ上部の説明
+					fig.text(0.5, 0.98,
+					         f"ArUco {aruco_dict_name} — 実寸 {marker_size_mm:.1f}mm — "
+					         f"「実際のサイズ / 100%」で印刷 ({n_pages}ページ)",
+					         ha='center', va='top', fontsize=9)
+					for pos in range(per_page):
+						if idx >= len(items):
+							break
+						aid, name = items[idx]
+						mimg = cv2.aruco.generateImageMarker(dictionary, aid, render_px)
+						row = pos // n_col
+						col = pos % n_col
+						# A4座標系 (左下原点, mm)
+						x_mm = margin_mm + col * unit_w_mm
+						y_top_mm = A4_MM[1] - margin_mm - 8 - row * unit_h_mm
+						y_mm = y_top_mm - unit_h_mm
+						# マーカー本体 (quiet zoneの内側に配置)
+						mx = x_mm + quiet_zone_mm
+						my = y_mm + label_h_mm + quiet_zone_mm
+						ax = fig.add_axes([
+							mx / A4_MM[0],
+							my / A4_MM[1],
+							marker_size_mm / A4_MM[0],
+							marker_size_mm / A4_MM[1],
+						])
+						ax.imshow(mimg, cmap='gray', vmin=0, vmax=255, interpolation='nearest')
+						ax.axis('off')
+						# 外枠 (切り取り目安)
+						cut_ax = fig.add_axes([
+							x_mm / A4_MM[0],
+							y_mm / A4_MM[1],
+							cell_mm / A4_MM[0],
+							cell_mm / A4_MM[1] + label_h_mm / A4_MM[1] * 0.3,
+						])
+						cut_ax.axis('off')
+						cut_ax.set_xlim(0, 1); cut_ax.set_ylim(0, 1)
+						cut_ax.plot([0, 1, 1, 0, 0], [0, 0, 1, 1, 0],
+						            color='#cccccc', linewidth=0.5, linestyle=(0, (2, 2)))
+						# ラベル
+						label = f"ID={aid}"
+						if name:
+							label += f"  ({name})"
+						label += f"  {marker_size_mm:.1f}mm"
+						label_ax = fig.add_axes([
+							x_mm / A4_MM[0],
+							y_mm / A4_MM[1],
+							cell_mm / A4_MM[0],
+							label_h_mm / A4_MM[1],
+						])
+						label_ax.axis('off')
+						label_ax.text(0.5, 0.5, label, ha='center', va='center', fontsize=7)
+						idx += 1
+					pdf.savefig(fig)
+					plt.close(fig)
+		except Exception as e:
+			messagebox.showerror("マーカーPDF", f"PDF生成失敗: {e}"); return
+		messagebox.showinfo(
+			"マーカーPDF 保存完了",
+			f"{len(items)} 個のマーカーを {n_pages} ページの PDF に保存しました。\n\n"
+			f"ファイル: {path}\n"
+			f"辞書:     {aruco_dict_name}\n"
+			f"実寸:     {marker_size_mm:.1f} mm\n"
+			f"配置:     {n_col} × {n_row} = {per_page} 個/ページ\n\n"
+			f"【印刷方法 — 重要】\n"
+			f"1. PDFを Adobe Reader / Chrome / Edge で開く\n"
+			f"2. 印刷設定で「実際のサイズ」または「カスタムスケール 100%」を選択\n"
+			f"   ・「ページに合わせる」「フィット」は絶対にOFF\n"
+			f"3. レーザープリンタ + マット紙 で印刷\n"
+			f"4. 印刷後、ノギスでマーカー実寸を確認 → ②の値に反映\n"
+			f"5. quiet zone (外枠内の白余白) は切らずに残す")
+
+	def on_ankle_save_marker_images(self) -> None:
+		"""骨リストのArUco IDに対応する印刷用マーカー画像(PNG)をまとめて保存する。"""
+		import numpy as np
+		if not self._ankle_check_cv2():
+			return
+		if not self.ankle_bones:
+			messagebox.showinfo("マーカー画像",
+				"骨リストが空です。③でまず骨を追加してArUco IDを設定してください。")
+			return
+		# ID + 骨名を収集
+		items = []
+		for b in self.ankle_bones:
+			try:
+				aid = int(b.get("aruco_id", -1))
+			except Exception:
+				continue
+			if aid < 0:
+				continue
+			items.append((aid, str(b.get("name", "")).strip()))
+		if not items:
+			messagebox.showinfo("マーカー画像", "有効なArUco IDが設定された骨がありません。")
+			return
+		aruco_dict_name = self.ankle_aruco_dict_var.get()
+		try:
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			marker_size_mm = 20.0
+		out_dir = filedialog.askdirectory(title="マーカー画像の保存先を選択")
+		if not out_dir:
+			return
+		import cv2
+		try:
+			dictionary = self._ankle_resolve_aruco_dict(aruco_dict_name)
+		except Exception as e:
+			messagebox.showerror("マーカー画像", f"辞書解決失敗: {e}"); return
+		# マーカー本体600px + 白余白(quiet zone)100px → 全体800px
+		marker_px = 600
+		pad = 100
+		total_px = marker_px + 2 * pad
+		saved = []
+		errs = []
+		for aid, name in items:
+			try:
+				mimg = cv2.aruco.generateImageMarker(dictionary, aid, marker_px)
+				canvas = np.full((total_px, total_px), 255, dtype=np.uint8)
+				canvas[pad:pad + marker_px, pad:pad + marker_px] = mimg
+				name_safe = ("_" + "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name)) if name else ""
+				fname = f"aruco_{aruco_dict_name}_id{aid:03d}{name_safe}.png"
+				fpath = Path(out_dir) / fname
+				cv2.imwrite(str(fpath), canvas)
+				saved.append((aid, name, fname))
+			except Exception as e:
+				errs.append((aid, str(e)))
+		lines = [f"{len(saved)} 個のマーカー画像を保存しました。",
+		         "",
+		         f"保存先: {out_dir}",
+		         f"辞書:   {aruco_dict_name}",
+		         f"目標実寸: {marker_size_mm:.2f} mm",
+		         "",
+		         "保存ファイル:"]
+		for a, n, f in saved:
+			lines.append(f"  ID={a:3d}{('  ('+n+')') if n else ''}: {f}")
+		if errs:
+			lines.append("")
+			lines.append("失敗:")
+			for a, e in errs:
+				lines.append(f"  ID={a}: {e}")
+		lines += [
+			"",
+			"【印刷手順 / 重要】",
+			"1. レーザープリンタ + マット紙 (光沢紙はNG)",
+			f"2. マーカー実寸 = {marker_size_mm:.2f} mm になるよう印刷スケールを調整",
+			"   (PNG外寸 800px、マーカー本体 600px / 800px)",
+			"3. 印刷後にノギスで実測 → ②の「マーカー実寸(mm)」に反映",
+			"4. マーカー外周の白部分 (quiet zone) は切らずに残す",
+			"5. 剥がれ防止に透明フィルムでラミネート推奨"]
+		messagebox.showinfo("マーカー画像 保存完了", "\n".join(lines))
+
+	def on_ankle_save_pose_series(self) -> None:
+		cache = self._ankle_get_current_cache()
+		if not cache:
+			messagebox.showinfo("保存", "保存する姿勢時系列がありません。先に「ArUco検出+PnP実行」してください。")
+			return
+		path = filedialog.asksaveasfilename(
+			title="姿勢時系列を保存 (.npz)",
+			defaultextension=".npz",
+			filetypes=[("NPZファイル", "*.npz"), ("すべてのファイル", "*.*")])
+		if not path:
+			return
+		try:
+			self._ankle_save_pose_cache_npz(path, cache)
+		except Exception as e:
+			messagebox.showerror("保存エラー", f"保存に失敗しました:\n{e}"); return
+		self.ankle_pose_series_path.set(path)
+		messagebox.showinfo("保存完了", f"保存しました:\n{path}")
+
+	def on_ankle_load_pose_series(self) -> None:
+		path = self.ankle_pose_series_path.get().strip() or filedialog.askopenfilename(
+			title="姿勢時系列を読込 (.npz)",
+			filetypes=[("NPZファイル", "*.npz"), ("すべてのファイル", "*.*")])
+		if not path:
+			return
+		if not Path(path).exists():
+			messagebox.showwarning("読込", f"ファイルが見つかりません: {path}"); return
+		try:
+			cache = self._ankle_load_pose_cache_npz(path)
+		except Exception as e:
+			messagebox.showerror("読込エラー", f"読込に失敗しました:\n{e}"); return
+		self._ankle_set_current_cache(cache)
+		self.ankle_pose_series_path.set(path)
+		self._ankle_update_detection_status()
+		messagebox.showinfo("読込完了", self._ankle_cache_status_text(cache))
+
+	def on_ankle_visualize_initial(self) -> None:
+		"""初期状態スキャンだけをPyVistaで表示する。"""
+		scan_path = self.ankle_initial_scan_path.get().strip()
+		if not scan_path:
+			messagebox.showwarning("可視化", "①初期状態スキャンを選択してください。")
+			return
+		try:
+			scan_mesh = pv.read(scan_path)
+		except Exception as e:
+			messagebox.showerror("読み込み失敗", f"初期状態スキャンの読み込みに失敗しました:\n{e}")
+			return
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="ankle: 初期状態スキャン",
+		                     window_size=(int(sw * 0.85), int(sh * 0.85)))
+		plotter.set_background("white")
+		plotter.add_mesh(scan_mesh, color="lightgray", smooth_shading=True)
+		plotter.add_text(f"初期状態スキャン: {Path(scan_path).name}",
+		                 position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	def on_ankle_visualize_all(self) -> None:
+		"""位置合わせ済みの全骨(モデル→W系)と、任意で初期スキャン(灰半透明)を重ねて表示。"""
+		registered = [b for b in self.ankle_bones if b.get("reg_T") is not None and b.get("model_path")]
+		if not registered:
+			messagebox.showwarning("全骨可視化",
+				"位置合わせ済みの骨がありません。まず③で位置合わせを実行してください。\n"
+				"(参考: 「初期状態を可視化」なら位置合わせ不要です)")
+			return
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="ankle: 全骨(位置合わせ済み・W系)",
+		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
+		plotter.set_background("white")
+		scan_path = self.ankle_initial_scan_path.get().strip()
+		if scan_path:
+			try:
+				plotter.add_mesh(pv.read(scan_path), color="lightgray", opacity=0.25, smooth_shading=True)
+			except Exception as e:
+				print(f"[ankle vis-all] 初期スキャン表示失敗: {e}")
+		names = []
+		for b in registered:
+			try:
+				m = pv.read(b["model_path"])
+				T = np.asarray(b["reg_T"], dtype=float)
+				self._knee_apply_T(m, T)
+				plotter.add_mesh(m, color=self._ankle_color_of(self.ankle_bones.index(b)),
+				                 opacity=1.0, smooth_shading=True)
+				names.append(b.get("name", "?"))
+			except Exception as e:
+				print(f"[ankle vis-all] {b.get('name','?')} 表示失敗: {e}")
+		plotter.add_text(f"全骨(W系, 位置合わせ済み): {', '.join(names)}",
+		                 position="upper_left", font_size=10, color="black")
+		plotter.show()
+
+	# ---- Stage 5: 骨アニメーション + 骨対ヒートマップ ----
+	def _ankle_heatmap_bone_indices(self):
+		"""ヒートマップ用の骨A/骨B (ankle_bones上のindex) を返す。未選択は None。"""
+		def parse(label: str):
+			label = (label or "").strip()
+			if not label or label == "(未選択)":
+				return None
+			# 「N. 骨名」 → N-1
+			try:
+				return int(label.split(".", 1)[0]) - 1
+			except Exception:
+				return None
+		return parse(self.ankle_heatmap_prox_var.get()), parse(self.ankle_heatmap_dist_var.get())
+
+	def _ankle_pick_reference_pose(self, poses, detected, ref_frame: int):
+		"""参照フレーム(t=0)の姿勢を選ぶ。指定frameが検出失敗なら最近傍の検出済みfromへフォールバック。"""
+		import numpy as np
+		N = len(detected)
+		if N == 0:
+			return None, -1
+		ref = max(0, min(int(ref_frame), N - 1))
+		if bool(detected[ref]):
+			return np.asarray(poses[ref], dtype=float), ref
+		# 前後探索
+		for d in range(1, N):
+			for k in (ref - d, ref + d):
+				if 0 <= k < N and bool(detected[k]):
+					return np.asarray(poses[k], dtype=float), k
+		return None, -1
+
+	def _ankle_build_bone_transforms(self, cache: dict):
+		"""キャッシュ+骨リストから、各骨の T_W←bone(t) 時系列を構築する。
+
+		Returns:
+		    animatable: list of (bone_idx, mesh_L(pv.PolyData), T_series(N,4,4))
+		    frame_count: int (共通フレーム数)
+		    warnings: list[str]
+		"""
+		import numpy as np
+		N = int(cache.get("frame_count", 0))
+		if N == 0:
+			return [], 0, ["キャッシュにフレームがありません"]
+		ref = int(self.ankle_ref_frame.get())
+		warnings = []
+		animatable = []
+		bones_cache = cache.get("bones", {}) or {}
+		for idx, bone in enumerate(self.ankle_bones):
+			name = bone.get("name", f"骨{idx+1}")
+			aid = int(bone.get("aruco_id", -1))
+			if aid not in bones_cache:
+				warnings.append(f"{name} (ID={aid}): 姿勢時系列にIDなし → スキップ")
+				continue
+			if bone.get("reg_T") is None:
+				warnings.append(f"{name}: 位置合わせ未実行 → スキップ")
+				continue
+			if not bone.get("model_path"):
+				warnings.append(f"{name}: 骨モデル未設定 → スキップ")
+				continue
+			try:
+				mesh_L = pv.read(bone["model_path"])
+			except Exception as e:
+				warnings.append(f"{name}: モデル読込失敗 ({e}) → スキップ")
+				continue
+			reg_T = np.asarray(bone["reg_T"], dtype=float)
+			b = bones_cache[aid]
+			poses = np.asarray(b["poses"], dtype=float)  # (N,4,4) 未検出はNaN
+			detected = np.asarray(b["detected"], dtype=bool)
+			if len(poses) != N or len(detected) != N:
+				warnings.append(f"{name}: 姿勢時系列のフレーム数不一致 → スキップ")
+				continue
+			T0, ref_used = self._ankle_pick_reference_pose(poses, detected, ref)
+			if T0 is None:
+				warnings.append(f"{name}: 参照フレームで検出無し(全フレーム未検出) → スキップ")
+				continue
+			try:
+				T0_inv = np.linalg.inv(T0)
+			except np.linalg.LinAlgError:
+				warnings.append(f"{name}: 参照姿勢が特異 → スキップ")
+				continue
+			if ref_used != ref:
+				warnings.append(f"{name}: 参照フレーム{ref}未検出 → 代替フレーム{ref_used}を使用")
+			# 各フレームの T_W←bone(t) を計算 (未検出は直前保持)
+			Ts = np.zeros((N, 4, 4), dtype=float)
+			last_valid = reg_T.copy()   # 参照姿勢では delta=I なので T = reg_T
+			for t in range(N):
+				if detected[t]:
+					delta = poses[t] @ T0_inv
+					Ts[t] = delta @ reg_T
+					last_valid = Ts[t]
+				else:
+					Ts[t] = last_valid
+			animatable.append((idx, mesh_L, Ts))
+		return animatable, N, warnings
+
+	def _ankle_apply_T_to_mesh(self, mesh, T):
+		"""pvメッシュに4x4同次変換を適用してW系配置したコピーを返す。"""
+		import numpy as np
+		m = mesh.copy()
+		if m.n_points > 0:
+			pts = np.hstack([m.points, np.ones((m.n_points, 1))])
+			m.points = (np.asarray(T, dtype=float) @ pts.T).T[:, :3]
+		return m
+
+	def _ankle_signed_distance_A_to_B(self, mesh_A_W, mesh_B_W):
+		"""A の各頂点から B の三角メッシュへの符号付き距離 (mm)。
+		open3d BVH を毎フレーム構築する簡易実装 (MVP)。"""
+		import numpy as np
+		try:
+			import open3d as o3d
+		except ImportError:
+			return None
+		mb = mesh_B_W
+		if not isinstance(mb, pv.PolyData):
+			mb = mb.extract_surface()
+		mb = mb.triangulate()
+		verts = np.asarray(mb.points, dtype=np.float32)
+		faces_raw = np.asarray(mb.faces)
+		if faces_raw.size < 4:
+			return None
+		faces = faces_raw.reshape(-1, 4)[:, 1:4].astype(np.int32)
+		scene = o3d.t.geometry.RaycastingScene()
+		scene.add_triangles(o3d.t.geometry.TriangleMesh(
+			o3d.core.Tensor(verts, o3d.core.float32),
+			o3d.core.Tensor(faces, o3d.core.int32)))
+		pts_A = np.asarray(mesh_A_W.points, dtype=np.float32)
+		sd = scene.compute_signed_distance(o3d.core.Tensor(pts_A, o3d.core.float32)).numpy()
+		return np.asarray(sd, dtype=np.float32)
+
+	def on_ankle_animate(self) -> None:
+		"""ArUco姿勢時系列と骨位置合わせから、N骨のアニメーション + 骨対ヒートマップを表示する。"""
+		import numpy as np
+		# 1. 前提チェック
+		cache = self._ankle_get_current_cache()
+		if not cache:
+			messagebox.showwarning("シミュレーション",
+				"姿勢時系列がありません。④で「ArUco検出+PnP実行」または「姿勢時系列を読込」してください。")
+			return
+		if not self.ankle_bones:
+			messagebox.showwarning("シミュレーション", "骨リストが空です。")
+			return
+		# 2. 骨ごとに W系姿勢時系列を構築
+		animatable, N, warns = self._ankle_build_bone_transforms(cache)
+		if not animatable:
+			messagebox.showwarning("シミュレーション",
+				"アニメ可能な骨がありません。\n\n" + "\n".join(warns))
+			return
+		if warns:
+			print("[ankle animate] 警告:\n  " + "\n  ".join(warns))
+
+		# 3. ヒートマップ骨対の解決
+		prox_i, dist_i = self._ankle_heatmap_bone_indices()
+		bone_indices_in_anim = {idx for (idx, _, _) in animatable}
+		heatmap_enabled = (prox_i is not None and dist_i is not None
+		                   and prox_i in bone_indices_in_anim and dist_i in bone_indices_in_anim
+		                   and prox_i != dist_i)
+		if (prox_i is not None or dist_i is not None) and not heatmap_enabled:
+			print(f"[ankle animate] ヒートマップ対が無効 (prox={prox_i}, dist={dist_i}) → ヒートマップなしで表示")
+
+		# 4. Plotter 準備
+		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+		plotter = pv.Plotter(title="ankle: シミュレーション",
+		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
+		plotter.set_background("white")
+
+		# 骨アクター (SetUserMatrixで高速更新)
+		# 初期 = 参照フレームの姿勢 (=reg_T)。ここに時刻tの delta を掛ける。
+		anim_map = {idx: (mesh_L, Ts) for (idx, mesh_L, Ts) in animatable}
+		actors = {}
+		anim_first_T_inv = {}
+		for idx, mesh_L, Ts in animatable:
+			# 初期姿勢 = Ts[0] を適用したコピーをVTKに渡す
+			m0 = self._ankle_apply_T_to_mesh(mesh_L, Ts[0])
+			color = self._ankle_color_of(idx)
+			actor = plotter.add_mesh(m0, color=color, opacity=1.0, smooth_shading=True, show_edges=False)
+			actors[idx] = actor
+			anim_first_T_inv[idx] = np.linalg.inv(Ts[0])
+
+		# 初期スキャン(半透明) — 参考表示
+		scan_path = self.ankle_initial_scan_path.get().strip()
+		if scan_path:
+			try:
+				plotter.add_mesh(pv.read(scan_path), color="lightgray", opacity=0.15, smooth_shading=True)
+			except Exception as e:
+				print(f"[ankle animate] 初期スキャン表示失敗: {e}")
+
+		# 5. ヒートマップアクター準備
+		heatmap_actor = None
+		heatmap_cache = {}  # frame -> distances(N_A,)
+		if heatmap_enabled:
+			mesh_A_L, Ts_A = anim_map[prox_i]
+			mesh_B_L, Ts_B = anim_map[dist_i]
+			# 骨A の初期姿勢メッシュを用意 (scalarsだけ毎フレーム更新する)
+			ha_mesh0 = self._ankle_apply_T_to_mesh(mesh_A_L, Ts_A[0])
+			ha_mesh0['distance'] = np.zeros(ha_mesh0.n_points, dtype=np.float32)
+			CLIM_LO, CLIM_HI = -10.0, 0.0
+			try:
+				from matplotlib.colors import LinearSegmentedColormap
+				hm_cmap = LinearSegmentedColormap.from_list(
+					'contact_pen',
+					[(0.0, (0.75, 0.0, 0.0)),   # -10mm: 赤
+					 (0.5, (1.0, 0.6, 0.0)),
+					 (1.0, (0.1, 0.75, 0.1))])  # 0mm(接触): 緑
+			except Exception:
+				hm_cmap = 'RdYlGn'
+			heatmap_actor = plotter.add_mesh(
+				ha_mesh0, scalars='distance', cmap=hm_cmap, clim=[CLIM_LO, CLIM_HI],
+				opacity=1.0, show_edges=False, label='Heatmap')
+			# 離間(範囲外)は透明
+			try:
+				lut = heatmap_actor.GetMapper().GetLookupTable()
+				lut.SetUseAboveRangeColor(True)
+				lut.SetAboveRangeColor(0.0, 0.0, 0.0, 0.0)
+			except Exception:
+				pass
+			# Z-fighting対策
+			try:
+				mp = heatmap_actor.GetMapper()
+				mp.SetResolveCoincidentTopologyToPolygonOffset()
+				mp.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
+				heatmap_actor.ForceTranslucentOn()
+			except Exception:
+				pass
+
+		# 6. UserMatrix 適用ヘルパ (VTKのSetUserMatrix)
+		def _apply_matrix(actor, T4):
+			import vtk
+			m = vtk.vtkMatrix4x4()
+			for i in range(4):
+				for j in range(4):
+					m.SetElement(i, j, float(T4[i, j]))
+			try:
+				actor.SetUserMatrix(m)
+			except Exception:
+				# fallback: vertex copy
+				pass
+
+		# 7. スライダーコールバック
+		info_text = plotter.add_text("", position='upper_left', font_size=10, color='black')
+		def on_frame(value):
+			t = int(round(float(value)))
+			t = max(0, min(t, N - 1))
+			# 各骨のアクターに (T(t) * inv(T(0))) を適用 (初期姿勢からの累積差分)
+			for idx, actor in actors.items():
+				Ts = anim_map[idx][1]
+				dT = Ts[t] @ anim_first_T_inv[idx]
+				_apply_matrix(actor, dT)
+			# ヒートマップ更新
+			if heatmap_enabled and heatmap_actor is not None:
+				distances = heatmap_cache.get(t)
+				if distances is None:
+					mesh_A_L, Ts_A = anim_map[prox_i]
+					mesh_B_L, Ts_B = anim_map[dist_i]
+					mA = self._ankle_apply_T_to_mesh(mesh_A_L, Ts_A[t])
+					mB = self._ankle_apply_T_to_mesh(mesh_B_L, Ts_B[t])
+					distances = self._ankle_signed_distance_A_to_B(mA, mB)
+					if distances is None:
+						distances = np.zeros(mA.n_points, dtype=np.float32)
+					heatmap_cache[t] = distances
+				# heatmap_actor の scalars を更新 + アクター自体は骨Aと同じ動き
+				pd = heatmap_actor.GetMapper().GetInput()
+				pd.GetPointData().GetScalars().Modified()
+				# distances 配列をコピー
+				arr = pd.GetPointData().GetScalars()
+				for i in range(len(distances)):
+					arr.SetValue(i, float(distances[i]))
+				arr.Modified()
+				Ts_A = anim_map[prox_i][1]
+				dT_A = Ts_A[t] @ anim_first_T_inv[prox_i]
+				_apply_matrix(heatmap_actor, dT_A)
+			# 情報テキスト
+			ts = cache.get("timestamps", None)
+			t_sec = float(ts[t]) if (ts is not None and len(ts) > t) else t / 30.0
+			try:
+				info_text.SetText(0, f"Frame {t}/{N-1}  (t={t_sec:.3f}s)")
+			except Exception:
+				pass
+			try:
+				plotter.render()
+			except Exception:
+				pass
+
+		plotter.add_slider_widget(
+			on_frame, [0, max(N - 1, 1)], value=0, title="Frame",
+			pointa=(0.15, 0.06), pointb=(0.85, 0.06))
+		on_frame(0)
+		plotter.show()
+
+	# ---- RealSense D405 ライブ撮影 (友人スクリプトのUXを踏襲、出力は .bag) ----
+	def _ankle_rs_parse_resolution(self):
+		"""'1280x720@15' → (W, H, fps) を返す。"""
+		s = str(self.ankle_rs_resolution.get()).strip()
+		try:
+			wh, fps = s.split("@")
+			w, h = wh.split("x")
+			return int(w), int(h), int(fps)
+		except Exception:
+			return 1280, 720, 15
+
+	def _ankle_rs_configure_depth_exposure(self, depth_sensor):
+		"""深度センサーの露光を設定 (友人 make_date_movie_D405.py と同じロジック)。"""
+		import pyrealsense2 as rs
+		try:
+			if bool(self.ankle_rs_manual_exposure.get()):
+				if depth_sensor.supports(rs.option.enable_auto_exposure):
+					depth_sensor.set_option(rs.option.enable_auto_exposure, 0)
+				if depth_sensor.supports(rs.option.exposure):
+					depth_sensor.set_option(rs.option.exposure, float(self.ankle_rs_exposure_val.get()))
+					print(f"[ankle rs] Depth Exposure = {int(self.ankle_rs_exposure_val.get())} (手動)")
+				else:
+					print("[ankle rs] 警告: 手動露光がサポートされていません")
+			elif depth_sensor.supports(rs.option.enable_auto_exposure):
+				depth_sensor.set_option(rs.option.enable_auto_exposure, 1)
+				print("[ankle rs] Depth Auto Exposure ON")
+		except Exception as e:
+			print(f"[ankle rs] 露光設定エラー: {e}")
+
+	def on_ankle_rs_test_connection(self) -> None:
+		"""D405の接続を確認し、シリアル/内部パラメータ/深度スケールを表示。"""
+		if not self._ankle_check_rs():
+			return
+		import pyrealsense2 as rs
+		import numpy as np  # noqa: F401
+		w, h, fps = self._ankle_rs_parse_resolution()
+		self.ankle_rs_status.set(f"接続中… ({w}x{h}@{fps})")
+		self.update_idletasks()
+		pipeline = rs.pipeline()
+		config = rs.config()
+		try:
+			config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+			config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
+			profile = pipeline.start(config)
+		except Exception as e:
+			self.ankle_rs_status.set("(接続失敗)")
+			messagebox.showerror("接続確認 失敗",
+				f"D405を起動できませんでした:\n{e}\n\n"
+				"別のアプリがカメラを掴んでいる/USBが弱い/解像度非対応 の可能性があります。")
+			return
+		info_lines = []
+		try:
+			dev = profile.get_device()
+			try:
+				name = dev.get_info(rs.camera_info.name)
+				info_lines.append(f"デバイス: {name}")
+			except Exception:
+				pass
+			try:
+				serial = dev.get_info(rs.camera_info.serial_number)
+				info_lines.append(f"シリアル: {serial}")
+			except Exception:
+				pass
+			try:
+				fw = dev.get_info(rs.camera_info.firmware_version)
+				info_lines.append(f"ファームウェア: {fw}")
+			except Exception:
+				pass
+			depth_sensor = dev.first_depth_sensor()
+			ds = float(depth_sensor.get_depth_scale())
+			info_lines.append(f"Depth Scale: {ds:.6f} m/unit (= {ds*1000:.4f} mm/unit)")
+			color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+			intr = color_profile.get_intrinsics()
+			info_lines.append(f"RGB内部: fx={intr.fx:.1f}, fy={intr.fy:.1f}, "
+			                  f"cx={intr.ppx:.1f}, cy={intr.ppy:.1f}, {intr.width}x{intr.height}")
+			info_lines.append(f"歪み係数: {[round(c,5) for c in intr.coeffs]}")
+		finally:
+			try:
+				pipeline.stop()
+			except Exception:
+				pass
+		text = "\n".join(info_lines) if info_lines else "(情報取得なし)"
+		self.ankle_rs_status.set("接続OK: " + " / ".join(info_lines[:2]) if info_lines else "接続OK")
+		messagebox.showinfo("D405 接続確認 OK", text)
+
+	def _ankle_rs_run_preview_and_record(self, bag_path: str) -> tuple:
+		"""2フェーズ撮影: (1)プレビュー→開始で(2)録画→停止。
+
+		操作: **tk Toplevelコントロールパネル** の [録画開始/停止] [キャンセル] ボタン、
+		     または SPACE / ESC (パネルにフォーカスがあるとき)、
+		     または cv2 の動画ウィンドウで SPACE / ESC (cv2にフォーカスがあるとき)、
+		     または cv2 ウィンドウの × 。
+
+		bind_all を使わないのは、それが「元のボタン」のSPACE=invoke を防げないため。
+		Toplevelを最前面+focus_forceで表示し、Toplevel自身に bind することで
+		「元ボタンにSPACEが誤って行く」問題を根本回避する。
+
+		Returns: (success: bool, frame_count: int, error_msg: str or None)
+		"""
+		if not self._ankle_check_rs():
+			return False, 0, "pyrealsense2 が利用不可"
+		try:
+			import cv2
+			import pyrealsense2 as rs
+			import numpy as np
+		except Exception as e:
+			return False, 0, f"依存インポート失敗: {e}"
+
+		w, h, fps = self._ankle_rs_parse_resolution()
+
+		# --- Toplevel コントロールパネル ---
+		self._ankle_rs_action = None   # None / "space" / "escape"
+
+		panel = tk.Toplevel(self)
+		panel.title("D405 撮影コントロール")
+		panel.transient(self)
+		try:
+			panel.attributes("-topmost", True)
+		except Exception:
+			pass
+		# 位置: メインウィンドウの右上寄り
+		try:
+			px = self.winfo_rootx() + max(self.winfo_width() - 320, 40)
+			py = self.winfo_rooty() + 80
+			panel.geometry(f"300x220+{px}+{py}")
+		except Exception:
+			panel.geometry("300x220")
+
+		state_var = tk.StringVar(value="準備中…")
+		action_btn_text = tk.StringVar(value="録画開始 (SPACE)")
+
+		tk.Label(panel, text="D405 撮影コントロール",
+		         font=(self.ui_font_family, 10, "bold")).pack(pady=(10, 4))
+		tk.Label(panel, textvariable=state_var, fg="#005580",
+		         font=(self.ui_font_family, 9)).pack(pady=(0, 8))
+		action_btn = tk.Button(panel, textvariable=action_btn_text, width=22, height=2,
+		                        bg="#e0f0ff", relief="raised",
+		                        command=lambda: (setattr(self, "_ankle_rs_action", "space")))
+		action_btn.pack(pady=4)
+		cancel_btn = tk.Button(panel, text="キャンセル / 停止 (ESC)", width=22, height=1,
+		                        command=lambda: (setattr(self, "_ankle_rs_action", "escape")))
+		cancel_btn.pack(pady=(2, 6))
+		tk.Label(panel,
+		         text="cv2の×またはSPACE/ESCキーでも操作可",
+		         fg="gray", font=(self.ui_font_family, 8)).pack(pady=(2, 4))
+
+		# キーバインド (Toplevel限定 — bind_allしないので元ボタンに漏れない)
+		panel.bind("<space>", lambda e: (setattr(self, "_ankle_rs_action", "space")))
+		panel.bind("<Escape>", lambda e: (setattr(self, "_ankle_rs_action", "escape")))
+		# パネルの×ボタン
+		panel.protocol("WM_DELETE_WINDOW",
+		                lambda: setattr(self, "_ankle_rs_action", "escape"))
+
+		# 表示 + フォーカス強奪 (元ボタンからフォーカスを奪う)
+		panel.update_idletasks()
+		try:
+			panel.focus_force()
+		except Exception:
+			pass
+
+		def _consume_action() -> str:
+			"""Toplevel/ボタン/cv2 キーの3経路から action を取り出す (取れなければ '')。"""
+			a = self._ankle_rs_action
+			if a:
+				self._ankle_rs_action = None
+				return a
+			try:
+				k = cv2.waitKey(1) & 0xFF
+			except Exception:
+				k = 255
+			if k == 27:
+				return "escape"
+			if k == ord(" "):
+				return "space"
+			return ""
+
+		def _window_closed(name: str) -> bool:
+			try:
+				return cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1.0
+			except Exception:
+				return False
+
+		WIN_COLOR = "D405 color"
+		WIN_DEPTH = "D405 depth"
+		WIN_REC = "D405 REC"
+		WIN_ARUCO = "D405 ArUco tracking (pose axes)"
+
+		def _cleanup_panel():
+			try: panel.destroy()
+			except Exception: pass
+
+		# =============== 単一パイプライン方式 ===============
+		# 前回まで Phase 1→ Phase 2 でpipeline を stop→ start していたが、
+		# pyrealsense2 の内部リソース解放が間に合わず Python がクラッシュする問題があった。
+		# 対策: 最初から enable_record_to_file(bag_path) で pipeline を1本だけ起動し、
+		#      recorder.pause()/resume() で「書き込むかどうか」だけ切り替える。
+		#      これで pipeline は途中で stop/start されず、クラッシュしない。
+		self.ankle_rs_status.set(f"起動中… ({w}x{h}@{fps})")
+		state_var.set(f"起動中… ({w}x{h}@{fps})")
+		action_btn_text.set("録画開始 (SPACE)")
+		try:
+			action_btn.configure(bg="#e0f0ff")
+		except Exception:
+			pass
+		self.update_idletasks()
+
+		pipeline = rs.pipeline()
+		config = rs.config()
+		try:
+			config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+			config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
+			config.enable_record_to_file(bag_path)
+			profile = pipeline.start(config)
+		except Exception as e:
+			_cleanup_panel()
+			return False, 0, f"パイプライン起動失敗: {e}"
+
+		# recorder を取得して直ちに pause (書き込ませない=preview 状態)
+		recorder = None
+		try:
+			recorder = profile.get_device().as_recorder()
+			recorder.pause()
+		except Exception as e:
+			print(f"[ankle rs] recorder取得/pause失敗: {e}")
+
+		# ウィンドウ
+		try:
+			cv2.namedWindow(WIN_COLOR, cv2.WINDOW_NORMAL)
+			cv2.namedWindow(WIN_DEPTH, cv2.WINDOW_NORMAL)
+		except Exception:
+			pass
+
+		colorizer = rs.colorizer()
+		align = rs.align(rs.stream.color)
+		start_record = False
+		cancelled = False
+		frame_count = 0
+		recording = False   # True になったら書き込み中
+
+		# ---- 録画中に表示映像 (オーバーレイ込み) を MP4 でも自動保存 ----
+		# .db3 と同じフォルダ・同じベース名に _color.mp4 / _depth.mp4 / _aruco.mp4 を出す
+		bag_p = Path(bag_path)
+		mp4_color_path = str(bag_p.with_name(bag_p.stem + "_color.mp4"))
+		mp4_depth_path = str(bag_p.with_name(bag_p.stem + "_depth.mp4"))
+		mp4_aruco_path = str(bag_p.with_name(bag_p.stem + "_aruco.mp4"))
+		video_writer_color = None
+		video_writer_depth = None
+		video_writer_aruco = None
+		_MP4_FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
+
+		def _ensure_video_writers(w_px: int, h_px: int, fps_hint: float):
+			"""録画開始直後の1フレーム目でwriterを初期化する (フレームサイズが確定してから)。"""
+			nonlocal video_writer_color, video_writer_depth
+			if video_writer_color is None:
+				try:
+					video_writer_color = cv2.VideoWriter(
+						mp4_color_path, _MP4_FOURCC, float(fps_hint), (int(w_px), int(h_px)))
+					if not video_writer_color.isOpened():
+						print(f"[ankle rs] color mp4 writer失敗 → 無効化")
+						video_writer_color = None
+				except Exception as e:
+					print(f"[ankle rs] color mp4 writer例外: {e}")
+					video_writer_color = None
+			if video_writer_depth is None:
+				try:
+					video_writer_depth = cv2.VideoWriter(
+						mp4_depth_path, _MP4_FOURCC, float(fps_hint), (int(w_px), int(h_px)))
+					if not video_writer_depth.isOpened():
+						print(f"[ankle rs] depth mp4 writer失敗 → 無効化")
+						video_writer_depth = None
+				except Exception as e:
+					print(f"[ankle rs] depth mp4 writer例外: {e}")
+					video_writer_depth = None
+
+		def _ensure_aruco_video_writer(w_px: int, h_px: int, fps_hint: float):
+			nonlocal video_writer_aruco
+			if video_writer_aruco is None:
+				try:
+					video_writer_aruco = cv2.VideoWriter(
+						mp4_aruco_path, _MP4_FOURCC, float(fps_hint), (int(w_px), int(h_px)))
+					if not video_writer_aruco.isOpened():
+						print(f"[ankle rs] aruco mp4 writer失敗 → 無効化")
+						video_writer_aruco = None
+				except Exception as e:
+					print(f"[ankle rs] aruco mp4 writer例外: {e}")
+					video_writer_aruco = None
+
+		# ---- ArUco 追跡プレビュー 初期化 (プレビュー中も録画中も第3ウィンドウで表示) ----
+		# ②の辞書・実寸、D405のRGB内部パラメータを使ってリアルタイム検出+PnP+軸描画。
+		# 失敗しても本体機能 (録画自体) には影響しないよう、エラー時は静かにスキップする。
+		aruco_ok = False
+		aruco_state = {
+			"detector": None, "dictionary": None, "params": None, "use_new_api": False,
+			"obj_pts": None, "K": None, "dist": None, "marker_size": 20.0,
+			"dict_name": "",
+		}
+		try:
+			_dict_name = str(self.ankle_aruco_dict_var.get())
+			_marker_size = float(self.ankle_marker_size_mm.get())
+			if _marker_size <= 0:
+				raise ValueError("marker size must be > 0")
+			_obj_pts = np.asarray(self._ankle_marker_obj_points(_marker_size), dtype=np.float64)
+			_det, _dic, _prm, _new = self._ankle_make_detector(_dict_name)
+			_cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
+			_intr = _cprof.get_intrinsics()
+			_K = np.array([[_intr.fx, 0, _intr.ppx],
+			               [0, _intr.fy, _intr.ppy],
+			               [0, 0, 1]], dtype=np.float64)
+			_dist_c = np.array(_intr.coeffs, dtype=np.float64)
+			aruco_state.update({
+				"detector": _det, "dictionary": _dic, "params": _prm, "use_new_api": _new,
+				"obj_pts": _obj_pts, "K": _K, "dist": _dist_c,
+				"marker_size": _marker_size, "dict_name": _dict_name,
+			})
+			cv2.namedWindow(WIN_ARUCO, cv2.WINDOW_NORMAL)
+			aruco_ok = True
+			print(f"[ankle rs] ArUco追跡プレビュー: 辞書={_dict_name}, 実寸={_marker_size:.1f}mm")
+		except Exception as e:
+			print(f"[ankle rs] ArUco追跡プレビュー初期化失敗 (この機能はスキップ): {e}")
+
+		def _draw_aruco_overlay(bgr_clean, gray):
+			"""1フレームで検出→軸描画。 (overlay_img, n_detected) を返す。aruco_ok=False時はNone。"""
+			nonlocal aruco_ok
+			if not aruco_ok:
+				return None, 0
+			try:
+				if aruco_state["use_new_api"] and aruco_state["detector"] is not None:
+					corners, ids, _ = aruco_state["detector"].detectMarkers(gray)
+				else:
+					corners, ids, _ = cv2.aruco.detectMarkers(
+						gray, aruco_state["dictionary"], parameters=aruco_state["params"])
+			except Exception as e:
+				print(f"[ankle rs] aruco detect失敗: {e}")
+				return None, 0
+			out = bgr_clean.copy()
+			n_det = 0 if ids is None else len(ids)
+			# ヘッダ情報
+			cv2.putText(out, f"ArUco tracking ({aruco_state['dict_name']}, {aruco_state['marker_size']:.1f}mm)",
+			            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+			if n_det == 0:
+				cv2.putText(out, "No ArUco detected", (10, 55),
+				            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+				return out, 0
+			try:
+				cv2.aruco.drawDetectedMarkers(out, corners, ids)
+			except Exception:
+				pass
+			# 各マーカーで PnP → drawFrameAxes + ID テキスト
+			K = aruco_state["K"]; dist_c = aruco_state["dist"]
+			obj_pts_ = aruco_state["obj_pts"]
+			ax_len = float(aruco_state["marker_size"]) * 0.7
+			for corner, mid_arr in zip(corners, ids):
+				try:
+					mid = int(mid_arr[0] if hasattr(mid_arr, '__len__') else mid_arr)
+				except Exception:
+					continue
+				img_pts = corner.reshape(-1, 2).astype(np.float64)
+				try:
+					ok, rvec, tvec = cv2.solvePnP(
+						obj_pts_, img_pts, K, dist_c, flags=cv2.SOLVEPNP_IPPE)
+				except Exception:
+					ok = False
+				if not ok:
+					continue
+				try:
+					cv2.drawFrameAxes(out, K, dist_c, rvec, tvec, ax_len, 3)
+				except Exception:
+					pass
+				try:
+					cm = img_pts.mean(axis=0)
+					cx_m, cy_m = int(cm[0]), int(cm[1])
+					cv2.putText(out, f"id={mid}", (cx_m + 10, cy_m - 10),
+					            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2, cv2.LINE_AA)
+				except Exception:
+					pass
+			cv2.putText(out, f"Detected: {n_det}", (10, out.shape[0] - 15),
+			            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 0), 2, cv2.LINE_AA)
+			return out, n_det
+
+		# 露光設定
+		try:
+			depth_sensor = profile.get_device().first_depth_sensor()
+			self._ankle_rs_configure_depth_exposure(depth_sensor)
+		except Exception as e:
+			print(f"[ankle rs] 露光設定失敗: {e}")
+
+		# 破棄フレーム数
+		try:
+			n_discard = max(0, int(self.ankle_rs_discard_frames.get()))
+		except Exception:
+			n_discard = 45
+
+		# パネルにフォーカス
+		try: panel.focus_force()
+		except Exception: pass
+
+		self.ankle_rs_status.set(f"プレビュー中… ({w}x{h}@{fps})")
+		state_var.set(f"プレビュー中\n({w}x{h}@{fps})")
+
+		try:
+			while True:
+				# --- 停止/開始条件 ---
+				if _window_closed(WIN_COLOR) or _window_closed(WIN_DEPTH):
+					if recording:
+						break   # 録画中は停止として扱う
+					cancelled = True; break
+				a = _consume_action()
+				if a == "escape":
+					if recording:
+						break   # 録画中は停止
+					cancelled = True; break
+				if a == "space":
+					if not recording:
+						# --- プレビュー → 録画へ切替 ---
+						# 破棄フレーム (露光/AE安定待ち) を pause状態で消費
+						state_var.set(f"露光安定待ち…\n(0/{n_discard}フレーム)")
+						self.update_idletasks()
+						for i in range(n_discard):
+							try:
+								pipeline.wait_for_frames(timeout_ms=2000)
+							except Exception:
+								break
+							if i % max(fps // 2, 1) == 0:
+								state_var.set(f"露光安定待ち…\n({i+1}/{n_discard}フレーム)")
+								self.update_idletasks()
+						# 録画開始
+						try:
+							if recorder is not None:
+								recorder.resume()
+						except Exception as e:
+							print(f"[ankle rs] recorder.resume失敗: {e}")
+						recording = True
+						start_record = True
+						frame_count = 0
+						action_btn_text.set("録画停止 (SPACE)")
+						try:
+							action_btn.configure(bg="#ffe0e0")
+						except Exception:
+							pass
+						self.ankle_rs_status.set("録画中…")
+						state_var.set("録画中 (0フレーム)")
+						self.update_idletasks()
+						try: panel.focus_force()
+						except Exception: pass
+						continue
+					else:
+						# 録画中 → 停止
+						break
+
+				# --- 通常フレーム処理 ---
+				try:
+					success, frames = pipeline.try_wait_for_frames(timeout_ms=100)
+				except Exception as e:
+					print(f"[ankle rs] frame取得エラー: {e}")
+					if recording:
+						break
+					cancelled = True; break
+				if not success:
+					self.update()
+					continue
+
+				# ---- 表示 (色+深度両方、プレビュー/録画で内容切替) ----
+				aligned = align.process(frames)
+				color = aligned.get_color_frame()
+				depth = aligned.get_depth_frame()
+				if not color or not depth:
+					self.update(); continue
+				if recording:
+					frame_count += 1
+				rgb = np.asanyarray(color.get_data())
+				bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+				# ArUcoウィンドウ用のクリーンな色画像 (十字/RECオーバーレイなし)
+				bgr_clean_for_aruco = bgr.copy() if aruco_ok else None
+				gray_for_aruco = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if aruco_ok else None
+				colored_depth = colorizer.colorize(depth)
+				depth_bgr = cv2.cvtColor(np.asanyarray(colored_depth.get_data()), cv2.COLOR_RGB2BGR)
+				ch, cw, _ = bgr.shape
+				cx, cy = cw // 2, ch // 2
+				try:
+					dist = depth.get_distance(cx, cy)
+				except Exception:
+					dist = 0.0
+				# 中心距離十字は色/深度両方に描画
+				for img in (bgr, depth_bgr):
+					cv2.line(img, (cx - 10, cy), (cx + 10, cy), (255, 255, 255), 1)
+					cv2.line(img, (cx, cy - 10), (cx, cy + 10), (255, 255, 255), 1)
+					cv2.putText(img, f"{dist:.3f} m", (cx + 15, cy - 15),
+					            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+				# オーバーレイ (色ウィンドウのみ)
+				if recording:
+					cv2.putText(bgr, f"REC  {frame_count} frames  (t={frame_count/max(fps,1):.1f}s)",
+					            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+					cv2.putText(bgr, "Use panel or SPACE/ESC to stop", (10, 60),
+					            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+					cv2.circle(bgr, (25, 90), 8, (0, 0, 255), -1)
+				else:
+					cv2.putText(bgr, "PREVIEW  Use panel or SPACE/ESC", (10, 30),
+					            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+				# ウィンドウ閉じ判定 (imshow前に)
+				if _window_closed(WIN_COLOR) or _window_closed(WIN_DEPTH):
+					if recording:
+						break
+					cancelled = True; break
+				# MP4 に書き出し (録画中のみ、オーバーレイ込み映像)
+				if recording:
+					_ensure_video_writers(bgr.shape[1], bgr.shape[0], fps)
+					if video_writer_color is not None:
+						try: video_writer_color.write(bgr)
+						except Exception as e: print(f"[ankle rs] color mp4 write失敗: {e}")
+					if video_writer_depth is not None:
+						try: video_writer_depth.write(depth_bgr)
+						except Exception as e: print(f"[ankle rs] depth mp4 write失敗: {e}")
+				cv2.imshow(WIN_COLOR, bgr)
+				cv2.imshow(WIN_DEPTH, depth_bgr)
+				# ---- ArUco追跡ウィンドウ (プレビュー+録画中の両方で表示) ----
+				if aruco_ok:
+					if _window_closed(WIN_ARUCO):
+						# ユーザーがArUcoウィンドウの×を閉じた → 以降スキップ (録画は継続)
+						aruco_ok = False
+					else:
+						overlay, n_det = _draw_aruco_overlay(bgr_clean_for_aruco, gray_for_aruco)
+						if overlay is not None:
+							cv2.imshow(WIN_ARUCO, overlay)
+							# 録画中はMP4にも保存
+							if recording:
+								_ensure_aruco_video_writer(overlay.shape[1], overlay.shape[0], fps)
+								if video_writer_aruco is not None:
+									try: video_writer_aruco.write(overlay)
+									except Exception as e: print(f"[ankle rs] aruco mp4 write失敗: {e}")
+				# 進捗表示更新 (fpsごと)
+				if recording and frame_count % max(fps, 1) == 0:
+					sec = frame_count / max(fps, 1)
+					self.ankle_rs_status.set(f"録画中… {frame_count}f (t≈{sec:.1f}s)")
+					state_var.set(f"録画中 ({frame_count}フレーム / {sec:.1f}s)")
+					self.update_idletasks()
+				self.update()
+		finally:
+			try:
+				if recorder is not None and recording:
+					recorder.pause()
+			except Exception:
+				pass
+			try: pipeline.stop()
+			except Exception: pass
+			# MP4 writer をきちんとリリース (これをやらないとファイルが破損)
+			try:
+				if video_writer_color is not None:
+					video_writer_color.release()
+			except Exception: pass
+			try:
+				if video_writer_depth is not None:
+					video_writer_depth.release()
+			except Exception: pass
+			try:
+				if video_writer_aruco is not None:
+					video_writer_aruco.release()
+			except Exception: pass
+			try: cv2.destroyAllWindows()
+			except Exception: pass
+			try: cv2.waitKey(1)
+			except Exception: pass
+			_cleanup_panel()
+
+		# キャンセル時は生成された(ほぼ空の) .db3 ファイルと MP4 も削除
+		if cancelled and not start_record:
+			for _p in (bag_path, mp4_color_path, mp4_depth_path, mp4_aruco_path):
+				try:
+					_pp = Path(_p)
+					if _pp.exists():
+						_pp.unlink()
+				except Exception:
+					pass
+			self.ankle_rs_status.set("(録画キャンセル)")
+			return False, 0, None
+		if not start_record:
+			# 想定外
+			self.ankle_rs_status.set("(録画されませんでした)")
+			return False, 0, None
+		# 保存された MP4 のパスを self に貯めておく (on_ankle_rs_capture が拾える)
+		self._ankle_rs_last_mp4 = {
+			"color": mp4_color_path if Path(mp4_color_path).exists() else None,
+			"depth": mp4_depth_path if Path(mp4_depth_path).exists() else None,
+			"aruco": mp4_aruco_path if Path(mp4_aruco_path).exists() else None,
+		}
+		return True, frame_count, None
+
+	def on_ankle_rs_capture(self) -> None:
+		"""D405プレビュー+録画→.db3保存 → ankle_depth_pathに自動セット。"""
+		if not self._ankle_check_rs():
+			return
+		# クリックされたボタンにフォーカスが残ると SPACE でボタンが再invokeされるので、
+		# ここで先にフォーカスを root へ逃がす (保険)
+		try:
+			self.focus_set()
+		except Exception:
+			pass
+		# 録画先 (pyrealsense2 2.58+ は .db3 拡張子を要求)
+		default_dir = Path(__file__).parent / "cache"
+		try:
+			default_dir.mkdir(parents=True, exist_ok=True)
+		except Exception:
+			pass
+		import datetime as _dt
+		default_name = f"ankle_d405_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.db3"
+		bag_path = filedialog.asksaveasfilename(
+			title="録画先 .db3 ファイル",
+			initialdir=str(default_dir),
+			initialfile=default_name,
+			defaultextension=".db3",
+			filetypes=[("RealSense recording", "*.db3"), ("すべてのファイル", "*.*")])
+		if not bag_path:
+			return
+		messagebox.showinfo(
+			"D405 録画",
+			"プレビューウィンドウが開きます。\n\n"
+			"  ・SPACE = 破棄フレーム待ち → 録画開始 / 録画中は停止\n"
+			"  ・ESC   = 中止\n\n"
+			"D405 は近距離用 (7-50cm) です。マーカーが視野内でくっきり見える距離で録画してください。")
+		ok, frame_count, err = self._ankle_rs_run_preview_and_record(bag_path)
+		if err:
+			self.ankle_rs_status.set(f"(エラー: {err})")
+			messagebox.showerror("D405 録画 失敗", f"録画に失敗しました:\n{err}")
+			return
+		if not ok:
+			self.ankle_rs_status.set("(録画されませんでした)")
+			return
+		# 保存ファイル一覧を表示 (.db3 + _color.mp4 + _depth.mp4)
+		def _size_mb(p: str) -> float:
+			try:
+				return Path(p).stat().st_size / (1024 * 1024)
+			except Exception:
+				return -1
+		db3_sz = _size_mb(bag_path)
+		mp4s = getattr(self, "_ankle_rs_last_mp4", None) or {}
+		mp4_color = mp4s.get("color")
+		mp4_depth = mp4s.get("depth")
+		mp4_aruco = mp4s.get("aruco")
+		self.ankle_rs_status.set(f"録画完了: {frame_count}f  ({db3_sz:.1f} MB db3)  → {Path(bag_path).name}")
+		self.ankle_depth_path.set(bag_path)
+		lines = [f"{frame_count} フレームを保存しました。",
+		         "",
+		         "▼ 保存ファイル (同一フォルダ):"]
+		lines.append(f"  {Path(bag_path).name}  ({db3_sz:.1f} MB)  ← 解析用 (深度含む)")
+		if mp4_color:
+			lines.append(f"  {Path(mp4_color).name}  ({_size_mb(mp4_color):.1f} MB)  ← 動画プレイヤーで確認可")
+		if mp4_depth:
+			lines.append(f"  {Path(mp4_depth).name}  ({_size_mb(mp4_depth):.1f} MB)  ← 深度サーモグラフ動画")
+		if mp4_aruco:
+			lines.append(f"  {Path(mp4_aruco).name}  ({_size_mb(mp4_aruco):.1f} MB)  ← ArUco追跡映像 (軸+ID描画)")
+		lines += ["",
+		          "「② 深度データ」に .db3 を自動セットしました。",
+		          "続けて ④「ArUco検出+PnP実行」で解析できます。",
+		          "",
+		          "MP4は Windows Media Player 等で直接再生できます。"]
+		messagebox.showinfo("D405 録画完了", "\n".join(lines))
+
+	# endregion ankle simulator
 
 	def _create_org_tab(self) -> None:
 		"""ORGタブのUIを構築"""
@@ -15666,6 +18841,7 @@ class MainMenuGUI(_BaseWindow):
 	def _on_close(self) -> None:
 		self._save_state()
 		self._save_knee_state()
+		self._save_ankle_state()
 		self.destroy()
 	
 	def _save_initial_geometry(self) -> None:
