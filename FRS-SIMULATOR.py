@@ -502,6 +502,22 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_ref_frame = tk.IntVar(value=0)         # 参照フレーム t=0 (Stage 5で使用)
 		self.ankle_detect_stride = tk.IntVar(value=1)     # フレーム間引き (1=全フレーム)
 		self.ankle_detection_status = tk.StringVar(value="(未実行)")
+		# 動作モード:
+		#   "self_pose" = 新プラン (マーカー付き骨単独スキャンから T_L←Mk 自己決定 → 絶対姿勢アニメ)  【デフォルト】
+		#   "original"  = 原プラン (組立スキャン + 位置合わせで T_W←L 決定 → 相対運動アニメ)
+		#   "simple"    = 簡易版 (3Dスキャン無し, クランプArUcoで関節座標系Cj校正 → 骨マーカー動揺性)
+		self.ankle_workflow_mode = tk.StringVar(value="self_pose")
+		# 新プラン用: W 座標系の選択  "camera_ref" (カメラref) or "boneA_ref" (骨A基準)
+		self.ankle_self_pose_world = tk.StringVar(value="camera_ref")
+		# 簡易版用: クランプ (関節座標系校正用) ArUco ID
+		self.ankle_clamp_aruco_id = tk.IntVar(value=100)
+		# 簡易版校正の記録時間 (各軸)
+		self.ankle_axis_calib_seconds = tk.DoubleVar(value=4.0)
+		# 簡易版で得られた関節座標系 Cj: 4x4 (R + origin)。 None なら未校正
+		self._ankle_joint_frame_Cj = None
+		# 各軸校正の記録 (最終) と姿勢時系列
+		self._ankle_axis_calib_results = {}   # {"ML": {axis_dir(3), positions(N,3), residual}, ...}
+		self.ankle_axis_calib_status = tk.StringVar(value="(未校正)")
 		# 姿勢時系列キャッシュ: {tab_name: {frame_count, timestamps, intrinsics, marker_size_mm,
 		#   aruco_dict, source, bones: {aruco_id: {poses(N,4,4), detected(N,), reproj_err(N,)}}}}
 		self._ankle_pose_cache = {}
@@ -1792,8 +1808,11 @@ class MainMenuGUI(_BaseWindow):
 			cands.append(M)
 		return cands
 
-	def _knee_pick_points(self, mesh, n: int, title: str) -> np.ndarray:
-		"""PyVistaでメッシュ表面の点を n 個クリックさせ、(m,3) 配列で返す。"""
+	def _knee_pick_points(self, mesh, n: int, title: str, texture=None) -> np.ndarray:
+		"""PyVistaでメッシュ表面の点を n 個クリックさせ、(m,3) 配列で返す。
+
+		texture: pv.Texture or None。指定時はテクスチャ付きレンダリング。
+		"""
 		picked = []
 		try:
 			b = np.array(mesh.bounds).reshape(3, 2)
@@ -1803,7 +1822,14 @@ class MainMenuGUI(_BaseWindow):
 		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
 		p = pv.Plotter(title=title, window_size=(int(sw * 0.7), int(sh * 0.7)))
 		p.set_background("white")
-		p.add_mesh(mesh, color="lightgray", show_edges=False)
+		if texture is not None:
+			try:
+				p.add_mesh(mesh, texture=texture, show_edges=False)
+			except Exception as e:
+				print(f"[pick] テクスチャ描画失敗 → 灰色にフォールバック: {e}")
+				p.add_mesh(mesh, color="lightgray", show_edges=False)
+		else:
+			p.add_mesh(mesh, color="lightgray", show_edges=False)
 
 		def cb(pt, *args):
 			if pt is None or len(picked) >= n:
@@ -2515,7 +2541,8 @@ class MainMenuGUI(_BaseWindow):
 		return {
 			"name": f"骨{index + 1}",
 			"aruco_id": index,
-			"model_path": "",
+			"model_path": "",            # 可視化用フルモデル (試験後スキャン)
+			"calib_model_path": "",      # キャリブ用モデル (省略時 model_path を使う、ArUco切り出し推奨)
 			"post_scan_path": "",
 			"color": color,
 			"method": "ransac",         # 'ransac' | 'pca' | 'manual'
@@ -2523,6 +2550,79 @@ class MainMenuGUI(_BaseWindow):
 			"marker_to_bone_T": None,
 			"reg_T": None,
 		}
+
+	# ---- テクスチャ対応 メッシュ読込ヘルパ ----
+	def _ankle_load_mesh_and_texture(self, path: str):
+		"""メッシュ + テクスチャを読み込む。テクスチャ取得できなければ None を返す。
+
+		対応形式:
+		- PLY: mesh.textures に埋め込みテクスチャがあれば使用
+		- OBJ: 同名の .mtl から map_Kd 行を探して画像パスを解決
+		- 同名の .png/.jpg/.jpeg/.tif/.bmp を fallback で探索
+
+		Returns: (mesh: pv.PolyData, texture: pv.Texture or None)
+		"""
+		p = Path(path)
+		mesh = pv.read(str(p))
+		if mesh is None:
+			return None, None
+		tex = None
+		# 1. mesh.textures に既に入っている場合 (PLY埋込など)
+		try:
+			if hasattr(mesh, 'textures') and mesh.textures:
+				first_key = next(iter(mesh.textures))
+				tex = mesh.textures[first_key]
+		except Exception:
+			tex = None
+		# 2. OBJ の場合: 同名 .mtl から map_Kd を解析
+		if tex is None and p.suffix.lower() == '.obj':
+			mtl_path = p.with_suffix('.mtl')
+			if mtl_path.exists():
+				try:
+					with mtl_path.open('r', encoding='utf-8', errors='ignore') as f:
+						for line in f:
+							s = line.strip()
+							if not s or s.startswith('#'):
+								continue
+							# map_Kd texture.png  or  map_Kd -options texture.png
+							low = s.lower()
+							if low.startswith('map_kd'):
+								parts = s.split()
+								if len(parts) >= 2:
+									tex_name = parts[-1]  # 最後の要素 = ファイル名
+									tex_p = Path(tex_name)
+									if not tex_p.is_absolute():
+										tex_p = p.parent / tex_p
+									if tex_p.exists():
+										try:
+											tex = pv.read_texture(str(tex_p))
+											print(f"[tex] OBJ+MTL からテクスチャ読込: {tex_p.name}")
+											break
+										except Exception as e:
+											print(f"[tex] {tex_p.name} 読込失敗: {e}")
+				except Exception as e:
+					print(f"[tex] MTL 解析失敗: {e}")
+		# 3. 同名の画像ファイルを探す (最終手段)
+		if tex is None:
+			for ext in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'):
+				candidate = p.with_suffix(ext)
+				if candidate.exists():
+					try:
+						tex = pv.read_texture(str(candidate))
+						print(f"[tex] 同名画像 fallback: {candidate.name}")
+						break
+					except Exception:
+						continue
+		if tex is None:
+			print(f"[tex] テクスチャ見つからず: {p.name}")
+		return mesh, tex
+
+	def _ankle_get_calib_model_path(self, bone: dict) -> str:
+		"""キャリブ用モデルパスを返す。calib_model_path が空なら model_path を fallback。"""
+		p = str(bone.get("calib_model_path", "") or "").strip()
+		if p:
+			return p
+		return str(bone.get("model_path", "") or "").strip()
 
 	def _create_ankle_simulator_tab(self) -> None:
 		"""ankle simulator タブのUIを構築（ArUcoマーカートラッキング方式）。"""
@@ -2563,9 +2663,86 @@ class MainMenuGUI(_BaseWindow):
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 8))
 
+		# --- 動作モード選択 (新プラン / 原プラン / 簡易版) ---
+		mode_frame = ttk.LabelFrame(container, text="動作モード (座標系の決め方)", style="Bold.TLabelframe")
+		mode_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+		mode_frame.columnconfigure(0, weight=1)
+		mf = ttk.Frame(mode_frame)
+		mf.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
+		ttk.Radiobutton(mf, text="🟢 新プラン【推奨】(マーカー付き骨単独スキャンから T_L←Mk 自己決定)",
+		                value="self_pose", variable=self.ankle_workflow_mode
+		                ).grid(row=0, column=0, sticky="w", padx=(0, 0))
+		ttk.Radiobutton(mf, text="⚪ 原プラン (①組立スキャン + ③位置合わせで T_W←L 決定)",
+		                value="original", variable=self.ankle_workflow_mode
+		                ).grid(row=1, column=0, sticky="w", padx=(0, 0))
+		ttk.Radiobutton(mf, text="⚡ 簡易版 (3Dスキャン無し, クランプArUcoで関節座標系Cj校正 → 骨マーカー動揺性)",
+		                value="simple", variable=self.ankle_workflow_mode
+		                ).grid(row=2, column=0, sticky="w", padx=(0, 0))
+		wf = ttk.Frame(mode_frame)
+		wf.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 6))
+		ttk.Label(wf, text="新プランのワールド系 W:", foreground="#666"
+		          ).grid(row=0, column=0, sticky="w", padx=(0, 6))
+		ttk.Radiobutton(wf, text="カメラ参照フレーム", value="camera_ref",
+		                variable=self.ankle_self_pose_world
+		                ).grid(row=0, column=1, sticky="w", padx=(0, 8))
+		ttk.Radiobutton(wf, text="骨A基準 (ヒートマップ骨A)", value="boneA_ref",
+		                variable=self.ankle_self_pose_world
+		                ).grid(row=0, column=2, sticky="w")
+		ttk.Label(mode_frame,
+		          text="🟢 新プラン: ①+③位置合わせは不要。各骨モデルに「🔍 スキャンから自動キャリブ」または手動キャリブで T_L←Mk が必要。組立スキャン省略で工数減。\n"
+		               "⚪ 原プラン: ①+③位置合わせが必要。マーカー-骨キャリブは不要 (剛結合仮定)。\n"
+		               "⚡ 簡易版: 3Dスキャン不要。クランプにArUco貼付→ロボットML/AP/PDで軸方向を計測→関節座標系Cjを校正→骨マーカー動揺をCj系で出力。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
+
+		# --- ⚡ 関節座標系校正 (簡易版モードで使用) ---
+		cj_frame = ttk.LabelFrame(container, text="⚡ 関節座標系校正 (Cj) — 簡易版モードで使用",
+		                            style="Bold.TLabelframe")
+		cj_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+		cj_frame.columnconfigure(0, weight=1)
+		self._ankle_cj_frame = cj_frame
+		cj_row1 = ttk.Frame(cj_frame)
+		cj_row1.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
+		ttk.Label(cj_row1, text="クランプArUco ID:").grid(row=0, column=0, sticky="w")
+		ttk.Spinbox(cj_row1, from_=0, to=999, textvariable=self.ankle_clamp_aruco_id, width=6
+		            ).grid(row=0, column=1, sticky="w", padx=(4, 12))
+		ttk.Label(cj_row1, text="各軸校正の記録秒数:").grid(row=0, column=2, sticky="w")
+		ttk.Entry(cj_row1, textvariable=self.ankle_axis_calib_seconds, width=6
+		          ).grid(row=0, column=3, sticky="w", padx=(4, 12))
+		cj_row2 = ttk.Frame(cj_frame)
+		cj_row2.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 2))
+		ttk.Button(cj_row2, text="🔴 ML軸校正 (内-外)",
+		           command=lambda: self.on_ankle_calibrate_axis("ML")
+		           ).grid(row=0, column=0, padx=(0, 4))
+		ttk.Button(cj_row2, text="🟢 AP軸校正 (前-後)",
+		           command=lambda: self.on_ankle_calibrate_axis("AP")
+		           ).grid(row=0, column=1, padx=(0, 4))
+		ttk.Button(cj_row2, text="🔵 PD軸校正 (近-遠)",
+		           command=lambda: self.on_ankle_calibrate_axis("PD")
+		           ).grid(row=0, column=2, padx=(0, 12))
+		ttk.Button(cj_row2, text="関節座標系Cjを確定",
+		           command=self.on_ankle_finalize_joint_frame
+		           ).grid(row=0, column=3, padx=(0, 4))
+		ttk.Button(cj_row2, text="Cjクリア",
+		           command=self.on_ankle_clear_joint_frame
+		           ).grid(row=0, column=4, padx=(0, 4))
+		ttk.Label(cj_frame, textvariable=self.ankle_axis_calib_status,
+		          foreground="#005580", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 2))
+		cj_row3 = ttk.Frame(cj_frame)
+		cj_row3.grid(row=3, column=0, sticky="w", padx=12, pady=(2, 6))
+		ttk.Button(cj_row3, text="骨マーカーをCj系で分析 (CSV+グラフ)",
+		           command=self.on_ankle_analyze_in_cj
+		           ).grid(row=0, column=0, padx=(0, 4))
+		ttk.Label(cj_frame,
+		          text="手順: (1) クランプにArUco貼付 → (2) 各軸校正ボタンで各方向にロボットを動かして記録\n"
+		               "(3) 3軸そろったら「関節座標系Cjを確定」→ (4) ⓪で本試験録画 → ④で検出 → (5) 「Cj系で分析」でCSV/グラフ出力",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=4, column=0, sticky="w", padx=12, pady=(0, 6))
+
 		# ⓪ RealSense D405 ライブ撮影 (①より前 = 実試験で最初に使うため)
 		rs_frame = ttk.LabelFrame(container, text="⓪ RealSense D405 ライブ撮影 (.db3を直接生成)", style="Bold.TLabelframe")
-		rs_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+		rs_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
 		rs_frame.columnconfigure(0, weight=1)
 		rf1 = ttk.Frame(rs_frame)
 		rf1.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
@@ -2596,20 +2773,23 @@ class MainMenuGUI(_BaseWindow):
 		          ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
 
 		# ① 初期状態スキャン
-		init_frame = ttk.LabelFrame(container, text="① 初期状態スキャン（ピン+マーカー装着後）", style="Bold.TLabelframe")
-		init_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+		init_frame = ttk.LabelFrame(container, text="① 初期状態スキャン（ピン+マーカー装着後）— 原プランのみ",
+		                              style="Bold.TLabelframe")
+		init_frame.grid(row=5, column=0, sticky="nsew", pady=(0, 8))
 		for i in range(3):
 			init_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		self._ankle_init_frame = init_frame   # トグル用参照
 		self._add_file_row(init_frame, 0, "初期状態スキャン (STL/OBJ)", self.ankle_initial_scan_path,
 		                   lambda: self._ankle_choose(self.ankle_initial_scan_path, "初期状態スキャンを選択", "model"))
-		ttk.Label(init_frame, text="※ 全骨がピン+マーカーを装着した状態でスキャンされたもの。"
-		          "各骨は③の骨リストで個別に登録します。",
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+		self._ankle_init_note = ttk.Label(init_frame,
+		          text="※ 原プランのみ使用。全骨がピン+マーカーを装着した状態でスキャンされたもの。"
+		               "新プラン/簡易版では不要 (空欄でOK)。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left")
+		self._ankle_init_note.grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
 
 		# ② 計測データ
 		meas_frame = ttk.LabelFrame(container, text="② RGB-D計測データ / ArUco設定", style="Bold.TLabelframe")
-		meas_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+		meas_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
 		for i in range(3):
 			meas_frame.columnconfigure(i, weight=[0, 1, 0][i])
 		self._add_file_row(meas_frame, 0, "RGBビデオ (mp4/avi)", self.ankle_video_path,
@@ -2630,7 +2810,7 @@ class MainMenuGUI(_BaseWindow):
 
 		# ③ 骨リスト
 		bones_frame = ttk.LabelFrame(container, text="③ 骨リスト（N本可変：脛骨・距骨・他）", style="Bold.TLabelframe")
-		bones_frame.grid(row=5, column=0, sticky="nsew", pady=(0, 8))
+		bones_frame.grid(row=7, column=0, sticky="nsew", pady=(0, 8))
 		bones_frame.columnconfigure(0, weight=0)
 		bones_frame.columnconfigure(1, weight=1)
 
@@ -2683,22 +2863,48 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_bone_editor_widgets["color_btn"] = color_btn
 
 		row += 1
-		ttk.Label(editor, text="骨モデル (試験後スキャン):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		ttk.Label(editor, text="骨モデル (可視化用フル):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
 		model_var = tk.StringVar(value="")
 		ttk.Entry(editor, textvariable=model_var, state="readonly", width=40).grid(row=row, column=1, sticky="ew", pady=2)
 		ttk.Button(editor, text="参照", width=5,
-		           command=lambda: self._ankle_pick_bone_file("model_path", "骨モデルを選択", "model")
+		           command=lambda: self._ankle_pick_bone_file("model_path", "骨モデル(可視化用フル)を選択", "model")
 		           ).grid(row=row, column=2, sticky="w", padx=4)
 		self._ankle_bone_editor_widgets["model_var"] = model_var
 
+		# キャリブ用モデル (省略時は上のフルモデルを使う, ArUco部分だけ切り出したもの推奨)
 		row += 1
-		ttk.Label(editor, text="初期スキャン側 骨領域 (位置合わせ先):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
-		post_var = tk.StringVar(value="")
-		ttk.Entry(editor, textvariable=post_var, state="readonly", width=40).grid(row=row, column=1, sticky="ew", pady=2)
+		ttk.Label(editor, text="キャリブ用モデル (省略可):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		calib_model_var = tk.StringVar(value="")
+		ttk.Entry(editor, textvariable=calib_model_var, state="readonly", width=40
+		          ).grid(row=row, column=1, sticky="ew", pady=2)
 		ttk.Button(editor, text="参照", width=5,
-		           command=lambda: self._ankle_pick_bone_file("post_scan_path", "初期スキャン側の骨領域を選択", "model")
+		           command=lambda: self._ankle_pick_bone_file("calib_model_path",
+		                                                       "キャリブ用モデル(ArUco部分切り出し)を選択", "model")
 		           ).grid(row=row, column=2, sticky="w", padx=4)
+		self._ankle_bone_editor_widgets["calib_model_var"] = calib_model_var
+		row += 1
+		ttk.Label(editor,
+		          text="※ キャリブ用モデルは、フルモデルからArUco貼付部分だけを切り出したもの (座標系はフルと同じであること)。\n"
+		               "   省略時はフルモデルをそのままキャリブに使います。テクスチャ (OBJ+MTL / PLY埋込 / 同名png/jpg) が必要。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
+		# --- 位置合わせ関連 (原プランのみで使用、他モードではグレーアウト) ---
+		row += 1
+		post_row_frame = ttk.Frame(editor)
+		post_row_frame.grid(row=row, column=0, columnspan=3, sticky="ew")
+		for i in range(3):
+			post_row_frame.columnconfigure(i, weight=[0, 1, 0][i])
+		ttk.Label(post_row_frame, text="初期スキャン側 骨領域 (位置合わせ先):"
+		          ).grid(row=0, column=0, sticky="w", padx=(8, 4), pady=2)
+		post_var = tk.StringVar(value="")
+		ttk.Entry(post_row_frame, textvariable=post_var, state="readonly", width=40
+		          ).grid(row=0, column=1, sticky="ew", pady=2)
+		ttk.Button(post_row_frame, text="参照", width=5,
+		           command=lambda: self._ankle_pick_bone_file("post_scan_path", "初期スキャン側の骨領域を選択", "model")
+		           ).grid(row=0, column=2, sticky="w", padx=4)
 		self._ankle_bone_editor_widgets["post_var"] = post_var
+		self._ankle_reg_widgets = [post_row_frame]
 
 		# 位置合わせ方式・スケーリング(骨ごと)
 		row += 1
@@ -2721,6 +2927,7 @@ class MainMenuGUI(_BaseWindow):
 		                ).grid(row=0, column=4, sticky="w")
 		self._ankle_bone_editor_widgets["method_var"] = method_var
 		self._ankle_bone_editor_widgets["scaling_var"] = scaling_var
+		self._ankle_reg_widgets.append(mf)
 
 		row += 1
 		status_lbl = ttk.Label(editor, text="", foreground="gray", font=(self.ui_font_family, 8))
@@ -2730,21 +2937,31 @@ class MainMenuGUI(_BaseWindow):
 		row += 1
 		opsf = ttk.Frame(editor)
 		opsf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
-		ttk.Button(opsf, text="マーカー-骨キャリブ",
-		           command=self.on_ankle_calibrate_marker_to_bone).grid(row=0, column=0, padx=(0, 4))
-		ttk.Button(opsf, text="初期スキャンへ位置合わせ",
-		           command=self.on_ankle_register_bone).grid(row=0, column=1, padx=(0, 4))
-		ttk.Button(opsf, text="キャリブをクリア",
+		ttk.Button(opsf, text="🔍 スキャンから自動キャリブ",
+		           command=self.on_ankle_auto_calibrate_from_mesh).grid(row=0, column=0, padx=(0, 4))
+		ttk.Button(opsf, text="マーカー-骨キャリブ (手動4点)",
+		           command=self.on_ankle_calibrate_marker_to_bone).grid(row=0, column=1, padx=(0, 4))
+		self._ankle_register_bone_btn = ttk.Button(opsf, text="初期スキャンへ位置合わせ",
+		           command=self.on_ankle_register_bone)
+		self._ankle_register_bone_btn.grid(row=0, column=2, padx=(0, 4))
+		self._ankle_reg_widgets.append(self._ankle_register_bone_btn)
+		row += 1
+		opsf2 = ttk.Frame(editor)
+		opsf2.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+		ttk.Button(opsf2, text="キャリブをクリア",
 		           command=lambda: self._ankle_apply_editor_field("marker_to_bone_T", None)
-		           ).grid(row=0, column=2, padx=(0, 4))
-		ttk.Button(opsf, text="位置合わせをクリア",
-		           command=lambda: self._ankle_apply_editor_field("reg_T", None)
-		           ).grid(row=0, column=3, padx=(0, 4))
+		           ).grid(row=0, column=0, padx=(0, 4))
+		self._ankle_clear_reg_btn = ttk.Button(opsf2, text="位置合わせをクリア",
+		           command=lambda: self._ankle_apply_editor_field("reg_T", None))
+		self._ankle_clear_reg_btn.grid(row=0, column=1, padx=(0, 4))
+		self._ankle_reg_widgets.append(self._ankle_clear_reg_btn)
 
-		# 位置合わせパラメータ (タブ共通)
-		param_frame = ttk.LabelFrame(bones_frame, text="位置合わせパラメータ (このタブの全骨で共有)",
+		# 位置合わせパラメータ (タブ共通、原プランのみで使用)
+		param_frame = ttk.LabelFrame(bones_frame, text="位置合わせパラメータ (原プランのみ・全骨共有)",
 		                              style="Bold.TLabelframe")
 		param_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(8, 8), pady=(0, 6))
+		self._ankle_reg_param_frame = param_frame
+		self._ankle_reg_widgets.append(param_frame)
 		pf = ttk.Frame(param_frame)
 		pf.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 2))
 		ank_reg_spec = [
@@ -2776,7 +2993,7 @@ class MainMenuGUI(_BaseWindow):
 		# 🔨 マーカー準備 (印刷) — 事前準備用: ③のID/名前と②の辞書/実寸から印刷ファイル生成
 		prep_frame = ttk.LabelFrame(container, text="🔨 マーカー準備 (印刷用ファイル生成)",
 		                             style="Bold.TLabelframe")
-		prep_frame.grid(row=6, column=0, sticky="nsew", pady=(0, 8))
+		prep_frame.grid(row=8, column=0, sticky="nsew", pady=(0, 8))
 		prep_frame.columnconfigure(0, weight=1)
 		prep_btn = ttk.Frame(prep_frame)
 		prep_btn.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 2))
@@ -2793,7 +3010,7 @@ class MainMenuGUI(_BaseWindow):
 
 		# ④ ArUco/PnP 実行
 		det_frame = ttk.LabelFrame(container, text="④ ArUco検出 / PnPで6DOF姿勢時系列を計算", style="Bold.TLabelframe")
-		det_frame.grid(row=7, column=0, sticky="nsew", pady=(0, 8))
+		det_frame.grid(row=9, column=0, sticky="nsew", pady=(0, 8))
 		det_frame.columnconfigure(0, weight=1)
 		# 検出パラメータ
 		pf = ttk.Frame(det_frame)
@@ -2828,7 +3045,7 @@ class MainMenuGUI(_BaseWindow):
 
 		# ⑤ 可視化・アニメ
 		vis_frame = ttk.LabelFrame(container, text="⑤ 可視化・アニメーション・骨対ヒートマップ", style="Bold.TLabelframe")
-		vis_frame.grid(row=8, column=0, sticky="nsew", pady=(0, 8))
+		vis_frame.grid(row=10, column=0, sticky="nsew", pady=(0, 8))
 		vis_frame.columnconfigure(0, weight=1)
 		vbtn = ttk.Frame(vis_frame)
 		vbtn.grid(row=0, column=0, sticky="w", padx=12, pady=(6, 4))
@@ -2847,6 +3064,74 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_heatmap_dist_combo.grid(row=0, column=3, sticky="w", padx=(4, 0))
 
 		self._ankle_init_tabs()
+		# モード変化に応じて①の enable/disable を切替
+		self.ankle_workflow_mode.trace_add("write", self._ankle_on_mode_change)
+		self._ankle_on_mode_change()  # 初期状態反映
+
+	def _ankle_on_mode_change(self, *args) -> None:
+		"""動作モード変化時、モード別に不要ウィジェットを enable/disable する。
+
+		- 原プラン (original):
+		    ①初期状態スキャン    → 有効
+		    ③位置合わせ関連     → 有効
+		    ⚡ 関節座標系Cj      → 無効
+		- 新プラン (self_pose):
+		    ①                    → 無効 (不要)
+		    ③位置合わせ関連     → 無効 (ArUcoで自己位置決定)
+		    ⚡ Cj                 → 無効
+		- 簡易版 (simple):
+		    ①                    → 無効
+		    ③位置合わせ関連     → 無効 (骨モデル自体不要だが編集は許可)
+		    ⚡ Cj                 → 有効
+		"""
+		try:
+			mode = str(self.ankle_workflow_mode.get())
+		except Exception:
+			mode = "self_pose"
+
+		def _set_state(w, state):
+			try: w.configure(state=state)
+			except Exception: pass
+			for c in w.winfo_children():
+				_set_state(c, state)
+
+		# ①初期状態スキャン (原プランのみ)
+		init_enabled = (mode == "original")
+		init_frame = getattr(self, "_ankle_init_frame", None)
+		if init_frame is not None:
+			_set_state(init_frame, "normal" if init_enabled else "disabled")
+			try:
+				if init_enabled:
+					init_frame.configure(text="① 初期状態スキャン（ピン+マーカー装着後）— 原プランのみ")
+				else:
+					init_frame.configure(text="① 初期状態スキャン (このモードでは不要 — スキップ)")
+			except Exception: pass
+
+		# ③位置合わせ関連 (原プランのみ) — post_scan/method/register/param
+		reg_enabled = (mode == "original")
+		for w in getattr(self, "_ankle_reg_widgets", []):
+			_set_state(w, "normal" if reg_enabled else "disabled")
+		# パラメータフレームのタイトルも更新
+		rpf = getattr(self, "_ankle_reg_param_frame", None)
+		if rpf is not None:
+			try:
+				if reg_enabled:
+					rpf.configure(text="位置合わせパラメータ (原プランのみ・全骨共有)")
+				else:
+					rpf.configure(text="位置合わせパラメータ (このモードでは不要 — スキップ)")
+			except Exception: pass
+
+		# ⚡ 関節座標系Cj (簡易版のみ)
+		cj_enabled = (mode == "simple")
+		cj_frame = getattr(self, "_ankle_cj_frame", None)
+		if cj_frame is not None:
+			_set_state(cj_frame, "normal" if cj_enabled else "disabled")
+			try:
+				if cj_enabled:
+					cj_frame.configure(text="⚡ 関節座標系校正 (Cj) — 簡易版モードで使用")
+				else:
+					cj_frame.configure(text="⚡ 関節座標系校正 (Cj) — このモードでは不要 — スキップ")
+			except Exception: pass
 
 	# ---- ankle: ファイル/カラーピッカー ----
 	def _ankle_choose(self, var: tk.StringVar, title: str, kind: str) -> None:
@@ -2952,6 +3237,8 @@ class MainMenuGUI(_BaseWindow):
 			w["name_var"].set(b.get("name", ""))
 			w["aruco_var"].set(int(b.get("aruco_id", 0)))
 			w["model_var"].set(b.get("model_path", "") or "")
+			if "calib_model_var" in w:
+				w["calib_model_var"].set(b.get("calib_model_path", "") or "")
 			w["post_var"].set(b.get("post_scan_path", "") or "")
 			if "method_var" in w:
 				w["method_var"].set(str(b.get("method", "ransac")))
@@ -3103,6 +3390,9 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_rs_discard_frames": (self.ankle_rs_discard_frames, int),
 			"ankle_rs_manual_exposure": (self.ankle_rs_manual_exposure, bool),
 			"ankle_rs_exposure_val": (self.ankle_rs_exposure_val, int),
+			# 動作モード (原プラン/新プラン)
+			"ankle_workflow_mode": (self.ankle_workflow_mode, str),
+			"ankle_self_pose_world": (self.ankle_self_pose_world, str),
 		}
 
 	def _ankle_snapshot_current(self) -> dict:
@@ -3390,8 +3680,9 @@ class MainMenuGUI(_BaseWindow):
 			f"  Stage 5 — アニメーション・骨対ヒートマップ")
 
 	# ---- Stage 4: マーカー-骨キャリブレーション ----
-	def _ankle_visualize_calibration(self, mesh, picked, T, marker_size_mm: float, title: str) -> None:
-		"""キャリブ結果を可視化: 骨(灰) + ピック点(赤) + 復元マーカー4隅(青枠) + Mk座標軸(RGB)。"""
+	def _ankle_visualize_calibration(self, mesh, picked, T, marker_size_mm: float, title: str,
+	                                   texture=None) -> None:
+		"""キャリブ結果を可視化: 骨(テクスチャまたは灰) + ピック点(赤) + 復元マーカー4隅(青枠) + Mk座標軸(RGB)."""
 		import numpy as np
 		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
 		plotter = pv.Plotter(title=title, window_size=(int(sw * 0.8), int(sh * 0.8)))
@@ -3403,7 +3694,15 @@ class MainMenuGUI(_BaseWindow):
 			r_sphere = max(diag * 0.005, 0.5)
 		except Exception:
 			r_sphere = 1.0
-		plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True)
+		if texture is not None:
+			try:
+				# テクスチャ付きは完全不透明で表示 (半透明だとテクスチャが薄れる)
+				plotter.add_mesh(mesh, texture=texture, opacity=1.0, smooth_shading=True)
+			except Exception as e:
+				print(f"[calib viz] テクスチャ描画失敗: {e}")
+				plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True)
+		else:
+			plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True)
 		# ピック点 (赤球+ラベル)
 		for i, pt in enumerate(picked):
 			plotter.add_mesh(pv.Sphere(radius=r_sphere, center=np.asarray(pt)), color="red")
@@ -3431,6 +3730,280 @@ class MainMenuGUI(_BaseWindow):
 			position="upper_left", font_size=10, color="black")
 		plotter.show()
 
+	# ---- Stage 4 新機能: テクスチャ付き骨スキャンからArUcoを自動検出 → T_L←Mk ----
+	def _ankle_render_mesh_and_detect(self, mesh, cam_pos, look_at, up, W, H,
+	                                    detector, dictionary, params, use_new_api,
+	                                    expected_id: int, texture=None):
+		"""1視点でメッシュをオフスクリーン描画→cv2.arucoで指定IDを探す。
+
+		texture: pv.Texture (優先使用) or None。None時は mesh.textures を試す。
+		Returns: (found: bool, corners_2d(4,2), area, cam_pos, look_at, up, W, H, view_angle_deg)
+		"""
+		import numpy as np
+		import cv2
+		try:
+			plotter = pv.Plotter(off_screen=True, window_size=(W, H))
+			plotter.set_background("white")
+			# 明示的に渡されたテクスチャを優先
+			tex = texture
+			if tex is None:
+				# メッシュ内蔵テクスチャを探す (fallback)
+				try:
+					if hasattr(mesh, 'textures') and mesh.textures:
+						first_key = next(iter(mesh.textures))
+						tex = mesh.textures[first_key]
+				except Exception:
+					tex = None
+			try:
+				if tex is not None:
+					plotter.add_mesh(mesh, texture=tex, show_edges=False)
+				else:
+					plotter.add_mesh(mesh, show_edges=False, color="lightgray")
+			except Exception:
+				plotter.add_mesh(mesh, show_edges=False, color="lightgray")
+			plotter.camera_position = [tuple(cam_pos), tuple(look_at), tuple(up)]
+			view_angle = float(plotter.camera.view_angle)
+			plotter.render()
+			img_rgb = plotter.screenshot(return_img=True)
+		except Exception as e:
+			print(f"[ankle auto calib] render失敗: {e}")
+			return False, None, 0.0, None, None, None, W, H, 30.0
+		finally:
+			try: plotter.close()
+			except Exception: pass
+		gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+		try:
+			if use_new_api and detector is not None:
+				corners, ids, _ = detector.detectMarkers(gray)
+			else:
+				corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
+		except Exception as e:
+			print(f"[ankle auto calib] detectMarkers失敗: {e}")
+			return False, None, 0.0, cam_pos, look_at, up, W, H, view_angle
+		if ids is None:
+			return False, None, 0.0, cam_pos, look_at, up, W, H, view_angle
+		for corner, mid_arr in zip(corners, ids):
+			try:
+				mid = int(mid_arr[0] if hasattr(mid_arr, '__len__') else mid_arr)
+			except Exception:
+				continue
+			if mid != expected_id:
+				continue
+			c2d = corner.reshape(-1, 2).astype(np.float64)
+			# 面積 = 4角形の外周
+			try:
+				area = float(cv2.contourArea(c2d.astype(np.float32)))
+			except Exception:
+				area = 0.0
+			return True, c2d, area, cam_pos, look_at, up, W, H, view_angle
+		return False, None, 0.0, cam_pos, look_at, up, W, H, view_angle
+
+	def _ankle_auto_calibrate_from_mesh_impl(self, bone: dict, progress=None) -> tuple:
+		"""テクスチャ付きOBJから ArUco 検出→T_L←Mk 推定。
+
+		戦略:
+		1. メッシュ中心を焦点に、球面上に多視点をサンプル
+		2. 各視点でオフスクリーンレンダリング→cv2.aruco検出
+		3. 該当IDが最大面積で見えた視点を選ぶ
+		4. その視点で cv2.solvePnP を実行 (仮想カメラ内部パラメータを計算)
+		5. T_cv2cam←Mk を T_L←Mk に変換
+
+		Returns: (T (4,4) list, rmse mm, best_area px^2, n_hits, id)
+		"""
+		import numpy as np
+		import cv2
+		# キャリブ用モデル優先 (無ければ フルモデル)
+		calib_path = self._ankle_get_calib_model_path(bone)
+		if not calib_path or not Path(calib_path).exists():
+			raise ValueError("キャリブ用モデル(or 骨モデル)が未設定 or ファイル無し")
+		try:
+			expected_id = int(bone.get("aruco_id", -1))
+		except Exception:
+			expected_id = -1
+		if expected_id < 0:
+			raise ValueError("骨のArUco IDが未設定")
+		try:
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			marker_size_mm = 20.0
+		if marker_size_mm <= 0:
+			raise ValueError("マーカー実寸が不正")
+		aruco_dict_name = str(self.ankle_aruco_dict_var.get())
+		detector, dictionary, params, use_new_api = self._ankle_make_detector(aruco_dict_name)
+
+		# メッシュ + テクスチャ読込
+		mesh, texture = self._ankle_load_mesh_and_texture(calib_path)
+		if mesh is None or mesh.n_points == 0:
+			raise ValueError("メッシュ空")
+		if texture is None:
+			print("[auto calib] 警告: テクスチャが検出できませんでした。"
+			      "灰色レンダリングになり、ArUcoは検出できません。"
+			      "OBJの場合は .mtl と画像ファイルが同じフォルダにあるか、"
+			      "PLYなら埋込テクスチャがあるか、同名の .png/.jpg が横にあるか確認してください。")
+		center = np.array(mesh.center, dtype=float)
+		diag = float(mesh.length)
+		radius = diag * 1.2
+
+		# 多視点サンプリング (球面, azimuth 8 × elevation 5 = 40視点)
+		hits = []
+		W, H = 1200, 1200
+		up_default = np.array([0.0, 0.0, 1.0])
+		up_alt = np.array([0.0, 1.0, 0.0])
+		azimuths = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+		elevations = np.linspace(np.deg2rad(-70), np.deg2rad(70), 5)
+		total = len(azimuths) * len(elevations)
+		done = 0
+		for phi in azimuths:
+			for theta in elevations:
+				cam_pos = center + radius * np.array([
+					np.cos(theta) * np.cos(phi),
+					np.cos(theta) * np.sin(phi),
+					np.sin(theta),
+				])
+				# up ベクトルは cam→焦点方向にほぼ平行なら別軸に切替
+				look_dir = center - cam_pos; look_dir /= np.linalg.norm(look_dir)
+				up = up_default if abs(np.dot(look_dir, up_default)) < 0.95 else up_alt
+				found, c2d, area, cp, la, u, w, h, va = \
+					self._ankle_render_mesh_and_detect(
+						mesh, cam_pos, center, up, W, H,
+						detector, dictionary, params, use_new_api, expected_id,
+						texture=texture)
+				if found:
+					hits.append({"c2d": c2d, "area": area, "cam_pos": cp,
+					              "look_at": la, "up": u, "W": w, "H": h, "view_angle": va})
+				done += 1
+				if progress is not None:
+					progress(done, total, len(hits))
+		if not hits:
+			raise ValueError(f"どの視点からもID={expected_id}が検出されませんでした")
+		# 最大面積の視点を採用
+		best = max(hits, key=lambda x: x["area"])
+		c2d = best["c2d"]
+		W_r, H_r = best["W"], best["H"]
+		view_angle_deg = best["view_angle"]
+		fov_y = np.deg2rad(view_angle_deg)
+		fy = H_r / (2 * np.tan(fov_y / 2))
+		fx = fy
+		cx_p = W_r / 2.0
+		cy_p = H_r / 2.0
+		K = np.array([[fx, 0, cx_p], [0, fy, cy_p], [0, 0, 1]], dtype=np.float64)
+		dist_c = np.zeros(5, dtype=np.float64)
+		obj_pts = np.asarray(self._ankle_marker_obj_points(marker_size_mm), dtype=np.float64)
+		try:
+			ok, rvec, tvec = cv2.solvePnP(obj_pts, c2d, K, dist_c, flags=cv2.SOLVEPNP_IPPE)
+		except Exception as e:
+			raise ValueError(f"solvePnP失敗: {e}")
+		if not ok:
+			raise ValueError("solvePnP解が得られませんでした")
+		R_cv, _ = cv2.Rodrigues(rvec)
+		T_cv = np.eye(4); T_cv[:3, :3] = R_cv; T_cv[:3, 3] = tvec.flatten()
+
+		# ワールド (mesh L) 系での PyVistaカメラ姿勢
+		cam_pos = np.array(best["cam_pos"], dtype=float)
+		look_at = np.array(best["look_at"], dtype=float)
+		up_v = np.array(best["up"], dtype=float)
+		z_pv = cam_pos - look_at
+		z_pv /= np.linalg.norm(z_pv)
+		x_pv = np.cross(up_v, z_pv); x_pv /= np.linalg.norm(x_pv)
+		y_pv = np.cross(z_pv, x_pv)
+		R_L_pv = np.column_stack([x_pv, y_pv, z_pv])
+		T_L_pv = np.eye(4); T_L_pv[:3, :3] = R_L_pv; T_L_pv[:3, 3] = cam_pos
+		# cv2カメラ (X右, Y下, Z奥) → PyVistaカメラ (X右, Y上, Z手前) の変換
+		R_pv_cv = np.diag([1.0, -1.0, -1.0])
+		T_pv_cv = np.eye(4); T_pv_cv[:3, :3] = R_pv_cv
+		T_L_from_Mk = T_L_pv @ T_pv_cv @ T_cv
+
+		# 残差 (対応点の再構成誤差, mm)
+		homog = np.hstack([obj_pts, np.ones((4, 1))])
+		pred_L = (T_L_from_Mk @ homog.T).T[:, :3]
+		# cv2 側で予測した3D位置 (cv2カメラ系) → L系
+		pred_cv2 = (T_cv @ homog.T).T[:, :3]
+		pred_pv = (T_pv_cv @ np.hstack([pred_cv2, np.ones((4, 1))]).T).T[:, :3]
+		# 再投影誤差 (pixel)
+		try:
+			img_pts_reproj, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, dist_c)
+			img_pts_reproj = img_pts_reproj.reshape(-1, 2)
+			reproj_rmse = float(np.sqrt(np.mean(np.sum((img_pts_reproj - c2d) ** 2, axis=1))))
+		except Exception:
+			reproj_rmse = float("nan")
+		return (T_L_from_Mk.tolist(), reproj_rmse, best["area"], len(hits), expected_id)
+
+	def on_ankle_auto_calibrate_from_mesh(self) -> None:
+		"""スキャンから自動でマーカー-骨キャリブを実行 (新プラン)。"""
+		import numpy as np
+		b = self._ankle_current_bone()
+		if b is None:
+			messagebox.showinfo("自動キャリブ", "先に骨を選択してください。"); return
+		name = b.get("name", "?")
+		model_path = str(b.get("model_path", "") or "").strip()
+		if not model_path:
+			messagebox.showwarning("自動キャリブ",
+				"骨モデル (試験後スキャン、マーカー付き) が未設定です。③で選択してください。")
+			return
+		try:
+			aid = int(b.get("aruco_id", -1))
+		except Exception:
+			aid = -1
+		if aid < 0:
+			messagebox.showwarning("自動キャリブ", "骨のArUco IDが未設定です。③で設定してください。")
+			return
+
+		# 進捗ダイアログ
+		update_cb, close_cb, cancel_cb = self._ankle_open_progress(
+			f"スキャンからArUco検出中 [{name}, ID={aid}]")
+		def _progress(done, total, hits):
+			try:
+				update_cb(done, total, 0.0)
+			except Exception:
+				pass
+		try:
+			T_list, reproj_rmse, area, n_hits, det_id = \
+				self._ankle_auto_calibrate_from_mesh_impl(b, progress=_progress)
+		except Exception as e:
+			close_cb()
+			messagebox.showerror("自動キャリブ 失敗", f"{name}: {e}\n\n"
+				"うまくいかない場合、手動「マーカー-骨キャリブ (手動4点)」を試してください。")
+			return
+		close_cb()
+
+		# 保存
+		b["marker_to_bone_T"] = T_list
+		self._ankle_refresh_bone_listbox()
+
+		# 品質評価
+		if reproj_rmse < 1.0:
+			verdict = "極めて良好"
+		elif reproj_rmse < 2.0:
+			verdict = "良好"
+		elif reproj_rmse < 5.0:
+			verdict = "許容範囲 (手動で確認推奨)"
+		else:
+			verdict = "要再取得または手動ピック"
+		msg = (f"[{name}] マーカー-骨変換 T_L←Mk を自動保存しました。\n\n"
+		       f"検出成功視点数 = {n_hits} / 40 視点\n"
+		       f"採用視点のマーカー面積 = {area:.0f} px²\n"
+		       f"再投影誤差 RMSE = {reproj_rmse:.3f} px\n"
+		       f"評価         = {verdict}\n\n"
+		       f"次のダイアログで確認画面を表示します。")
+		messagebox.showinfo(f"{name} 自動キャリブ完了", msg)
+
+		# 確認可視化 (既存の手動キャリブと同じフォーマット、テクスチャ付き)
+		try:
+			calib_path = self._ankle_get_calib_model_path(b)
+			mesh, texture = self._ankle_load_mesh_and_texture(calib_path)
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+			T_arr = np.asarray(T_list, dtype=float)
+			# 4隅の3D位置を obj_pts + T から生成
+			obj_pts = np.asarray(self._ankle_marker_obj_points(marker_size_mm), dtype=float)
+			homog = np.hstack([obj_pts, np.ones((4, 1))])
+			corners_L = (T_arr @ homog.T).T[:, :3]
+			self._ankle_visualize_calibration(
+				mesh, corners_L, T_arr, marker_size_mm,
+				title=f"{name}: 自動キャリブ確認 (青枠=復元, 赤=角)",
+				texture=texture)
+		except Exception as e:
+			print(f"[ankle auto calib] 確認可視化失敗: {e}")
+
 	def on_ankle_calibrate_marker_to_bone(self) -> None:
 		"""選択中の骨のモデル上でマーカー4隅をクリック → T_L←Mk を計算し bone['marker_to_bone_T'] に保存。
 
@@ -3443,10 +4016,11 @@ class MainMenuGUI(_BaseWindow):
 		if b is None:
 			messagebox.showinfo("マーカー-骨キャリブ", "先に骨を選択してください。")
 			return
-		model_path = str(b.get("model_path", "") or "").strip()
-		if not model_path:
+		# キャリブ用モデル優先 (無ければ フルモデル)
+		calib_path = self._ankle_get_calib_model_path(b)
+		if not calib_path:
 			messagebox.showwarning("マーカー-骨キャリブ",
-				"骨モデル(試験後スキャン)が未設定です。③で「骨モデル」を選択してください。")
+				"キャリブ用モデル or 骨モデルが未設定です。③で選択してください。")
 			return
 		try:
 			marker_size_mm = float(self.ankle_marker_size_mm.get())
@@ -3457,24 +4031,30 @@ class MainMenuGUI(_BaseWindow):
 			return
 
 		name = b.get("name", "?")
+		using_calib_only = bool(str(b.get("calib_model_path", "") or "").strip())
+		src_label = "キャリブ用モデル (切り出し)" if using_calib_only else "骨モデル (フル)"
 		messagebox.showinfo(
 			"マーカー-骨キャリブ",
-			f"[{name}] 骨モデル上のArUcoマーカーの4隅を順にクリックしてください。\n\n"
+			f"[{name}] {src_label} 上のArUcoマーカーの4隅を順にクリックしてください。\n\n"
 			f"クリック順序: 左上(TL) → 右上(TR) → 右下(BR) → 左下(BL)\n"
 			f"（マーカー表面を正面から見た向きで）\n\n"
 			f"※ マーカー実寸 = {marker_size_mm:.2f} mm を使用します。\n"
 			f"※ 4点全てクリックしたらウィンドウを閉じてください。")
 
+		# テクスチャ付きで読込
 		try:
-			mesh = pv.read(model_path)
+			mesh, texture = self._ankle_load_mesh_and_texture(calib_path)
 		except Exception as e:
 			messagebox.showerror("マーカー-骨キャリブ",
-				f"骨モデルの読込に失敗しました:\n{e}"); return
+				f"モデル読込失敗:\n{e}"); return
 		if mesh is None or mesh.n_points == 0:
-			messagebox.showerror("マーカー-骨キャリブ", "骨モデルが空です。"); return
+			messagebox.showerror("マーカー-骨キャリブ", "モデルが空です。"); return
+		if texture is None:
+			print(f"[calib] テクスチャなし → 灰色レンダリング。ArUcoが視認しにくい可能性")
 
-		# 膝の点ピッキングを再利用 (PyVistaの surface point picker)
-		picked = self._knee_pick_points(mesh, 4, f"{name}: マーカー4隅 (TL→TR→BR→BL)")
+		# 膝の点ピッキングを再利用 (PyVistaの surface point picker)、テクスチャ渡す
+		picked = self._knee_pick_points(mesh, 4, f"{name}: マーカー4隅 (TL→TR→BR→BL)",
+		                                  texture=texture)
 		if len(picked) < 4:
 			messagebox.showwarning("マーカー-骨キャリブ",
 				f"4点必要ですが {len(picked)} 点しかクリックされていません。やり直してください。")
@@ -3520,7 +4100,8 @@ class MainMenuGUI(_BaseWindow):
 		try:
 			self._ankle_visualize_calibration(
 				mesh, picked, T, marker_size_mm,
-				title=f"{name}: マーカー-骨キャリブ確認")
+				title=f"{name}: マーカー-骨キャリブ確認",
+				texture=texture)
 		except Exception as e:
 			print(f"[ankle calib] 確認可視化失敗: {e}")
 
@@ -4231,6 +4812,320 @@ class MainMenuGUI(_BaseWindow):
 			}
 		return cache
 
+	# ---- 簡易版: 関節座標系 Cj 校正 ----
+	def on_ankle_calibrate_axis(self, axis_name: str) -> None:
+		"""指定軸 (ML/AP/PD) の校正: 短時間D405録画 → クランプArUco軌跡 → PCA1軸抽出。"""
+		import numpy as np
+		if axis_name not in ("ML", "AP", "PD"):
+			messagebox.showerror("軸校正", f"不正な軸名: {axis_name}"); return
+		try:
+			clamp_id = int(self.ankle_clamp_aruco_id.get())
+		except Exception:
+			clamp_id = 100
+		try:
+			seconds = float(self.ankle_axis_calib_seconds.get())
+		except Exception:
+			seconds = 4.0
+		try:
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			marker_size_mm = 20.0
+		aruco_dict_name = str(self.ankle_aruco_dict_var.get())
+		if not self._ankle_check_rs():
+			return
+		if not self._ankle_check_cv2():
+			return
+		try:
+			self.focus_set()
+		except Exception:
+			pass
+		# 録画先
+		import datetime as _dt
+		default_dir = Path(__file__).parent / "cache"
+		try: default_dir.mkdir(parents=True, exist_ok=True)
+		except Exception: pass
+		tag = f"axis_{axis_name}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.db3"
+		bag_path = filedialog.asksaveasfilename(
+			title=f"{axis_name}軸校正: 録画先 .db3",
+			initialdir=str(default_dir),
+			initialfile=tag,
+			defaultextension=".db3",
+			filetypes=[("RealSense recording", "*.db3"), ("すべてのファイル", "*.*")])
+		if not bag_path:
+			return
+		messagebox.showinfo(
+			f"{axis_name}軸校正",
+			f"クランプに ArUco (ID={clamp_id}) を貼り、以下の順で操作してください:\n\n"
+			f"1. プレビューウィンドウで クランプマーカーが見えることを確認\n"
+			f"2. コントロールパネルの「録画開始」を押す\n"
+			f"3. **ロボットで {axis_name} 方向にのみ動かす** (往復可)\n"
+			f"4. 十分な移動範囲を確保したら「録画停止」")
+		ok, frame_count, err = self._ankle_rs_run_preview_and_record(bag_path)
+		if err:
+			messagebox.showerror("軸校正", f"録画失敗: {err}"); return
+		if not ok or frame_count < 5:
+			messagebox.showwarning("軸校正",
+				f"録画フレームが少なすぎます (frames={frame_count})。もう一度お試しください。")
+			return
+		# 検出 (クランプIDだけ)
+		update_cb, close_cb, cancel_cb = self._ankle_open_progress(
+			f"{axis_name}軸: クランプ検出中")
+		try:
+			cache = self._ankle_detect_from_bag(
+				bag_path, aruco_dict_name, marker_size_mm, {clamp_id}, 1, update_cb, cancel_cb)
+		except Exception as e:
+			close_cb()
+			messagebox.showerror("軸校正 検出失敗", f"{e}"); return
+		close_cb()
+		bones_cache = cache.get("bones", {}) or {}
+		if clamp_id not in bones_cache:
+			messagebox.showerror("軸校正",
+				f"クランプ ID={clamp_id} が検出されませんでした。ID・辞書・実寸を確認してください。")
+			return
+		poses = np.asarray(bones_cache[clamp_id]["poses"], dtype=float)
+		detected = np.asarray(bones_cache[clamp_id]["detected"], dtype=bool)
+		positions = poses[detected, :3, 3]  # (N_det, 3)  カメラ系のマーカー中心位置
+		if len(positions) < 5:
+			messagebox.showwarning("軸校正",
+				f"クランプの検出フレーム数が少なすぎます: {len(positions)}件。"); return
+		# PCA: 第1主成分 = 軸方向
+		centroid = positions.mean(axis=0)
+		centered = positions - centroid
+		U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+		axis_dir = Vt[0] / np.linalg.norm(Vt[0])
+		# 移動範囲 (第1主成分投影の最大幅)
+		proj = centered @ axis_dir
+		span_mm = float(proj.max() - proj.min())
+		# 残差 (第2/3主成分の大きさ) → 直線からのバラつき
+		residual_mm = float(np.sqrt(np.mean(centered @ Vt[1] * centered @ Vt[1]
+		                                     + centered @ Vt[2] * centered @ Vt[2])))
+		self._ankle_axis_calib_results[axis_name] = {
+			"axis_dir": axis_dir.tolist(),
+			"centroid": centroid.tolist(),
+			"span_mm": span_mm,
+			"residual_mm": residual_mm,
+			"n_positions": int(len(positions)),
+		}
+		self._ankle_update_axis_calib_status()
+		messagebox.showinfo(
+			f"{axis_name}軸校正 完了",
+			f"軸方向 (カメラ系, 単位ベクトル):\n"
+			f"  [{axis_dir[0]:+.4f}, {axis_dir[1]:+.4f}, {axis_dir[2]:+.4f}]\n\n"
+			f"移動範囲: {span_mm:.2f} mm ({len(positions)}点)\n"
+			f"直線からの残差RMSE: {residual_mm:.3f} mm\n\n"
+			+ ("良好" if residual_mm < 2.0 else "残差やや大 (要確認)"))
+
+	def _ankle_update_axis_calib_status(self) -> None:
+		lines = ["軸校正状態:"]
+		for ax in ("ML", "AP", "PD"):
+			r = self._ankle_axis_calib_results.get(ax)
+			if r:
+				d = r["axis_dir"]
+				lines.append(f"  {ax}: [{d[0]:+.3f}, {d[1]:+.3f}, {d[2]:+.3f}] "
+				             f"span={r['span_mm']:.1f}mm, 残差={r['residual_mm']:.2f}mm")
+			else:
+				lines.append(f"  {ax}: (未校正)")
+		if self._ankle_joint_frame_Cj is not None:
+			lines.append("→ Cj確定済み")
+		try:
+			self.ankle_axis_calib_status.set("\n".join(lines))
+		except Exception:
+			pass
+
+	def on_ankle_finalize_joint_frame(self) -> None:
+		"""3軸から関節座標系 Cj を確定 (SVDで直交化)。"""
+		import numpy as np
+		results = self._ankle_axis_calib_results
+		missing = [ax for ax in ("ML", "AP", "PD") if ax not in results]
+		if missing:
+			messagebox.showwarning("Cj確定", f"未校正軸: {', '.join(missing)}"); return
+		# 3軸を列としてまとめる
+		M = np.column_stack([
+			np.asarray(results["ML"]["axis_dir"], dtype=float),
+			np.asarray(results["AP"]["axis_dir"], dtype=float),
+			np.asarray(results["PD"]["axis_dir"], dtype=float),
+		])
+		# SVDで最近直交回転行列に (M ≈ U V^T, R = U V^T の変形)
+		U, S, Vt = np.linalg.svd(M)
+		R_Cj = U @ Vt
+		# 右手系保証
+		if np.linalg.det(R_Cj) < 0:
+			U[:, -1] *= -1
+			R_Cj = U @ Vt
+		# 原点: 3軸校正の重心平均
+		centroids = [np.asarray(results[ax]["centroid"], dtype=float) for ax in ("ML","AP","PD")]
+		origin = np.mean(centroids, axis=0)
+		# Cj: カメラ系 → Cj系 の変換。 R_Cj の列がカメラ系での Cj軸方向
+		# T_Cj←C 構築: p_Cj = R_Cj^T (p_C - origin)  → 4x4形式で
+		T = np.eye(4)
+		T[:3, :3] = R_Cj.T   # C→Cj の回転
+		T[:3, 3] = -R_Cj.T @ origin
+		self._ankle_joint_frame_Cj = T.tolist()
+		# 直交化残差 (元の3軸との角度差)
+		angles = []
+		for i, ax in enumerate(("ML","AP","PD")):
+			orig = np.asarray(results[ax]["axis_dir"], dtype=float)
+			new = R_Cj[:, i]
+			cos_a = float(np.clip(np.dot(orig, new), -1, 1))
+			angles.append(np.rad2deg(np.arccos(cos_a)))
+		self._ankle_update_axis_calib_status()
+		messagebox.showinfo(
+			"関節座標系 Cj 確定",
+			f"3軸から Cj を SVD直交化しました。\n\n"
+			f"直交化での各軸ずれ (deg):\n"
+			f"  ML: {angles[0]:.2f}°\n"
+			f"  AP: {angles[1]:.2f}°\n"
+			f"  PD: {angles[2]:.2f}°\n\n"
+			f"最大ずれ < 5° なら3軸がおおむね直交しており良好。\n"
+			f"それ以上なら3軸校正の動きが直交していなかった可能性があります。")
+
+	def on_ankle_clear_joint_frame(self) -> None:
+		if not messagebox.askyesno("Cjクリア", "3軸校正結果と Cj を全て削除しますか?"):
+			return
+		self._ankle_axis_calib_results = {}
+		self._ankle_joint_frame_Cj = None
+		self._ankle_update_axis_calib_status()
+
+	def on_ankle_analyze_in_cj(self) -> None:
+		"""現在の姿勢時系列キャッシュを、Cj系での骨マーカー動揺として出力 (CSV + matplotlibグラフ)。"""
+		import numpy as np
+		if self._ankle_joint_frame_Cj is None:
+			messagebox.showwarning("Cj分析", "先に関節座標系 Cj を確定してください。"); return
+		cache = self._ankle_get_current_cache()
+		if not cache:
+			messagebox.showwarning("Cj分析",
+				"姿勢時系列がありません。⓪で本試験録画 → ④でArUco検出+PnP実行 してください。")
+			return
+		bones_cache = cache.get("bones", {}) or {}
+		if not bones_cache:
+			messagebox.showwarning("Cj分析", "検出データがありません。"); return
+		T_Cj_C = np.asarray(self._ankle_joint_frame_Cj, dtype=float)
+		R_Cj_C = T_Cj_C[:3, :3]
+		# クランプIDを分析対象から除外 (静止基準として扱う)
+		try:
+			clamp_id = int(self.ankle_clamp_aruco_id.get())
+		except Exception:
+			clamp_id = -1
+		# ID→(骨名, 色) 対応
+		id_to_bone = {int(b.get("aruco_id", -1)): (b.get("name", ""), self._ankle_color_of(i))
+		              for i, b in enumerate(self.ankle_bones)}
+		# 出力先
+		default_dir = Path(__file__).parent / "cache"
+		try: default_dir.mkdir(parents=True, exist_ok=True)
+		except Exception: pass
+		import datetime as _dt
+		out_dir = filedialog.askdirectory(
+			title="Cj系分析結果 保存先フォルダ",
+			initialdir=str(default_dir))
+		if not out_dir:
+			return
+		ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+		timestamps = np.asarray(cache.get("timestamps", []), dtype=float)
+		# matplotlib
+		try:
+			import matplotlib
+			matplotlib.use("Agg")
+			import matplotlib.pyplot as plt
+		except ImportError:
+			plt = None
+		results_summary = []
+		for aid, b in bones_cache.items():
+			aid = int(aid)
+			if aid == clamp_id:
+				continue
+			name, color = id_to_bone.get(aid, (f"ID{aid}", "#888888"))
+			poses = np.asarray(b["poses"], dtype=float)  # (N,4,4)  T_C←Mk
+			detected = np.asarray(b["detected"], dtype=bool)
+			N = len(poses)
+			# 各フレームの Cj系での位置と回転
+			pos_cj = np.full((N, 3), np.nan)
+			rot_cj_euler = np.full((N, 3), np.nan)  # ML, AP, PD 回りの回転
+			for t in range(N):
+				if not detected[t]:
+					continue
+				T_C_Mk = poses[t]
+				# T_Cj←Mk = T_Cj←C · T_C←Mk
+				T_Cj_Mk = T_Cj_C @ T_C_Mk
+				pos_cj[t] = T_Cj_Mk[:3, 3]
+				# Euler: ML(x), AP(y), PD(z) 回転
+				R = T_Cj_Mk[:3, :3]
+				# xyz順 Euler
+				sy = np.sqrt(R[0,0]**2 + R[1,0]**2)
+				if sy > 1e-6:
+					x_rot = np.arctan2(R[2,1], R[2,2])
+					y_rot = np.arctan2(-R[2,0], sy)
+					z_rot = np.arctan2(R[1,0], R[0,0])
+				else:
+					x_rot = np.arctan2(-R[1,2], R[1,1])
+					y_rot = np.arctan2(-R[2,0], sy)
+					z_rot = 0.0
+				rot_cj_euler[t] = np.rad2deg([x_rot, y_rot, z_rot])
+			# 参照フレーム (t=0 の最初の検出) を減算 → 「動揺」
+			ref_idx = None
+			for t in range(N):
+				if detected[t]:
+					ref_idx = t; break
+			if ref_idx is not None:
+				pos_ref = pos_cj[ref_idx].copy()
+				rot_ref = rot_cj_euler[ref_idx].copy()
+				pos_delta = pos_cj - pos_ref[None, :]
+				rot_delta = rot_cj_euler - rot_ref[None, :]
+			else:
+				pos_delta = pos_cj
+				rot_delta = rot_cj_euler
+			# CSV書き出し
+			safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(name))
+			csv_path = Path(out_dir) / f"ankle_cj_bone_id{aid:03d}_{safe_name}_{ts}.csv"
+			try:
+				with csv_path.open("w", encoding="utf-8") as f:
+					f.write("frame,time_s,detected,pos_ML_mm,pos_AP_mm,pos_PD_mm,"
+					        "rot_ML_deg,rot_AP_deg,rot_PD_deg,"
+					        "delta_pos_ML_mm,delta_pos_AP_mm,delta_pos_PD_mm,"
+					        "delta_rot_ML_deg,delta_rot_AP_deg,delta_rot_PD_deg\n")
+					for t in range(N):
+						ts_v = timestamps[t] if t < len(timestamps) else t / 15.0
+						row = [t, f"{ts_v:.4f}", int(detected[t])]
+						for v in (*pos_cj[t], *rot_cj_euler[t], *pos_delta[t], *rot_delta[t]):
+							row.append(f"{v:.4f}" if not np.isnan(v) else "")
+						f.write(",".join(str(x) for x in row) + "\n")
+			except Exception as e:
+				print(f"[cj分析] CSV書出失敗 ({name}): {e}")
+			# グラフ
+			if plt is not None:
+				try:
+					fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+					x = timestamps if len(timestamps) == N else np.arange(N) / 15.0
+					axes[0].plot(x, pos_delta[:, 0], label="ΔML", color="red")
+					axes[0].plot(x, pos_delta[:, 1], label="ΔAP", color="green")
+					axes[0].plot(x, pos_delta[:, 2], label="ΔPD", color="blue")
+					axes[0].set_ylabel("Δposition (mm)")
+					axes[0].set_title(f"Bone motion in Cj — ID={aid} ({name})")
+					axes[0].legend(); axes[0].grid(True, alpha=0.3)
+					axes[1].plot(x, rot_delta[:, 0], label="ΔroundML", color="red")
+					axes[1].plot(x, rot_delta[:, 1], label="ΔroundAP", color="green")
+					axes[1].plot(x, rot_delta[:, 2], label="ΔroundPD", color="blue")
+					axes[1].set_xlabel("time (s)"); axes[1].set_ylabel("Δrotation (deg)")
+					axes[1].legend(); axes[1].grid(True, alpha=0.3)
+					png_path = Path(out_dir) / f"ankle_cj_bone_id{aid:03d}_{safe_name}_{ts}.png"
+					fig.tight_layout()
+					fig.savefig(png_path, dpi=120)
+					plt.close(fig)
+				except Exception as e:
+					print(f"[cj分析] グラフ失敗 ({name}): {e}")
+			# サマリー
+			det_rate = float(np.sum(detected)) / max(N, 1) * 100
+			results_summary.append(
+				f"  ID={aid} ({name}): 検出率{det_rate:.1f}%, "
+				f"ΔML範囲={float(np.nanmax(pos_delta[:,0]) - np.nanmin(pos_delta[:,0])):.2f}mm, "
+				f"ΔAP範囲={float(np.nanmax(pos_delta[:,1]) - np.nanmin(pos_delta[:,1])):.2f}mm, "
+				f"ΔPD範囲={float(np.nanmax(pos_delta[:,2]) - np.nanmin(pos_delta[:,2])):.2f}mm")
+		messagebox.showinfo(
+			"Cj系分析 完了",
+			f"骨マーカー動揺を Cj 系で分析しました。\n\n"
+			f"保存先: {out_dir}\n"
+			f"タイムスタンプ: {ts}\n\n"
+			+ ("\n".join(results_summary) if results_summary else "分析対象骨なし"))
+
 	def on_ankle_visualize_pose_series(self) -> None:
 		"""検出済み姿勢時系列 T_C←Mk(t) を3D軌跡としてPyVistaで表示 (骨モデル・スキャン不要)。
 
@@ -4676,6 +5571,10 @@ class MainMenuGUI(_BaseWindow):
 	def _ankle_build_bone_transforms(self, cache: dict):
 		"""キャッシュ+骨リストから、各骨の T_W←bone(t) 時系列を構築する。
 
+		動作モードで分岐:
+		- "original": T_W←bone(t) = ΔMk(t) · T_W←L    (要 reg_T)
+		- "self_pose": T_W←bone(t) = T_W←C · T_C←Mk(t) · inv(T_L←Mk)    (要 marker_to_bone_T)
+
 		Returns:
 		    animatable: list of (bone_idx, mesh_L(pv.PolyData), T_series(N,4,4))
 		    frame_count: int (共通フレーム数)
@@ -4685,10 +5584,107 @@ class MainMenuGUI(_BaseWindow):
 		N = int(cache.get("frame_count", 0))
 		if N == 0:
 			return [], 0, ["キャッシュにフレームがありません"]
+		try:
+			mode = str(self.ankle_workflow_mode.get())
+		except Exception:
+			mode = "original"
 		ref = int(self.ankle_ref_frame.get())
 		warnings = []
 		animatable = []
 		bones_cache = cache.get("bones", {}) or {}
+
+		if mode == "self_pose":
+			# --- 新プラン: T_C←bone(t) = T_C←Mk(t) · inv(T_L←Mk) ---
+			try:
+				world_choice = str(self.ankle_self_pose_world.get())
+			except Exception:
+				world_choice = "camera_ref"
+			# W = camera_ref: 参照フレームのカメラ姿勢を W とする → T_W←C = inv(T_C←C(0)) = I
+			#                 つまり T_W←bone(t) = T_C←bone(t) をそのまま使用 (W = C(0))
+			# W = boneA_ref: ヒートマップの骨A の参照フレーム姿勢を W とする
+			#                T_W←bone(t) = inv(T_C←boneA(0)) · T_C←bone(t)
+			# まず各骨の T_C←bone(t) を計算
+			bone_data = []  # (idx, name, mesh_L, T_C_bone_series, ref_valid)
+			for idx, bone in enumerate(self.ankle_bones):
+				name = bone.get("name", f"骨{idx+1}")
+				aid = int(bone.get("aruco_id", -1))
+				if aid not in bones_cache:
+					warnings.append(f"{name} (ID={aid}): 姿勢時系列にIDなし → スキップ")
+					continue
+				if bone.get("marker_to_bone_T") is None:
+					warnings.append(f"{name}: マーカー-骨キャリブ未実行 (新プラン必須) → スキップ")
+					continue
+				if not bone.get("model_path"):
+					warnings.append(f"{name}: 骨モデル未設定 → スキップ")
+					continue
+				try:
+					mesh_L = pv.read(bone["model_path"])
+				except Exception as e:
+					warnings.append(f"{name}: モデル読込失敗 ({e}) → スキップ")
+					continue
+				T_L_Mk = np.asarray(bone["marker_to_bone_T"], dtype=float)
+				try:
+					T_Mk_L = np.linalg.inv(T_L_Mk)
+				except np.linalg.LinAlgError:
+					warnings.append(f"{name}: T_L←Mk が特異 → スキップ")
+					continue
+				b = bones_cache[aid]
+				poses = np.asarray(b["poses"], dtype=float)     # (N,4,4) T_C←Mk(t)
+				detected = np.asarray(b["detected"], dtype=bool)
+				if len(poses) != N or len(detected) != N:
+					warnings.append(f"{name}: 姿勢時系列のフレーム数不一致 → スキップ")
+					continue
+				# T_C←bone(t) = T_C←Mk(t) · T_Mk←L
+				T_C_bone = np.zeros((N, 4, 4), dtype=float)
+				last_valid = None
+				for t in range(N):
+					if detected[t]:
+						T_C_bone[t] = poses[t] @ T_Mk_L
+						last_valid = T_C_bone[t]
+					else:
+						T_C_bone[t] = last_valid if last_valid is not None else np.eye(4)
+				bone_data.append((idx, name, mesh_L, T_C_bone, detected))
+			if not bone_data:
+				return [], N, warnings
+			# W 座標系の決定
+			T_W_C = np.eye(4)  # 既定: W = C
+			if world_choice == "camera_ref":
+				# W = 参照フレームでのカメラ姿勢 → T_W←C = C(ref)→C(ref) = I
+				# 実際は各骨が動くだけなので、W=C(0) と等価。何もしない。
+				T_W_C = np.eye(4)
+			elif world_choice == "boneA_ref":
+				# ヒートマップ骨A の参照フレーム姿勢を W とする
+				prox_i, _ = self._ankle_heatmap_bone_indices()
+				# bone_data の中で prox_i を探す
+				target = None
+				for (idx, name, mesh_L, T_C_bone, detected) in bone_data:
+					if idx == prox_i:
+						target = (name, T_C_bone, detected); break
+				if target is None:
+					warnings.append("W=骨A基準 指定だが骨Aが未選択 or 未検出 → W=C(0) にフォールバック")
+					T_W_C = np.eye(4)
+				else:
+					name_A, T_C_A, det_A = target
+					T_A_ref, ref_used = self._ankle_pick_reference_pose(T_C_A, det_A, ref)
+					if T_A_ref is None:
+						warnings.append(f"W=骨A基準: {name_A} の参照フレームが検出無し → W=C(0)")
+						T_W_C = np.eye(4)
+					else:
+						# W = 骨A の参照姿勢 (in C) → T_W←C = inv(T_C←W) = inv(T_A_ref)
+						try:
+							T_W_C = np.linalg.inv(T_A_ref)
+						except np.linalg.LinAlgError:
+							warnings.append(f"W=骨A基準: T_A_ref 特異 → W=C(0)")
+							T_W_C = np.eye(4)
+			# 最終 T_W←bone(t) = T_W←C · T_C←bone(t)
+			for (idx, name, mesh_L, T_C_bone, detected) in bone_data:
+				Ts = np.zeros((N, 4, 4), dtype=float)
+				for t in range(N):
+					Ts[t] = T_W_C @ T_C_bone[t]
+				animatable.append((idx, mesh_L, Ts))
+			return animatable, N, warnings
+
+		# --- 原プラン: 従来の相対運動アニメ ---
 		for idx, bone in enumerate(self.ankle_bones):
 			name = bone.get("name", f"骨{idx+1}")
 			aid = int(bone.get("aruco_id", -1))
@@ -4771,10 +5767,325 @@ class MainMenuGUI(_BaseWindow):
 		sd = scene.compute_signed_distance(o3d.core.Tensor(pts_A, o3d.core.float32)).numpy()
 		return np.asarray(sd, dtype=np.float32)
 
-	def on_ankle_animate(self) -> None:
-		"""ArUco姿勢時系列と骨位置合わせから、N骨のアニメーション + 骨対ヒートマップを表示する。"""
+	# ================================================================
+	# 共通シミュレーション表示エンジン (_sim_view_*)
+	# hip/knee の on_animate と同等の UI/UX/操作感を N骨に汎用化した実装。
+	# ankle が使用中。将来 hip/knee も同じヘルパに載せ替え可 (TODO)。
+	# ================================================================
+
+	@staticmethod
+	def _sim_view_heatmap_cmap():
+		"""接触ヒートマップの共通カラーマップ (-10mm=赤 → 0mm=緑)。hip と揃える。"""
+		try:
+			from matplotlib.colors import LinearSegmentedColormap
+			return LinearSegmentedColormap.from_list(
+				'contact_pen',
+				[(0.0, (0.75, 0.0, 0.0)),
+				 (0.5, (1.0, 0.6, 0.0)),
+				 (1.0, (0.1, 0.75, 0.1))])
+		except Exception:
+			return 'RdYlGn'
+
+	def _sim_view_precompute_multi_heatmap(self, bones_data, progress_cb=None, cancel_flag=None):
+		"""N骨のマルチヒートマップを事前計算。
+
+		各フレーム t / 各骨 i について
+		    scalars[t][i] = min over j!=i of signed_distance(bone_i vertex, bone_j surface)
+		を返す。負値=めり込み・0=接触・正=離間。
+
+		Args:
+			bones_data: list of (bone_idx, name, mesh_L, T_series (N,4,4))
+			progress_cb: fn(current, total, msg) -> bool (False で中断)
+			cancel_flag: list/ref with [0]=truthy でキャンセル
+
+		Returns:
+			list of dict{bone_idx: np.ndarray(N_verts,)}  長さ N (フレーム数)
+			失敗時: 空配列
+		"""
 		import numpy as np
-		# 1. 前提チェック
+		try:
+			import open3d as o3d
+		except ImportError:
+			return []
+		if not bones_data:
+			return []
+		N = len(bones_data[0][3])
+		result = []
+		for t in range(N):
+			if cancel_flag is not None and cancel_flag[0]:
+				return []
+			# 各骨の変換後メッシュ・BVH scene を構築
+			transformed = {}
+			scenes = {}
+			for (idx, name, mesh_L, Ts) in bones_data:
+				m_W = self._ankle_apply_T_to_mesh(mesh_L, Ts[t])
+				m_surf = m_W if isinstance(m_W, pv.PolyData) else m_W.extract_surface()
+				m_surf = m_surf.triangulate()
+				transformed[idx] = m_surf
+				try:
+					verts = np.asarray(m_surf.points, dtype=np.float32)
+					faces_raw = np.asarray(m_surf.faces)
+					if faces_raw.size < 4:
+						scenes[idx] = None
+						continue
+					faces = faces_raw.reshape(-1, 4)[:, 1:4].astype(np.int32)
+					scene = o3d.t.geometry.RaycastingScene()
+					scene.add_triangles(o3d.t.geometry.TriangleMesh(
+						o3d.core.Tensor(verts, o3d.core.float32),
+						o3d.core.Tensor(faces, o3d.core.int32)))
+					scenes[idx] = scene
+				except Exception:
+					scenes[idx] = None
+			# 各骨 i について、他の全骨 j との signed distance の頂点毎最小値
+			per_frame = {}
+			for (idx_i, name_i, mesh_L_i, Ts_i) in bones_data:
+				pts_i = np.asarray(transformed[idx_i].points, dtype=np.float32)
+				if pts_i.size == 0:
+					per_frame[idx_i] = np.zeros(0, dtype=np.float32)
+					continue
+				min_sd = np.full(len(pts_i), np.inf, dtype=np.float32)
+				for (idx_j, name_j, mesh_L_j, Ts_j) in bones_data:
+					if idx_j == idx_i:
+						continue
+					scene_j = scenes.get(idx_j)
+					if scene_j is None:
+						continue
+					try:
+						sd = scene_j.compute_signed_distance(
+							o3d.core.Tensor(pts_i, o3d.core.float32)).numpy()
+						min_sd = np.minimum(min_sd, sd.astype(np.float32))
+					except Exception:
+						pass
+				# 他骨無しなら +inf → clim 上限外 (透明)
+				per_frame[idx_i] = min_sd
+			result.append(per_frame)
+			if progress_cb is not None:
+				try:
+					if progress_cb(t + 1, N, f"ヒートマップ計算中 {t+1}/{N}") is False:
+						return []
+				except Exception:
+					pass
+		return result
+
+	def _sim_view_show_precompute_dialog(self, total_frames, n_bones):
+		"""ankle 用のシンプルな事前計算ダイアログ (hip の _show_precompute_dialog を軽量化)。
+
+		Returns:
+			(dialog, update_progress, start_var, skip_var, cancel_var)
+		"""
+		win = tk.Toplevel(self)
+		win.title("事前計算 (マルチヒートマップ)")
+		win.geometry("500x260")
+		win.resizable(False, False)
+		win.grab_set()
+		start_var = tk.BooleanVar(value=False)
+		skip_var = tk.BooleanVar(value=False)
+		cancel_var = tk.BooleanVar(value=False)
+
+		ttk.Label(win, text="ヒートマップの事前計算",
+		          font=(self.ui_font_family, 12, "bold")).pack(pady=10)
+		info = (f"骨数: {n_bones} 本\n"
+		        f"フレーム数: {total_frames}\n"
+		        f"計算量目安: 骨数×(骨数-1)×フレーム数 = {n_bones*(n_bones-1)*total_frames} 距離計算\n\n"
+		        "事前計算するとアニメーション中の描画が高速化されます。\n"
+		        "スキップした場合、ヒートマップは表示されません。")
+		ttk.Label(win, text=info, justify=tk.LEFT).pack(pady=5, padx=15, anchor=tk.W)
+
+		pbar = ttk.Progressbar(win, mode='determinate', length=440)
+		pbar.pack(pady=8, padx=15)
+		status_var = tk.StringVar(value="待機中")
+		ttk.Label(win, textvariable=status_var, foreground="#005580").pack(pady=2)
+
+		btn_frame = ttk.Frame(win)
+		btn_frame.pack(pady=10)
+		ttk.Button(btn_frame, text="計算開始", width=14,
+		           command=lambda: start_var.set(True)).pack(side=tk.LEFT, padx=5)
+		ttk.Button(btn_frame, text="スキップ (ヒートマップなし)", width=24,
+		           command=lambda: skip_var.set(True)).pack(side=tk.LEFT, padx=5)
+		ttk.Button(btn_frame, text="キャンセル", width=14,
+		           command=lambda: cancel_var.set(True)).pack(side=tk.LEFT, padx=5)
+
+		win.protocol("WM_DELETE_WINDOW", lambda: cancel_var.set(True))
+
+		def update_progress(current, total, msg):
+			try:
+				pbar['value'] = (current / max(total, 1)) * 100
+				status_var.set(msg)
+				win.update()
+			except Exception:
+				pass
+			return not cancel_var.get()
+
+		return win, update_progress, start_var, skip_var, cancel_var
+
+	def _sim_view_create_control_panel(self, n_frames, frame_times, callbacks, features=None):
+		"""hip と同じ再生コントロールウィンドウを作成 (N骨汎用)。
+
+		Args:
+			n_frames: 総フレーム数
+			frame_times: 各フレームの時刻 [sec] (長さ n_frames)
+			callbacks: dict {
+				'on_frame_seek': fn(frame_idx)  ユーザーがバーをドラッグしたとき,
+				'on_pause_toggle': fn(is_paused)  一時停止/再生切替後,
+				'on_speed_change': fn(speed)  速度スライダー変更後,
+				'on_csv_export': fn()  CSV出力ボタン (features['csv']=True のみ),
+				'on_screenshot': fn()  スクリーンショット,
+				'on_export_model': fn()  現在フレームのモデルを出力,
+				'on_close': fn()  ウィンドウが閉じられたとき,
+			}
+			features: dict {'csv': bool, 'export_model': bool, 'screenshot': bool}
+
+		Returns:
+			dict {
+				'window': tk.Toplevel,
+				'frame_label': ttk.Label,     # "Frame: N/M | Time: X.XXXs"
+				'actual_label': ttk.Label,    # "Actual: X.XXXs"
+				'speed_label': ttk.Label,     # "Speed: X.XXx"
+				'max_pent_label': ttk.Label,  # "Max Pent: X.XX mm"
+				'playback_scale': tk.Scale,
+				'speed_scale': tk.Scale,
+				'pause_button': ttk.Button,
+				'user_is_dragging': [bool],   # ドラッグ中フラグ (参照用)
+				'is_programmatic_update': [bool],
+			}
+		"""
+		if features is None:
+			features = {'csv': True, 'export_model': True, 'screenshot': True}
+
+		control_window = tk.Toplevel(self)
+		control_window.title("再生コントロール")
+		control_window.geometry("850x260")
+		control_window.resizable(True, True)
+		control_window.minsize(400, 200)
+		control_window.attributes('-topmost', True)
+
+		user_is_dragging = [False]
+		is_programmatic_update = [False]
+
+		# 情報表示行
+		info_frame = ttk.Frame(control_window)
+		info_frame.pack(pady=5, padx=10, fill=tk.X)
+		frame_label = ttk.Label(info_frame,
+			text=f"Frame: 0/{max(n_frames-1,0)} | Time: {frame_times[0]:.3f}s"
+			     if n_frames > 0 else "Frame: 0/0",
+			font=(self.ui_font_family, 10))
+		frame_label.pack(side=tk.LEFT, padx=5)
+		actual_label = ttk.Label(info_frame, text="Actual: 0.000s",
+			font=(self.ui_font_family, 10), foreground="blue")
+		actual_label.pack(side=tk.LEFT, padx=5)
+		speed_label = ttk.Label(info_frame, text="Speed: 1.0x",
+			font=(self.ui_font_family, 10), foreground="darkgreen")
+		speed_label.pack(side=tk.LEFT, padx=5)
+		max_pent_label = ttk.Label(info_frame, text="Max Pent: -- mm",
+			font=(self.ui_font_family, 10), foreground="red")
+		max_pent_label.pack(side=tk.LEFT, padx=5)
+
+		# 再生バー
+		def _on_press(event):
+			user_is_dragging[0] = True
+
+		def _on_release(event):
+			user_is_dragging[0] = False
+
+		def _on_scale_change(val):
+			if is_programmatic_update[0]:
+				return
+			if user_is_dragging[0]:
+				cb = callbacks.get('on_frame_seek')
+				if cb is not None:
+					try:
+						cb(int(float(val)))
+					except Exception as e:
+						print(f"[sim_view] on_frame_seek 失敗: {e}")
+
+		playback_scale = tk.Scale(
+			control_window, from_=0, to=max(n_frames - 1, 0),
+			orient=tk.HORIZONTAL, label="Frame Position",
+			command=_on_scale_change)
+		playback_scale.pack(pady=5, padx=10, fill=tk.X)
+		playback_scale.bind("<ButtonPress-1>", _on_press)
+		playback_scale.bind("<ButtonRelease-1>", _on_release)
+
+		# 速度スライダー
+		def _on_speed(val):
+			try:
+				speed = float(val)
+				speed_label.config(text=f"Speed: {speed:.2f}x")
+				cb = callbacks.get('on_speed_change')
+				if cb is not None:
+					cb(speed)
+			except Exception as e:
+				print(f"[sim_view] on_speed 失敗: {e}")
+
+		speed_scale = tk.Scale(control_window, from_=0.25, to=10.0, resolution=0.25,
+			orient=tk.HORIZONTAL, label="Playback Speed (0.25x - 10x)",
+			command=_on_speed)
+		speed_scale.set(1.0)
+		speed_scale.pack(pady=5, padx=10, fill=tk.X)
+
+		# ボタン行
+		button_frame = ttk.Frame(control_window)
+		button_frame.pack(pady=5)
+		pause_button = ttk.Button(button_frame, text="一時停止", width=15)
+		pause_button.pack(side=tk.LEFT, padx=5)
+
+		def _toggle_pause():
+			# 呼び側が実際の state を管理 (True/False は callback に任せる)
+			cb = callbacks.get('on_pause_toggle')
+			if cb is not None:
+				try:
+					new_paused = cb()
+					pause_button.config(text="再生" if new_paused else "一時停止")
+				except Exception as e:
+					print(f"[sim_view] on_pause_toggle 失敗: {e}")
+
+		pause_button.config(command=_toggle_pause)
+
+		if features.get('csv') and callbacks.get('on_csv_export'):
+			ttk.Button(button_frame, text="CSV出力", width=15,
+			           command=callbacks['on_csv_export']).pack(side=tk.LEFT, padx=5)
+		if features.get('export_model') and callbacks.get('on_export_model'):
+			ttk.Button(button_frame, text="このモデルを出力", width=18,
+			           command=callbacks['on_export_model']).pack(side=tk.LEFT, padx=5)
+		if features.get('screenshot') and callbacks.get('on_screenshot'):
+			ttk.Button(button_frame, text="スクリーンショット", width=18,
+			           command=callbacks['on_screenshot']).pack(side=tk.LEFT, padx=5)
+
+		def _on_close():
+			cb = callbacks.get('on_close')
+			if cb is not None:
+				try:
+					cb()
+				except Exception:
+					pass
+			try:
+				control_window.destroy()
+			except Exception:
+				pass
+
+		control_window.protocol("WM_DELETE_WINDOW", _on_close)
+
+		return {
+			'window': control_window,
+			'frame_label': frame_label,
+			'actual_label': actual_label,
+			'speed_label': speed_label,
+			'max_pent_label': max_pent_label,
+			'playback_scale': playback_scale,
+			'speed_scale': speed_scale,
+			'pause_button': pause_button,
+			'user_is_dragging': user_is_dragging,
+			'is_programmatic_update': is_programmatic_update,
+		}
+
+	def on_ankle_animate(self) -> None:
+		"""ArUco姿勢時系列と骨キャリブから、N骨のアニメーション + マルチヒートマップを表示。
+
+		hip の on_animate と同等の再生コントロール (Play/Pause/速度/フレームバー/CSV/スクショ) を持つ。
+		描画エンジンは共通ヘルパ _sim_view_* を使用。
+		"""
+		import numpy as np
+		# --- 1. 前提チェック ---
 		cache = self._ankle_get_current_cache()
 		if not cache:
 			messagebox.showwarning("シミュレーション",
@@ -4783,7 +6094,8 @@ class MainMenuGUI(_BaseWindow):
 		if not self.ankle_bones:
 			messagebox.showwarning("シミュレーション", "骨リストが空です。")
 			return
-		# 2. 骨ごとに W系姿勢時系列を構築
+
+		# --- 2. 骨ごとに W系姿勢時系列を構築 ---
 		animatable, N, warns = self._ankle_build_bone_transforms(cache)
 		if not animatable:
 			messagebox.showwarning("シミュレーション",
@@ -4792,81 +6104,130 @@ class MainMenuGUI(_BaseWindow):
 		if warns:
 			print("[ankle animate] 警告:\n  " + "\n  ".join(warns))
 
-		# 3. ヒートマップ骨対の解決
-		prox_i, dist_i = self._ankle_heatmap_bone_indices()
-		bone_indices_in_anim = {idx for (idx, _, _) in animatable}
-		heatmap_enabled = (prox_i is not None and dist_i is not None
-		                   and prox_i in bone_indices_in_anim and dist_i in bone_indices_in_anim
-		                   and prox_i != dist_i)
-		if (prox_i is not None or dist_i is not None) and not heatmap_enabled:
-			print(f"[ankle animate] ヒートマップ対が無効 (prox={prox_i}, dist={dist_i}) → ヒートマップなしで表示")
+		# bones_data: list of (idx, name, mesh_L, T_series)
+		bones_data = []
+		for (idx, mesh_L, Ts) in animatable:
+			name = self.ankle_bones[idx].get("name", f"骨{idx+1}") if idx < len(self.ankle_bones) else f"骨{idx+1}"
+			bones_data.append((idx, name, mesh_L, Ts))
+		n_bones = len(bones_data)
 
-		# 4. Plotter 準備
-		sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
-		plotter = pv.Plotter(title="ankle: シミュレーション",
-		                     window_size=(int(sw * 0.9), int(sh * 0.9)))
-		plotter.set_background("white")
+		# フレーム時刻 (キャッシュにあれば使う、なければ 1/30s 刻み)
+		ts_cache = cache.get("timestamps", None)
+		if ts_cache is not None and len(ts_cache) >= N:
+			frame_times = [float(ts_cache[t]) for t in range(N)]
+		else:
+			frame_times = [t / 30.0 for t in range(N)]
 
-		# 骨アクター (SetUserMatrixで高速更新)
-		# 初期 = 参照フレームの姿勢 (=reg_T)。ここに時刻tの delta を掛ける。
-		anim_map = {idx: (mesh_L, Ts) for (idx, mesh_L, Ts) in animatable}
-		actors = {}
-		anim_first_T_inv = {}
-		for idx, mesh_L, Ts in animatable:
-			# 初期姿勢 = Ts[0] を適用したコピーをVTKに渡す
-			m0 = self._ankle_apply_T_to_mesh(mesh_L, Ts[0])
-			color = self._ankle_color_of(idx)
-			actor = plotter.add_mesh(m0, color=color, opacity=1.0, smooth_shading=True, show_edges=False)
-			actors[idx] = actor
-			anim_first_T_inv[idx] = np.linalg.inv(Ts[0])
+		# --- 3. 事前計算ダイアログ (マルチヒートマップ) ---
+		heatmap_data = []  # list of dict {bone_idx: distances} per frame
+		if n_bones >= 2:
+			dlg_win, upd_progress, start_var, skip_var, cancel_var = \
+				self._sim_view_show_precompute_dialog(N, n_bones)
+			# モーダル待機
+			while dlg_win.winfo_exists():
+				if start_var.get() or skip_var.get() or cancel_var.get():
+					break
+				try:
+					dlg_win.update()
+				except Exception:
+					break
+				time.sleep(0.01)
+			if cancel_var.get():
+				try:
+					dlg_win.destroy()
+				except Exception:
+					pass
+				return
+			if start_var.get():
+				# 計算実行
+				try:
+					heatmap_data = self._sim_view_precompute_multi_heatmap(
+						bones_data,
+						progress_cb=upd_progress,
+						cancel_flag=[False])
+					print(f"[ankle animate] マルチヒートマップ計算完了: {len(heatmap_data)} frames")
+				except Exception as e:
+					print(f"[ankle animate] ヒートマップ計算失敗: {e}")
+					heatmap_data = []
+			try:
+				dlg_win.destroy()
+			except Exception:
+				pass
 
-		# 初期スキャン(半透明) — 参考表示
+		# --- 4. プロッター作成 (hip と同じスタイル) ---
+		pv.global_theme.allow_empty_mesh = True
+		sw = self.winfo_screenwidth()
+		sh = self.winfo_screenheight()
+		anim_plotter = pv.Plotter(title="ankle: シミュレーション",
+		                          window_size=(int(sw * 0.9), int(sh * 0.9)))
+		anim_plotter.set_background("white")
+
+		# 初期スキャン (半透明・参考表示)
 		scan_path = self.ankle_initial_scan_path.get().strip()
 		if scan_path:
 			try:
-				plotter.add_mesh(pv.read(scan_path), color="lightgray", opacity=0.15, smooth_shading=True)
+				anim_plotter.add_mesh(pv.read(scan_path), color="lightgray",
+				                       opacity=0.15, smooth_shading=True, name='initial_scan')
 			except Exception as e:
 				print(f"[ankle animate] 初期スキャン表示失敗: {e}")
 
-		# 5. ヒートマップアクター準備
-		heatmap_actor = None
-		heatmap_cache = {}  # frame -> distances(N_A,)
-		if heatmap_enabled:
-			mesh_A_L, Ts_A = anim_map[prox_i]
-			mesh_B_L, Ts_B = anim_map[dist_i]
-			# 骨A の初期姿勢メッシュを用意 (scalarsだけ毎フレーム更新する)
-			ha_mesh0 = self._ankle_apply_T_to_mesh(mesh_A_L, Ts_A[0])
-			ha_mesh0['distance'] = np.zeros(ha_mesh0.n_points, dtype=np.float32)
-			CLIM_LO, CLIM_HI = -10.0, 0.0
-			try:
-				from matplotlib.colors import LinearSegmentedColormap
-				hm_cmap = LinearSegmentedColormap.from_list(
-					'contact_pen',
-					[(0.0, (0.75, 0.0, 0.0)),   # -10mm: 赤
-					 (0.5, (1.0, 0.6, 0.0)),
-					 (1.0, (0.1, 0.75, 0.1))])  # 0mm(接触): 緑
-			except Exception:
-				hm_cmap = 'RdYlGn'
-			heatmap_actor = plotter.add_mesh(
-				ha_mesh0, scalars='distance', cmap=hm_cmap, clim=[CLIM_LO, CLIM_HI],
-				opacity=1.0, show_edges=False, label='Heatmap')
-			# 離間(範囲外)は透明
-			try:
-				lut = heatmap_actor.GetMapper().GetLookupTable()
-				lut.SetUseAboveRangeColor(True)
-				lut.SetAboveRangeColor(0.0, 0.0, 0.0, 0.0)
-			except Exception:
-				pass
-			# Z-fighting対策
-			try:
-				mp = heatmap_actor.GetMapper()
-				mp.SetResolveCoincidentTopologyToPolygonOffset()
-				mp.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
-				heatmap_actor.ForceTranslucentOn()
-			except Exception:
-				pass
+		# --- 5. 各骨のアクター作成 (ヒートマップあり=scalars で色付け、なし=単色) ---
+		heatmap_enabled = bool(heatmap_data)
+		hm_cmap = self._sim_view_heatmap_cmap()
+		CLIM_LO, CLIM_HI = -10.0, 0.0
 
-		# 6. UserMatrix 適用ヘルパ (VTKのSetUserMatrix)
+		actors = {}                 # bone_idx -> actor (骨本体、SetUserMatrix で駆動)
+		mesh_L_map = {}             # bone_idx -> mesh_L (ローカル)
+		anim_first_T_inv = {}       # bone_idx -> inv(Ts[0])
+		bone_colors = {}            # bone_idx -> hex color
+
+		for (idx, name, mesh_L, Ts) in bones_data:
+			mesh_L_map[idx] = mesh_L
+			color = self._ankle_color_of(idx)
+			bone_colors[idx] = color
+			# 初期姿勢メッシュ (Ts[0] を適用)
+			m0 = self._ankle_apply_T_to_mesh(mesh_L, Ts[0])
+			if heatmap_enabled:
+				# scalars を持たせる (初期フレームの distances)
+				d0 = heatmap_data[0].get(idx)
+				if d0 is None or len(d0) != m0.n_points:
+					d0 = np.full(m0.n_points, np.inf, dtype=np.float32)
+				m0['distance'] = d0
+				actor = anim_plotter.add_mesh(m0, scalars='distance', cmap=hm_cmap,
+				                              clim=[CLIM_LO, CLIM_HI], opacity=1.0,
+				                              smooth_shading=True, show_edges=False,
+				                              name=f'bone_{idx}',
+				                              scalar_bar_args={'title': 'distance [mm]', 'color': 'black'} if idx == bones_data[0][0] else None)
+				# 離間 (>0) は骨本来の色、めり込み (< -10) は 濃赤
+				try:
+					def _hex_to_rgb01(h):
+						h = h.lstrip('#')
+						return (int(h[0:2], 16) / 255.0,
+						        int(h[2:4], 16) / 255.0,
+						        int(h[4:6], 16) / 255.0)
+					r, g, b = _hex_to_rgb01(color)
+					lut = actor.GetMapper().GetLookupTable()
+					lut.SetUseAboveRangeColor(True)
+					lut.SetAboveRangeColor(r, g, b, 1.0)
+					lut.SetUseBelowRangeColor(True)
+					lut.SetBelowRangeColor(0.5, 0.0, 0.0, 1.0)
+				except Exception:
+					pass
+				# 距離が inf (他骨無し) は透明
+				try:
+					mp = actor.GetMapper()
+					mp.SetResolveCoincidentTopologyToPolygonOffset()
+					mp.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
+				except Exception:
+					pass
+			else:
+				actor = anim_plotter.add_mesh(m0, color=color, opacity=1.0,
+				                              smooth_shading=True, show_edges=False,
+				                              name=f'bone_{idx}', label=name)
+			actors[idx] = actor
+			anim_first_T_inv[idx] = np.linalg.inv(Ts[0])
+
+		# --- 6. アクターに SetUserMatrix を適用するヘルパ ---
 		def _apply_matrix(actor, T4):
 			import vtk
 			m = vtk.vtkMatrix4x4()
@@ -4876,59 +6237,338 @@ class MainMenuGUI(_BaseWindow):
 			try:
 				actor.SetUserMatrix(m)
 			except Exception:
-				# fallback: vertex copy
 				pass
 
-		# 7. スライダーコールバック
-		info_text = plotter.add_text("", position='upper_left', font_size=10, color='black')
-		def on_frame(value):
-			t = int(round(float(value)))
-			t = max(0, min(t, N - 1))
-			# 各骨のアクターに (T(t) * inv(T(0))) を適用 (初期姿勢からの累積差分)
-			for idx, actor in actors.items():
-				Ts = anim_map[idx][1]
-				dT = Ts[t] @ anim_first_T_inv[idx]
-				_apply_matrix(actor, dT)
-			# ヒートマップ更新
-			if heatmap_enabled and heatmap_actor is not None:
-				distances = heatmap_cache.get(t)
-				if distances is None:
-					mesh_A_L, Ts_A = anim_map[prox_i]
-					mesh_B_L, Ts_B = anim_map[dist_i]
-					mA = self._ankle_apply_T_to_mesh(mesh_A_L, Ts_A[t])
-					mB = self._ankle_apply_T_to_mesh(mesh_B_L, Ts_B[t])
-					distances = self._ankle_signed_distance_A_to_B(mA, mB)
-					if distances is None:
-						distances = np.zeros(mA.n_points, dtype=np.float32)
-					heatmap_cache[t] = distances
-				# heatmap_actor の scalars を更新 + アクター自体は骨Aと同じ動き
-				pd = heatmap_actor.GetMapper().GetInput()
-				pd.GetPointData().GetScalars().Modified()
-				# distances 配列をコピー
-				arr = pd.GetPointData().GetScalars()
-				for i in range(len(distances)):
-					arr.SetValue(i, float(distances[i]))
-				arr.Modified()
-				Ts_A = anim_map[prox_i][1]
-				dT_A = Ts_A[t] @ anim_first_T_inv[prox_i]
-				_apply_matrix(heatmap_actor, dT_A)
-			# 情報テキスト
-			ts = cache.get("timestamps", None)
-			t_sec = float(ts[t]) if (ts is not None and len(ts) > t) else t / 30.0
+		# --- 7. アニメーション状態変数 (hip と同じ形) ---
+		current_frame = [0]
+		actual_frame_counter = [0]
+		animation_start_time = [None]
+		playback_speed = [1.0]
+		last_scale_update_time = [0.0]
+		scale_update_interval = [0.2]
+		after_id = [None]
+		is_animation_active = [True]
+		is_paused = [False]
+		is_seeking = [False]
+
+		# 6軸情報テキスト (upper_right)
+		six_axis_text_actor = [None]
+
+		# --- 8. show_frame: 1フレーム描画 ---
+		def show_frame(frame_idx, force_render=False):
+			if not force_render and not is_animation_active[0]:
+				return
+			if hasattr(anim_plotter, 'closed') and anim_plotter.closed:
+				is_animation_active[0] = False
+				return
 			try:
-				info_text.SetText(0, f"Frame {t}/{N-1}  (t={t_sec:.3f}s)")
+				fi = int(frame_idx) % max(N, 1)
+				# 各骨アクターに (T(t) * inv(T(0))) を適用
+				for (idx, name, mesh_L, Ts) in bones_data:
+					dT = Ts[fi] @ anim_first_T_inv[idx]
+					_apply_matrix(actors[idx], dT)
+				# ヒートマップ scalars 更新
+				max_pent = 0.0
+				if heatmap_enabled and fi < len(heatmap_data):
+					frame_hm = heatmap_data[fi]
+					for (idx, name, mesh_L, Ts) in bones_data:
+						d = frame_hm.get(idx)
+						if d is None:
+							continue
+						actor = actors[idx]
+						try:
+							pd_in = actor.GetMapper().GetInput()
+							arr = pd_in.GetPointData().GetScalars()
+							if arr is not None and arr.GetNumberOfTuples() == len(d):
+								for j in range(len(d)):
+									arr.SetValue(j, float(d[j]))
+								arr.Modified()
+							else:
+								# 頂点数が合わない場合は再アサイン
+								pd_in.GetPointData().SetScalars(pv.pyvista_ndarray(d.astype(np.float32)).VTKObject if hasattr(pv, 'pyvista_ndarray') else None)
+						except Exception:
+							pass
+						# 最大めり込み量 (負値の絶対値)
+						try:
+							dmin = float(np.nanmin(d))
+							if dmin < 0 and abs(dmin) > max_pent:
+								max_pent = abs(dmin)
+						except Exception:
+							pass
+				# 情報ラベル更新 (制御パネル)
+				try:
+					widgets = ctrl_widgets  # closure から参照
+					widgets['frame_label'].config(
+						text=f"Frame: {fi}/{max(N-1,0)} | Time: {frame_times[fi]:.3f}s")
+					widgets['max_pent_label'].config(
+						text=f"Max Pent: {max_pent:.2f} mm" if heatmap_enabled else "Max Pent: -- mm")
+				except Exception:
+					pass
+				# 6軸表示 (骨1のフレームに対する骨2の相対姿勢を表示、N>=2 のとき)
+				try:
+					if n_bones >= 2:
+						T_A = bones_data[0][3][fi]
+						T_B = bones_data[1][3][fi]
+						T_rel = np.linalg.inv(T_A) @ T_B
+						R = T_rel[:3, :3]
+						t_vec = T_rel[:3, 3]
+						# ZYX Euler (deg)
+						sy = float(np.sqrt(R[0,0]**2 + R[1,0]**2))
+						if sy > 1e-6:
+							rz = float(np.degrees(np.arctan2(R[1,0], R[0,0])))
+							ry = float(np.degrees(np.arctan2(-R[2,0], sy)))
+							rx = float(np.degrees(np.arctan2(R[2,1], R[2,2])))
+						else:
+							rz = float(np.degrees(np.arctan2(-R[0,1], R[1,1])))
+							ry = float(np.degrees(np.arctan2(-R[2,0], sy)))
+							rx = 0.0
+						txt = (f"骨A→B 相対姿勢\n"
+						       f"Rx: {rx:+7.2f}°\n"
+						       f"Ry: {ry:+7.2f}°\n"
+						       f"Rz: {rz:+7.2f}°\n"
+						       f"tx: {t_vec[0]:+7.2f} mm\n"
+						       f"ty: {t_vec[1]:+7.2f} mm\n"
+						       f"tz: {t_vec[2]:+7.2f} mm")
+						if six_axis_text_actor[0] is None:
+							six_axis_text_actor[0] = anim_plotter.add_text(
+								txt, position='upper_right', font_size=11,
+								color='black', font='courier')
+						else:
+							try:
+								six_axis_text_actor[0].SetText(3, txt)
+							except Exception:
+								pass
+				except Exception:
+					pass
+				# 描画
+				if force_render or is_animation_active[0]:
+					try:
+						if hasattr(anim_plotter, 'render_window') and anim_plotter.render_window:
+							anim_plotter.render()
+					except Exception:
+						pass
+			except Exception as e:
+				print(f"[ankle animate] フレーム{frame_idx} 描画失敗: {e}")
+				traceback.print_exc()
+
+		# --- 9. 制御パネルのコールバック ---
+		def _cb_frame_seek(fi):
+			is_seeking[0] = True
+			current_frame[0] = fi
+			show_frame(fi, force_render=True)
+			try:
+				time_val = frame_times[fi]
+				actual_frame_counter[0] = int(time_val / 0.005)
+				actual_time = actual_frame_counter[0] * 0.005
+				ctrl_widgets['actual_label'].config(text=f"Actual: {actual_time:.3f}s")
+				if animation_start_time[0] is not None:
+					animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
 			except Exception:
 				pass
+			is_seeking[0] = False
+
+		def _cb_pause_toggle():
+			is_paused[0] = not is_paused[0]
+			if not is_paused[0]:
+				actual_time = actual_frame_counter[0] * 0.005
+				animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
+			return is_paused[0]
+
+		def _cb_speed_change(speed):
+			playback_speed[0] = speed
+			if animation_start_time[0] is not None and not is_paused[0]:
+				actual_time = actual_frame_counter[0] * 0.005
+				animation_start_time[0] = time.time() - (actual_time / speed)
+
+		def _cb_csv_export():
+			"""マルチヒートマップの Max Penetration とフレーム時刻を CSV に出力。"""
+			if not heatmap_data:
+				messagebox.showwarning("CSV出力", "ヒートマップ事前計算がありません。")
+				return
+			fp = filedialog.asksaveasfilename(
+				title="CSV出力", defaultextension=".csv",
+				filetypes=[("CSVファイル", "*.csv"), ("すべてのファイル", "*.*")])
+			if not fp:
+				return
 			try:
-				plotter.render()
+				import csv
+				with open(fp, 'w', newline='', encoding='utf-8-sig') as f:
+					w = csv.writer(f)
+					header = ["Frame", "Time [s]"]
+					for (idx, name, _, _) in bones_data:
+						header.append(f"{name}_min_dist [mm]")
+						header.append(f"{name}_max_pen [mm]")
+					w.writerow(header)
+					for t in range(N):
+						row = [t, f"{frame_times[t]:.4f}"]
+						for (idx, name, _, _) in bones_data:
+							d = heatmap_data[t].get(idx) if t < len(heatmap_data) else None
+							if d is None or len(d) == 0:
+								row.extend(["", ""])
+							else:
+								finite = d[np.isfinite(d)]
+								if finite.size == 0:
+									row.extend(["", ""])
+								else:
+									dmin = float(np.min(finite))
+									row.append(f"{dmin:.4f}")
+									row.append(f"{abs(dmin):.4f}" if dmin < 0 else "0.0000")
+						w.writerow(row)
+				messagebox.showinfo("CSV出力完了", f"保存しました:\n{fp}")
+			except Exception as e:
+				messagebox.showerror("CSV出力失敗", f"CSV保存に失敗しました:\n{e}")
+
+		def _cb_export_model():
+			"""現在フレームの各骨 (変換後) を1つのメッシュに結合して保存。"""
+			was_paused = is_paused[0]
+			is_paused[0] = True
+			try:
+				fp = filedialog.asksaveasfilename(
+					title=f"現在のモデルを出力 (Frame {current_frame[0]})",
+					defaultextension=".stl",
+					filetypes=[("STL files", "*.stl"), ("OBJ files", "*.obj")],
+					initialfile=f"ankle_frame_{current_frame[0]}.stl")
+				if not fp:
+					return
+				fi = current_frame[0]
+				merged = None
+				for (idx, name, mesh_L, Ts) in bones_data:
+					m_W = self._ankle_apply_T_to_mesh(mesh_L, Ts[fi])
+					merged = m_W if merged is None else (merged + m_W)
+				if merged is None:
+					messagebox.showwarning("出力", "出力するメッシュがありません。")
+					return
+				merged.save(fp)
+				messagebox.showinfo("出力完了", f"Frame {fi} のモデルを出力しました:\n{fp}")
+			except Exception as e:
+				messagebox.showerror("出力失敗", f"モデル出力に失敗しました:\n{e}")
+			finally:
+				if not was_paused:
+					is_paused[0] = False
+					ctrl_widgets['pause_button'].config(text="一時停止")
+					actual_time = actual_frame_counter[0] * 0.005
+					animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
+
+		def _cb_screenshot():
+			fp = filedialog.asksaveasfilename(
+				title="スクリーンショット保存", defaultextension=".png",
+				filetypes=[("PNG image", "*.png"), ("すべてのファイル", "*.*")],
+				initialfile=f"ankle_frame_{current_frame[0]}.png")
+			if not fp:
+				return
+			try:
+				anim_plotter.screenshot(fp)
+				messagebox.showinfo("スクリーンショット", f"保存しました:\n{fp}")
+			except Exception as e:
+				messagebox.showerror("スクリーンショット失敗", f"{e}")
+
+		def _cb_close():
+			is_animation_active[0] = False
+			if after_id[0] is not None:
+				try:
+					self.after_cancel(after_id[0])
+				except Exception:
+					pass
+				after_id[0] = None
+			try:
+				if hasattr(anim_plotter, 'close') and not (hasattr(anim_plotter, 'closed') and anim_plotter.closed):
+					anim_plotter.close()
 			except Exception:
 				pass
 
-		plotter.add_slider_widget(
-			on_frame, [0, max(N - 1, 1)], value=0, title="Frame",
-			pointa=(0.15, 0.06), pointb=(0.85, 0.06))
-		on_frame(0)
-		plotter.show()
+		# --- 10. 制御パネル生成 ---
+		ctrl_widgets = self._sim_view_create_control_panel(
+			n_frames=N,
+			frame_times=frame_times,
+			callbacks={
+				'on_frame_seek': _cb_frame_seek,
+				'on_pause_toggle': _cb_pause_toggle,
+				'on_speed_change': _cb_speed_change,
+				'on_csv_export': _cb_csv_export,
+				'on_export_model': _cb_export_model,
+				'on_screenshot': _cb_screenshot,
+				'on_close': _cb_close,
+			},
+			features={'csv': heatmap_enabled, 'export_model': True, 'screenshot': True})
+
+		# --- 11. 再生ループ (hip と同じ 5ms/実時間同期) ---
+		max_time = frame_times[-1] if frame_times else 0.0
+
+		def animation_loop():
+			if not is_animation_active[0]:
+				return
+			if hasattr(anim_plotter, 'closed') and anim_plotter.closed:
+				is_animation_active[0] = False
+				return
+			if not is_paused[0] and not is_seeking[0]:
+				if animation_start_time[0] is None:
+					animation_start_time[0] = time.time()
+				elapsed_real = time.time() - animation_start_time[0]
+				elapsed_anim = elapsed_real * playback_speed[0]
+				actual_frame_counter[0] = int(elapsed_anim / 0.005)
+				actual_time = actual_frame_counter[0] * 0.005
+				if actual_time > max_time and max_time > 0:
+					actual_frame_counter[0] = 0
+					actual_time = 0.0
+					animation_start_time[0] = time.time()
+				try:
+					ctrl_widgets['actual_label'].config(text=f"Actual: {actual_time:.3f}s")
+				except Exception:
+					pass
+				# 現在フレームから前方検索
+				target = current_frame[0]
+				for i in range(current_frame[0], N):
+					if frame_times[i] <= actual_time:
+						target = i
+					else:
+						break
+				if target == current_frame[0] and current_frame[0] > 0:
+					if actual_time < frame_times[current_frame[0]]:
+						target = 0
+						for i in range(N):
+							if frame_times[i] <= actual_time:
+								target = i
+							else:
+								break
+				if target != current_frame[0]:
+					current_frame[0] = target
+					show_frame(target)
+				# 再生バーは 200ms 毎に更新 (ドラッグ中は更新しない)
+				now = time.time()
+				if (not ctrl_widgets['user_is_dragging'][0]
+				    and now - last_scale_update_time[0] >= scale_update_interval[0]):
+					try:
+						ctrl_widgets['is_programmatic_update'][0] = True
+						ctrl_widgets['playback_scale'].set(current_frame[0])
+						ctrl_widgets['is_programmatic_update'][0] = False
+						last_scale_update_time[0] = now
+					except Exception:
+						pass
+			after_id[0] = self.after(5, animation_loop)
+
+		# --- 12. カメラ・キー ---
+		anim_plotter.camera_position = 'iso'
+		anim_plotter.reset_camera()
+		anim_plotter.add_key_event('p', lambda: ctrl_widgets['pause_button'].invoke())
+		anim_plotter.add_key_event('P', lambda: ctrl_widgets['pause_button'].invoke())
+
+		# 最初のフレーム
+		show_frame(0, force_render=True)
+
+		# ウィンドウ close コールバック
+		try:
+			anim_plotter.iren.add_observer('ExitEvent', lambda obj, ev: _cb_close())
+		except Exception:
+			pass
+
+		# ノンブロッキング表示
+		try:
+			anim_plotter.show(auto_close=False, interactive_update=True)
+		except TypeError:
+			anim_plotter.show(auto_close=False)
+
+		# ループ開始
+		after_id[0] = self.after(5, animation_loop)
 
 	# ---- RealSense D405 ライブ撮影 (友人スクリプトのUXを踏襲、出力は .bag) ----
 	def _ankle_rs_parse_resolution(self):

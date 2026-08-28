@@ -4,14 +4,14 @@
       "name": "260810_テスト",
       "snapshot": {
         "ankle_initial_scan": "",
-        "ankle_video": "",
-        "ankle_depth": "C:/Users/yutas/Desktop/depthcamera_data/ankle_d405_20260807_172914.db3",
+        "ankle_video": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/ankle_d405_20260828_180045_color.mp4",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/ankle_d405_20260828_180045.db3",
         "ankle_camera_intrinsics": "",
-        "ankle_aruco_dict": "DICT_4X4_50",
+        "ankle_aruco_dict": "DICT_4X4_100",
         "ankle_marker_size_mm": 20.0,
         "ankle_pose_series": "",
-        "ankle_heatmap_prox": "(未選択)",
-        "ankle_heatmap_dist": "(未選択)",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
         "ankle_reg_ransac_distance": 1.0,
         "ankle_reg_ransac_max_iter": 1000,
         "ankle_reg_ransac_confidence": 0.99,
@@ -23,45 +23,86 @@
         "ankle_ref_frame": 0,
         "ankle_detect_stride": 1,
         "ankle_rs_resolution": "1280x720@15",
-        "ankle_rs_discard_frames": 63,
+        "ankle_rs_discard_frames": 64,
         "ankle_rs_manual_exposure": false,
         "ankle_rs_exposure_val": 5000,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
         "_bones": [
           {
-            "name": "test1",
+            "name": "femur",
             "aruco_id": 0,
-            "model_path": "",
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
             "post_scan_path": "",
-            "color": "#DEB887",
+            "color": "#c0c0c0",
             "method": "ransac",
             "enable_scaling": false,
-            "marker_to_bone_T": null,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
             "reg_T": null
           },
           {
-            "name": "test2",
-            "aruco_id": 1,
-            "model_path": "",
-            "post_scan_path": "",
-            "color": "#ADD8E6",
-            "method": "ransac",
-            "enable_scaling": false,
-            "marker_to_bone_T": null,
-            "reg_T": null
-          },
-          {
-            "name": "test3",
+            "name": "pelvis",
             "aruco_id": 2,
-            "model_path": "",
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_pelvis_hd/pelvis.obj",
             "post_scan_path": "",
-            "color": "#98FB98",
+            "color": "#c0c0c0",
             "method": "ransac",
             "enable_scaling": false,
-            "marker_to_bone_T": null,
+            "marker_to_bone_T": [
+              [
+                -0.43459638271699513,
+                -0.8176368349053583,
+                -0.3776188426644657,
+                -3.320294706828456
+              ],
+              [
+                0.8989908142890062,
+                -0.3685849377811745,
+                -0.2365600546686545,
+                34.86182570828562
+              ],
+              [
+                0.05423559673583596,
+                -0.4422840149121321,
+                0.8952336846879212,
+                522.1206280961217
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
             "reg_T": null
           }
         ],
-        "_selected_bone": 0
+        "_selected_bone": 1
       }
     },
     {
