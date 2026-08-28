@@ -20,9 +20,9 @@
         "ankle_reg_sample_points": 100000,
         "ankle_reg_voxel_size": 0.0,
         "ankle_reg_preview_var": true,
-        "ankle_ref_frame": 0,
+        "ankle_ref_frame": 1,
         "ankle_detect_stride": 1,
-        "ankle_rs_resolution": "1280x720@15",
+        "ankle_rs_resolution": "640x480@15",
         "ankle_rs_discard_frames": 64,
         "ankle_rs_manual_exposure": false,
         "ankle_rs_exposure_val": 5000,
@@ -63,7 +63,8 @@
                 1.0
               ]
             ],
-            "reg_T": null
+            "reg_T": null,
+            "fixed": false
           },
           {
             "name": "pelvis",
@@ -99,7 +100,8 @@
                 1.0
               ]
             ],
-            "reg_T": null
+            "reg_T": null,
+            "fixed": true
           }
         ],
         "_selected_bone": 1
@@ -131,6 +133,8 @@
         "ankle_rs_discard_frames": 63,
         "ankle_rs_manual_exposure": false,
         "ankle_rs_exposure_val": 5000,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
         "_bones": [
           {
             "name": "test1",

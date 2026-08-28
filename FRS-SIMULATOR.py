@@ -502,6 +502,24 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_ref_frame = tk.IntVar(value=0)         # 参照フレーム t=0 (Stage 5で使用)
 		self.ankle_detect_stride = tk.IntVar(value=1)     # フレーム間引き (1=全フレーム)
 		self.ankle_detection_status = tk.StringVar(value="(未実行)")
+		# 可視化オプション
+		self.ankle_smooth_enable = tk.BooleanVar(value=True)   # 平滑化 ON/OFF
+		# カットオフ [Hz]: 15fps 録画なら Nyquist 7.5Hz。関節試験は低速なので 2〜3Hz が目安
+		self.ankle_smooth_cutoff_hz = tk.DoubleVar(value=2.5)
+		self.ankle_reject_outliers = tk.BooleanVar(value=True)  # Hampel 外れ値除去
+		self.ankle_show_markers = tk.BooleanVar(value=True)    # ArUcoマーカー軸を可視化
+		# 診断モード: 骨重心をマーカー位置に強制配置 (キャリブを無視する切り分け用。既定OFF)
+		self.ankle_recenter_meshes = tk.BooleanVar(value=False)
+		# depth_scale の自動補正 (SDK報告値が実データと乖離する場合)
+		self.ankle_depth_scale_autofix = tk.BooleanVar(value=True)
+		# 平面フィット領域の拡張倍率 (マーカーの外側=台座まで使って法線精度を上げる)
+		self.ankle_plane_expand = tk.DoubleVar(value=2.2)
+		# 姿勢推定手法: "rgb" | "fusion" | "depth-corners"
+		# 実測 (2026-08-29) では rgb が 融合より 7〜14倍 安定だったため rgb を既定にする。
+		# 深度は「IPPEの表裏判定」と「深度スケール検証」にのみ使う。
+		self.ankle_pose_method = tk.StringVar(value="rgb")
+		# 手法比較を行うフレーム数 (0 で無効)。冒頭だけ3手法を計算して比較レポートを出す。
+		self.ankle_compare_frames = tk.IntVar(value=300)
 		# 動作モード:
 		#   "self_pose" = 新プラン (マーカー付き骨単独スキャンから T_L←Mk 自己決定 → 絶対姿勢アニメ)  【デフォルト】
 		#   "original"  = 原プラン (組立スキャン + 位置合わせで T_W←L 決定 → 相対運動アニメ)
@@ -2549,6 +2567,7 @@ class MainMenuGUI(_BaseWindow):
 			"enable_scaling": False,
 			"marker_to_bone_T": None,
 			"reg_T": None,
+			"fixed": False,             # True: この骨を固定して他骨の相対姿勢を表示 (骨リスト中で1本のみ)
 		}
 
 	# ---- テクスチャ対応 メッシュ読込ヘルパ ----
@@ -2805,6 +2824,32 @@ class MainMenuGUI(_BaseWindow):
 		             values=list(self._ANKLE_ARUCO_DICT_CHOICES)).grid(row=0, column=1, sticky="w", padx=(4, 12))
 		ttk.Label(af, text="マーカー実寸 (mm):").grid(row=0, column=2, sticky="w")
 		ttk.Entry(af, textvariable=self.ankle_marker_size_mm, width=8).grid(row=0, column=3, sticky="w", padx=(4, 12))
+		ttk.Checkbutton(af, text="深度スケールを自動補正",
+		                variable=self.ankle_depth_scale_autofix
+		                ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+		ttk.Label(af, text="※ SDKが報告する depth_scale が実データと10倍等ズレる場合、"
+		               "ArUcoの実寸基準と照合して自動補正します。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=700, justify="left"
+		          ).grid(row=2, column=0, columnspan=4, sticky="w", padx=(20, 0))
+		ttk.Label(af, text="姿勢推定手法:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+		ttk.Combobox(af, textvariable=self.ankle_pose_method, width=16, state="readonly",
+		             values=["rgb", "fusion", "depth-corners"]
+		             ).grid(row=3, column=1, sticky="w", pady=(8, 0))
+		ttk.Label(af, text="比較する冒頭フレーム数:").grid(row=3, column=2, sticky="w", pady=(8, 0))
+		ttk.Spinbox(af, from_=0, to=2000, increment=100,
+		            textvariable=self.ankle_compare_frames, width=6
+		            ).grid(row=3, column=3, sticky="w", pady=(8, 0))
+		ttk.Label(af,
+		          text="※ rgb = solvePnP のみ（推奨）。深度は「表裏判定」と「深度スケール検証」にのみ使います。\n"
+		               "   実機計測では rgb が fusion より 7〜14倍 安定でした。"
+		               "冒頭の指定フレームだけ3手法を計算し、実行後に比較レポートを出します (0 で無効)。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=700, justify="left"
+		          ).grid(row=4, column=0, columnspan=4, sticky="w", padx=(20, 0))
+		ttk.Label(af, text="平面フィット範囲 (fusion 用・マーカー幅の倍率):").grid(
+			row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+		ttk.Spinbox(af, from_=1.0, to=5.0, increment=0.1,
+		            textvariable=self.ankle_plane_expand, width=6
+		            ).grid(row=5, column=2, sticky="w", pady=(6, 0))
 		self._add_file_row(meas_frame, 4, "姿勢時系列 (事前計算済, 任意)", self.ankle_pose_series_path,
 		                   lambda: self._ankle_choose(self.ankle_pose_series_path, "姿勢時系列ファイル(npz/csv)を選択", "pose"))
 
@@ -2832,6 +2877,9 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(btnrow2, text="↑", width=3, command=lambda: self.on_ankle_bone_move(-1)).grid(row=0, column=0, padx=1)
 		ttk.Button(btnrow2, text="↓", width=3, command=lambda: self.on_ankle_bone_move(1)).grid(row=0, column=1, padx=1)
 		ttk.Button(btnrow2, text="名前変更", width=9, command=self.on_ankle_bone_rename).grid(row=0, column=2, padx=1)
+		btnrow3 = ttk.Frame(left)
+		btnrow3.grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+		ttk.Button(btnrow3, text="🔒 固定/解除", width=15, command=self.on_ankle_bone_toggle_fixed).grid(row=0, column=0, padx=1)
 
 		editor = ttk.LabelFrame(bones_frame, text="選択中の骨", style="Bold.TLabelframe")
 		editor.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=6)
@@ -3044,7 +3092,7 @@ class MainMenuGUI(_BaseWindow):
 		          ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
 
 		# ⑤ 可視化・アニメ
-		vis_frame = ttk.LabelFrame(container, text="⑤ 可視化・アニメーション・骨対ヒートマップ", style="Bold.TLabelframe")
+		vis_frame = ttk.LabelFrame(container, text="⑤ 可視化・アニメーション (N骨マルチヒートマップ)", style="Bold.TLabelframe")
 		vis_frame.grid(row=10, column=0, sticky="nsew", pady=(0, 8))
 		vis_frame.columnconfigure(0, weight=1)
 		vbtn = ttk.Frame(vis_frame)
@@ -3052,16 +3100,45 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(vbtn, text="初期状態を可視化", command=self.on_ankle_visualize_initial).grid(row=0, column=0, padx=(0, 8))
 		ttk.Button(vbtn, text="全骨を可視化", command=self.on_ankle_visualize_all).grid(row=0, column=1, padx=(0, 8))
 		ttk.Button(vbtn, text="シミュレーション実行", command=self.on_ankle_animate).grid(row=0, column=2, padx=(0, 8))
-		hf = ttk.Frame(vis_frame)
-		hf.grid(row=1, column=0, sticky="w", padx=12, pady=(4, 6))
-		ttk.Label(hf, text="ヒートマップ対象 骨A:").grid(row=0, column=0, sticky="w")
-		self._ankle_heatmap_prox_combo = ttk.Combobox(hf, textvariable=self.ankle_heatmap_prox_var,
-		                                               width=20, state="readonly")
-		self._ankle_heatmap_prox_combo.grid(row=0, column=1, sticky="w", padx=(4, 12))
-		ttk.Label(hf, text="骨B:").grid(row=0, column=2, sticky="w")
-		self._ankle_heatmap_dist_combo = ttk.Combobox(hf, textvariable=self.ankle_heatmap_dist_var,
-		                                               width=20, state="readonly")
-		self._ankle_heatmap_dist_combo.grid(row=0, column=3, sticky="w", padx=(4, 0))
+		ttk.Label(vis_frame,
+		          text="※ ③骨リストに登録された全骨が自動的に可視化されます。各骨のヒートマップは"
+		               " 他全骨との signed distance の最小値 (接触=緑・めり込み=赤・離間=骨本来の色)。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+		# 可視化オプション行
+		opt = ttk.Frame(vis_frame)
+		opt.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
+		ttk.Checkbutton(opt, text="時系列平滑化",
+		                variable=self.ankle_smooth_enable
+		                ).grid(row=0, column=0, sticky="w")
+		ttk.Label(opt, text="カットオフ周波数:").grid(row=0, column=1, sticky="w", padx=(12, 4))
+		ttk.Spinbox(opt, from_=0.2, to=15.0, increment=0.1,
+		            textvariable=self.ankle_smooth_cutoff_hz,
+		            width=6).grid(row=0, column=2, sticky="w")
+		ttk.Label(opt, text="Hz").grid(row=0, column=3, sticky="w", padx=(2, 12))
+		ttk.Checkbutton(opt, text="外れ値除去 (Hampel)",
+		                variable=self.ankle_reject_outliers
+		                ).grid(row=0, column=4, sticky="w", padx=(4, 12))
+		ttk.Checkbutton(opt, text="ArUcoマーカー軸を表示",
+		                variable=self.ankle_show_markers
+		                ).grid(row=0, column=5, sticky="w", padx=(4, 0))
+		ttk.Label(opt,
+		          text="※ 小さいほど滑らか (動きは鈍る)。15fps 録画なら 1.5〜3 Hz が目安。"
+		               "実測フレームレートはログに出ます。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, columnspan=6, sticky="w", padx=(20, 0), pady=(2, 0))
+		opt2 = ttk.Frame(vis_frame)
+		opt2.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
+		ttk.Checkbutton(opt2, text="🔧 診断モード: 骨重心をマーカー位置に強制配置 (通常はOFF)",
+		                variable=self.ankle_recenter_meshes
+		                ).grid(row=0, column=0, sticky="w")
+		ttk.Label(opt2,
+		          text="※ 骨が変な位置に出るときの原因切り分け用。キャリブ (T_L←Mk) を無視し、"
+		               "骨の重心をArUcoが検出したマーカー位置にそのまま置きます。\n"
+		               "   ONにして骨が正常な位置に来る → キャリブが原因。変なまま → ArUco検出が原因。\n"
+		               "   骨の向きは意味を持たなくなるため、定量解析では必ずOFFにしてください。",
+		          foreground="#8B0000", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=1, column=0, sticky="w", padx=(20, 0))
 
 		self._ankle_init_tabs()
 		# モード変化に応じて①の enable/disable を切替
@@ -3175,7 +3252,8 @@ class MainMenuGUI(_BaseWindow):
 			aid = b.get("aruco_id", "?")
 			mk = "M" if b.get("marker_to_bone_T") is not None else "-"
 			rg = "R" if b.get("reg_T") is not None else "-"
-			lb.insert(tk.END, f"{i+1}. {name} [ID={aid}] {mk}{rg}")
+			lock = "🔒 " if b.get("fixed") else "   "
+			lb.insert(tk.END, f"{lock}{i+1}. {name} [ID={aid}] {mk}{rg}")
 		if self.ankle_bones:
 			idx = max(0, min(self._ankle_selected_bone, len(self.ankle_bones) - 1))
 			self._ankle_selected_bone = idx
@@ -3360,6 +3438,38 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_bones[i], self.ankle_bones[j] = self.ankle_bones[j], self.ankle_bones[i]
 		self._ankle_selected_bone = j
 		self._ankle_refresh_bone_listbox()
+
+	def on_ankle_bone_toggle_fixed(self) -> None:
+		"""選択中の骨を「固定」対象にトグルする。固定は1骨のみで排他 (他骨の fixed は自動解除)。
+
+		固定された骨は on_ankle_animate で常に identity 姿勢になり、他の骨は固定骨の座標系
+		での相対姿勢として表示される (= 固定骨から見た他骨の運動を観察できる)。
+		"""
+		i = self._ankle_selected_bone
+		if not (0 <= i < len(self.ankle_bones)):
+			messagebox.showwarning("骨固定", "骨リストで固定/解除する骨を選択してください。")
+			return
+		current = bool(self.ankle_bones[i].get("fixed", False))
+		# 他骨の fixed を全て解除 (排他)
+		for j, b in enumerate(self.ankle_bones):
+			if j != i:
+				b["fixed"] = False
+		# トグル
+		self.ankle_bones[i]["fixed"] = not current
+		self._ankle_refresh_bone_listbox()
+		# 選択状態を維持
+		try:
+			lb = self._ankle_bones_listbox
+			lb.selection_clear(0, tk.END)
+			lb.selection_set(i)
+			lb.see(i)
+		except Exception:
+			pass
+		name = self.ankle_bones[i].get("name", f"骨{i+1}")
+		if self.ankle_bones[i]["fixed"]:
+			print(f"[ankle] {name} を固定に設定 (他骨は解除)")
+		else:
+			print(f"[ankle] {name} の固定を解除")
 
 	# ---- ankle: 多試験タブ ----
 	def _ankle_state_vars(self) -> dict:
@@ -4295,18 +4405,438 @@ class MainMenuGUI(_BaseWindow):
 			[-s,  s, 0.0],   # BL
 		], dtype=np.float32)
 
+	@staticmethod
+	def _ankle_safe_print(msg) -> None:
+		"""コンソールのエンコーディングで表示できない文字があっても例外を出さない print。
+
+		Windows の cp932 コンソールでは絵文字や一部記号が UnicodeEncodeError を起こす。
+		計算処理の途中でログ出力が例外になると結果を失うため、安全側に倒す。
+		"""
+		try:
+			print(msg)
+		except Exception:
+			try:
+				print(str(msg).encode("ascii", "replace").decode("ascii"))
+			except Exception:
+				pass
+
+	@staticmethod
+	def _ankle_imwrite(path, img) -> bool:
+		"""日本語パス対応の cv2.imwrite。
+
+		Windows の OpenCV は cv2.imwrite に非ASCIIパスを渡すと黙って失敗する
+		(戻り値 False, 例外なし)。imencode でメモリ上にエンコードしてから
+		numpy.tofile で書き出すことで回避する。
+		"""
+		import cv2
+		import numpy as np
+		try:
+			ext = Path(str(path)).suffix or ".png"
+			ok, buf = cv2.imencode(ext, img)
+			if not ok:
+				return False
+			buf.tofile(str(path))
+			return True
+		except Exception as e:
+			print(f"[imwrite] 保存失敗 {path}: {e}")
+			return False
+
+	def _ankle_auto_correct_depth_scale(self, gray, depth_arr, K, dist, obj_pts,
+	                                     target_ids, detector, dictionary, params,
+	                                     use_new_api, depth_scale_mm: float):
+		"""SDKが報告する depth_scale が実データと合わない場合に自動補正する。
+
+		【背景】一部の RealSense SDK / .db3 記録では depth_scale が誤って報告される
+		(例: D405 の真値 0.0001 m/unit に対し 0.001 m/unit を返す = 10倍過大)。
+		この場合、深度から復元する 3D 座標がすべて 10倍の距離になり、
+		ArUco の solvePnP 結果 (マーカー実寸から計算・スケール的に信頼できる) と乖離する。
+
+		【手法】ArUco を検出できるフレームで
+		    ratio = solvePnP の tvec_Z / (マーカー4隅の raw depth 中央値 × 現行 scale)
+		を求める。ratio が 1.0 付近なら補正不要。10 や 1/10 のような綺麗な倍率に
+		近い場合のみ、その倍率で depth_scale_mm を補正する
+		(中途半端な値は物理的なズレの可能性があるため補正しない)。
+
+		Returns:
+			(corrected_depth_scale_mm: float, info: dict)
+			補正しなかった場合は入力値をそのまま返す。
+		"""
+		import cv2
+		import numpy as np
+		info = {"corrected": False, "ratio": None, "factor": 1.0,
+		        "original_mm": float(depth_scale_mm)}
+		try:
+			if use_new_api and detector is not None:
+				corners, ids, _ = detector.detectMarkers(gray)
+			else:
+				corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
+			if ids is None:
+				return depth_scale_mm, info
+			obj_pts_f64 = np.asarray(obj_pts, dtype=np.float64)
+			H, W = depth_arr.shape[:2]
+			ratios = []
+			for corner, mid_arr in zip(corners, ids):
+				mid = int(mid_arr[0] if hasattr(mid_arr, '__len__') else mid_arr)
+				if mid not in target_ids:
+					continue
+				img_pts = corner.reshape(-1, 2).astype(np.float64)
+				# solvePnP の Z (マーカー実寸に基づく距離。スケール的に信頼できる)
+				try:
+					ok, rvec, tvec = cv2.solvePnP(obj_pts_f64, img_pts, K, dist,
+					                               flags=cv2.SOLVEPNP_ITERATIVE)
+					if not ok:
+						continue
+					pnp_z = float(np.asarray(tvec).flatten()[2])
+				except Exception:
+					continue
+				if pnp_z <= 0:
+					continue
+				# マーカー4隅の raw depth (5x5窓の中央値)
+				raws = []
+				for pt in img_pts:
+					u_c, v_c = int(round(pt[0])), int(round(pt[1]))
+					patch = []
+					for du in range(-2, 3):
+						for dv in range(-2, 3):
+							u, v = u_c + du, v_c + dv
+							if 0 <= u < W and 0 <= v < H:
+								d_raw = float(depth_arr[v, u])
+								if d_raw > 0:
+									patch.append(d_raw)
+					if patch:
+						raws.append(float(np.median(patch)))
+				if len(raws) < 3:
+					continue
+				depth_z = float(np.median(raws)) * depth_scale_mm
+				if depth_z <= 0:
+					continue
+				ratios.append(pnp_z / depth_z)
+			if not ratios:
+				return depth_scale_mm, info
+			ratio = float(np.median(ratios))
+			info["ratio"] = ratio
+			# 1.0 付近 (0.7〜1.4) なら補正不要
+			if 0.7 <= ratio <= 1.4:
+				return depth_scale_mm, info
+			# 10 の整数乗に近いか判定 (log10 が整数に近い = 単位系の取り違え)
+			log10_ratio = float(np.log10(ratio))
+			nearest_pow = round(log10_ratio)
+			if nearest_pow == 0 or abs(log10_ratio - nearest_pow) > 0.08:
+				# 綺麗な倍率でない → 物理的なズレの可能性。補正しない
+				self._ankle_safe_print(
+					f"[深度スケール] 不一致率 {ratio:.2f}x を検出しましたが、"
+					f"10の整数乗ではないため自動補正しません "
+					f"(マーカー実寸設定 or 深度品質を確認してください)")
+				return depth_scale_mm, info
+			factor = float(10.0 ** nearest_pow)
+			corrected = depth_scale_mm * factor
+			info.update({"corrected": True, "factor": factor,
+			             "corrected_mm": corrected})
+			# 【重要】print の失敗 (cp932 で表示できない文字など) で補正結果を失わないよう、
+			# 表示は安全な print ヘルパ経由で行い、例外を出さない
+			self._ankle_safe_print("=" * 70)
+			self._ankle_safe_print(
+				f"[深度スケール] [警告] SDK報告の depth_scale が実データと {ratio:.2f}倍 乖離")
+			self._ankle_safe_print("  solvePnP (マーカー実寸 基準) と 深度値 を比較した結果、")
+			self._ankle_safe_print(
+				f"  depth_scale_mm を {depth_scale_mm:.6f} -> {corrected:.6f} mm/unit に自動補正します"
+				f" (x{factor:g})")
+			self._ankle_safe_print("  ※ 補正後は深度から復元する 3D 座標が solvePnP と整合します")
+			self._ankle_safe_print("=" * 70)
+			return corrected, info
+		except Exception as e:
+			self._ankle_safe_print(
+				f"[深度スケール] 自動補正の判定に失敗 ({e}) - SDK報告値を使用します")
+			return depth_scale_mm, info
+
+	@staticmethod
+	def _ankle_fit_plane_ransac(pts, thresh_mm: float = 1.5, iters: int = 120, seed: int = 0):
+		"""3D点群に平面をロバストフィットする。
+
+		RANSAC で外れ値 (flying pixel など) を除いてから、inlier に SVD をかけて最終化する。
+
+		Returns:
+			(n, d, inlier_mask, rms) — 平面は n·p + d = 0 (|n|=1)。失敗時は (None, None, None, None)
+		"""
+		import numpy as np
+		pts = np.asarray(pts, dtype=np.float64)
+		n_pts = len(pts)
+		if n_pts < 3:
+			return None, None, None, None
+		rng = np.random.default_rng(seed)
+		best_mask = None
+		best_cnt = 0
+		for _ in range(iters):
+			idx = rng.choice(n_pts, 3, replace=False)
+			p1, p2, p3 = pts[idx]
+			nv = np.cross(p2 - p1, p3 - p1)
+			nn = float(np.linalg.norm(nv))
+			if nn < 1e-9:
+				continue
+			nv = nv / nn
+			dd = -float(nv @ p1)
+			inl = np.abs(pts @ nv + dd) < thresh_mm
+			cnt = int(inl.sum())
+			if cnt > best_cnt:
+				best_cnt = cnt
+				best_mask = inl
+		if best_mask is None or best_cnt < 3:
+			return None, None, None, None
+		# inlier で最小二乗リファイン (SVD)
+		inl_pts = pts[best_mask]
+		centroid = inl_pts.mean(axis=0)
+		try:
+			_, _, Vt = np.linalg.svd(inl_pts - centroid, full_matrices=False)
+		except np.linalg.LinAlgError:
+			return None, None, None, None
+		n = Vt[2]
+		nn = float(np.linalg.norm(n))
+		if nn < 1e-12:
+			return None, None, None, None
+		n = n / nn
+		d = -float(n @ centroid)
+		rms = float(np.sqrt(np.mean((inl_pts @ n + d) ** 2)))
+		return n, d, best_mask, rms
+
+	def _ankle_pose_from_rgb_depth_fusion(self, img_pts, obj_pts, depth_arr, K, dist,
+	                                       depth_scale_mm, shrink: float = 0.80,
+	                                       ransac_thresh_mm: float = 1.5,
+	                                       min_plane_points: int = 60,
+	                                       expand: float = 2.2,
+	                                       use_measured_size: bool = True):
+		"""RGB の面内精度 と Depth の面外精度 を融合して ArUco 姿勢を推定する (推奨手法)。
+
+		【なぜこれが必要か】
+		マーカー4隅の深度だけで姿勢を組むと、20mm マーカーに対し深度ノイズ 0.5〜1mm が
+		そのまま角度誤差 atan(1/10) ≈ 3° として乗る。しかも角はマーカーと背景の境界で、
+		深度が最も荒れる場所 (flying pixel) なので実際にはさらに悪化する。
+		これがフレーム毎のガタつきの主因になる。
+
+		【手法】RGB と Depth の得意分野だけを使う:
+		  - Depth: マーカー *内部* の数百〜数千画素に平面をフィット → 法線が √N で高精度化
+		           (4点 → 2000点で理論上 40倍以上の改善)
+		  - RGB:   サブピクセル角から歪み補正済みの視線ベクトルを作る (面内位置・回転が高精度)
+		  - 融合:  各視線を平面と交差させ、両者に矛盾しない 3D 角を求める
+		  - 姿勢:  得られた 4 隅で Umeyama 剛体フィット
+
+		角の深度を一切読まないため、境界の flying pixel の影響を受けない。
+		また 3D 点が直接得られるので IPPE の表裏 2 解の曖昧性も原理的に発生しない。
+
+		Args:
+			img_pts: (4,2) サブピクセル角 (整数化しないこと)
+			obj_pts: (4,3) マーカー座標系の 4 隅 [mm]
+			depth_arr: (H,W) 深度画像 (raw units)
+			K, dist: カメラ内部パラメータ・歪み係数
+			depth_scale_mm: raw → mm
+			shrink: 角に向かって縮める率。0.8 なら面積 64% の内側だけを平面フィットに使う
+			ransac_thresh_mm: 平面 inlier しきい値
+			min_plane_points: 平面フィットに必要な最小点数
+
+		Returns:
+			(T: 4x4, ok: bool, info: dict)
+		"""
+		import cv2
+		import numpy as np
+		info = {"method": "rgbd_fusion", "n_plane_points": 0, "plane_rms_mm": None,
+		        "inlier_ratio": None, "fit_rmse_mm": None, "reason": None,
+		        "plane_radius_mm": None, "expanded": False}
+		try:
+			H, W = depth_arr.shape[:2]
+			img_pts = np.asarray(img_pts, dtype=np.float64)
+			obj_pts_f = np.asarray(obj_pts, dtype=np.float64)
+			c2d = img_pts.mean(axis=0)
+
+			def _collect(scale):
+				"""重心を中心に scale 倍した多角形内の有効深度画素を 3D 化して返す。"""
+				poly_i = np.round(c2d + (img_pts - c2d) * float(scale)).astype(np.int32)
+				m = np.zeros((H, W), dtype=np.uint8)
+				cv2.fillPoly(m, [poly_i], 1)
+				yy, xx = np.nonzero(m)
+				if len(xx) == 0:
+					return None
+				zz = depth_arr[yy, xx].astype(np.float64) * float(depth_scale_mm)
+				g = zz > 0
+				if int(g.sum()) == 0:
+					return None
+				xx = xx[g].astype(np.float64); yy = yy[g].astype(np.float64); zz = zz[g]
+				pix = np.stack([xx, yy], axis=1).reshape(-1, 1, 2)
+				und = cv2.undistortPoints(pix, K, dist).reshape(-1, 2)
+				return np.stack([und[:, 0] * zz, und[:, 1] * zz, zz], axis=1)
+
+			# --- 1. アンカー: マーカー内部だけで平面を仮フィット ---
+			# ここは確実にマーカー面なので、正しい平面を掴むための足がかりになる。
+			anchor_pts = _collect(shrink)
+			if anchor_pts is None or len(anchor_pts) < min_plane_points:
+				info["reason"] = f"マーカー内部の有効深度が少ない ({0 if anchor_pts is None else len(anchor_pts)})"
+				return np.eye(4), False, info
+			n0, d0, _, _ = self._ankle_fit_plane_ransac(
+				anchor_pts, thresh_mm=ransac_thresh_mm, iters=120)
+			if n0 is None:
+				info["reason"] = "アンカー平面フィット失敗"
+				return np.eye(4), False, info
+
+			# --- 2. 台座まで領域を広げる ---
+			# 法線精度は σ/r で決まり (深度ノイズは空間相関があるので √N では稼げない)、
+			# r を大きくすることが唯一の効く手。マーカーが貼られた平らな台座は
+			# 印刷模様が無く深度が綺麗なので、そこまで使う。
+			# アンカー平面から離れた点 (骨・背景) は距離しきい値で自動的に外れる。
+			pts3d = anchor_pts
+			if expand and expand > shrink:
+				wide = _collect(expand)
+				if wide is not None and len(wide) > len(anchor_pts):
+					keep = np.abs(wide @ n0 + d0) < (ransac_thresh_mm * 2.0)
+					if int(keep.sum()) >= len(anchor_pts):
+						pts3d = wide[keep]
+						info["expanded"] = True
+			info["n_plane_points"] = int(len(pts3d))
+
+			# --- 3. 拡張した点群で平面を最終フィット ---
+			n_vec, d_val, inl, rms = self._ankle_fit_plane_ransac(
+				pts3d, thresh_mm=ransac_thresh_mm, iters=120)
+			if n_vec is None:
+				info["reason"] = "平面フィット失敗"
+				return np.eye(4), False, info
+			info["plane_rms_mm"] = float(rms)
+			info["inlier_ratio"] = float(inl.sum()) / float(len(pts3d))
+			if info["inlier_ratio"] < 0.4:
+				info["reason"] = f"平面 inlier 率が低い ({info['inlier_ratio']:.2f})"
+				return np.eye(4), False, info
+			# 法線精度の指標: 点群の重心まわりの RMS 半径 (大きいほど法線が安定)
+			try:
+				inl_pts = pts3d[inl]
+				ctr = inl_pts.mean(axis=0)
+				info["plane_radius_mm"] = float(np.sqrt(np.mean(
+					np.sum((inl_pts - ctr) ** 2, axis=1) - ((inl_pts - ctr) @ n_vec) ** 2)))
+			except Exception:
+				pass
+
+			# --- 4. RGB のサブピクセル角 → 視線ベクトル (歪み補正込み) ---
+			und_c = cv2.undistortPoints(img_pts.reshape(-1, 1, 2), K, dist).reshape(-1, 2)
+			rays = np.concatenate([und_c, np.ones((len(und_c), 1))], axis=1)  # (4,3)
+
+			# --- 5. 視線 × 平面 の交点 = 深度ノイズに汚されていない 3D 角 ---
+			denom = rays @ n_vec
+			if np.any(np.abs(denom) < 1e-9):
+				info["reason"] = "視線が平面と平行"
+				return np.eye(4), False, info
+			t_scale = -d_val / denom
+			if np.any(t_scale <= 0):
+				info["reason"] = "交点がカメラ後方"
+				return np.eye(4), False, info
+			corners3d = rays * t_scale[:, None]
+
+			# --- 6. 実測マーカーサイズ ---
+			# 視線×平面の交点は「実物の角の3D位置」なので、その辺長 = 実際のマーカー寸法。
+			# ②の設定と食い違う (印刷スケールのズレ) と、剛体フィットに残差が乗って
+			# 姿勢がわずかに歪む。実測値に合わせた obj_pts を使えばこの誤差は消える。
+			nominal = float(np.linalg.norm(obj_pts_f[0] - obj_pts_f[1]))
+			obj_fit = obj_pts_f
+			try:
+				edges = [float(np.linalg.norm(corners3d[i] - corners3d[(i + 1) % 4]))
+				         for i in range(4)]
+				measured = float(np.mean(edges))
+				info["measured_marker_mm"] = measured
+				info["marker_edge_spread_mm"] = float(np.max(edges) - np.min(edges))
+				if use_measured_size and nominal > 1e-6:
+					ratio = measured / nominal
+					# 極端な値は誤検出とみなして採用しない
+					if 0.8 < ratio < 1.25:
+						obj_fit = obj_pts_f * ratio
+						info["size_ratio_applied"] = float(ratio)
+			except Exception:
+				pass
+
+			# --- 7. Umeyama 剛体フィット ---
+			T = self._rigid_from_correspondences(obj_fit, corners3d, allow_scale=False)
+			pred = (T[:3, :3] @ obj_fit.T).T + T[:3, 3]
+			resid = np.linalg.norm(pred - corners3d, axis=1)
+			info["fit_rmse_mm"] = float(np.sqrt(np.mean(resid ** 2)))
+			return T, True, info
+		except Exception as e:
+			info["reason"] = f"例外: {e}"
+			return np.eye(4), False, info
+
 	def _ankle_make_detector(self, aruco_dict_name: str):
-		"""ArUco Detectorインスタンスを返す (新旧API対応)。"""
+		"""ArUco Detectorインスタンスを返す (新旧API対応)。
+
+		【高精度化設定 (Option C)】検出コーナーのサブピクセル精度を向上させる:
+		- CORNER_REFINE_APRILTAG (contribの新精度化アルゴ) を優先。
+		  内部でエッジ勾配から放物線フィットでピーク位置を求めるためピクセル 1/10 精度が出る。
+		- 未対応環境では CORNER_REFINE_SUBPIX にフォールバック (window size を 5→7 拡大、
+		  反復回数 30→50 増、収束精度 0.01→0.001 に厳格化)。
+		- 検出パラメータも高精度寄りに調整 (adaptive threshold / polygon approx / error corr)。
+		"""
 		import cv2
 		dictionary = self._ankle_resolve_aruco_dict(aruco_dict_name)
 		try:
 			params = cv2.aruco.DetectorParameters()
-			# サブピクセル精緻化を有効化
+			# --- コーナーサブピクセル精緻化 (最高精度優先) ---
+			refined = False
 			try:
-				params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-				params.cornerRefinementWinSize = 5
-				params.cornerRefinementMaxIterations = 30
-				params.cornerRefinementMinAccuracy = 0.01
+				apriltag_flag = getattr(cv2.aruco, 'CORNER_REFINE_APRILTAG', None)
+				if apriltag_flag is not None:
+					params.cornerRefinementMethod = apriltag_flag
+					# APRILTAG 用パラメータ (放物線フィット近傍サイズ, deglitch)
+					try:
+						params.aprilTagQuadDecimate = 1.0  # 1.0 = decimate 無し (精度最優先)
+						params.aprilTagQuadSigma = 0.0
+						params.aprilTagMinClusterPixels = 5
+						params.aprilTagMaxNmaxima = 10
+						params.aprilTagCriticalRad = 10.0 * np.pi / 180.0
+						params.aprilTagMaxLineFitMse = 10.0
+						params.aprilTagMinWhiteBlackDiff = 5
+						params.aprilTagDeglitch = 0
+					except Exception:
+						pass
+					refined = True
+			except Exception:
+				refined = False
+			if not refined:
+				# フォールバック: SUBPIX (window/iter を拡大して精度向上)
+				try:
+					params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+					params.cornerRefinementWinSize = 7                # 5 → 7 拡大
+					params.cornerRefinementMaxIterations = 50         # 30 → 50 増加
+					params.cornerRefinementMinAccuracy = 0.001        # 0.01 → 0.001 厳格化
+				except Exception:
+					pass
+			# 実際に何が有効になったかを明示する。
+			# 角検出精度が姿勢精度を直接決めるので、意図せず低精度モードに落ちていないか確認する。
+			try:
+				actual = int(params.cornerRefinementMethod)
+				names = {}
+				for nm in ("CORNER_REFINE_NONE", "CORNER_REFINE_SUBPIX",
+				            "CORNER_REFINE_CONTOUR", "CORNER_REFINE_APRILTAG"):
+					v = getattr(cv2.aruco, nm, None)
+					if v is not None:
+						names[int(v)] = nm
+				label = names.get(actual, f"不明({actual})")
+				extra = ""
+				if label == "CORNER_REFINE_SUBPIX":
+					extra = (f" win={getattr(params, 'cornerRefinementWinSize', '?')}"
+					         f" iter={getattr(params, 'cornerRefinementMaxIterations', '?')}")
+				self._ankle_safe_print(f"[ArUco] コーナー精緻化 = {label}{extra}")
+				if label in ("CORNER_REFINE_NONE",):
+					self._ankle_safe_print(
+						"  [警告] 精緻化が無効です。角がピクセル単位でしか出ないため姿勢が大きく荒れます")
+			except Exception:
+				pass
+			# --- 検出パラメータの高精度寄り調整 ---
+			try:
+				# 適応的閾値の細かいスイープ (窓サイズを 3→23 の間で走査)
+				params.adaptiveThreshWinSizeMin = 3
+				params.adaptiveThreshWinSizeMax = 23
+				params.adaptiveThreshWinSizeStep = 4
+				params.adaptiveThreshConstant = 7
+				# 小さいマーカーでも検出可
+				params.minMarkerPerimeterRate = 0.02
+				params.maxMarkerPerimeterRate = 4.0
+				# 多角形近似を厳格化 (角検出精度向上)
+				params.polygonalApproxAccuracyRate = 0.03
+				# ボーダー誤検出許容を厳格化 (誤検出削減)
+				params.maxErroneousBitsInBorderRate = 0.15
+				# エラー訂正を強化 (ID誤読減)
+				params.errorCorrectionRate = 0.6
 			except Exception:
 				pass
 			return cv2.aruco.ArucoDetector(dictionary, params), dictionary, params, True
@@ -4314,6 +4844,217 @@ class MainMenuGUI(_BaseWindow):
 			# 旧API
 			params = cv2.aruco.DetectorParameters_create()
 			return None, dictionary, params, False
+
+	def _ankle_pose_from_depth_corners(self, img_pts, obj_pts, depth_arr, K, depth_scale_mm,
+	                                    patch_radius: int = 2):
+		"""ArUcoの4隅ピクセルで深度を直接サンプルし、3D点から姿勢を推定する (mono PnP に依存しない)。
+
+		【この関数の意義】
+		mono PnP は marker_size_mm 設定と実物寸法が一致していないと tvec Z を大幅に誤る。
+		本関数は「RGB で検出したコーナー座標 → その位置の深度」で 3D 点を得るため、
+		marker_size_mm には依存しない (obj_pts の相対形状にのみ依存)。
+		D405 の実測深度精度 (~0.1mm/unit at 30cm) をフル活用できる。
+
+		Args:
+			img_pts: (4, 2) RGB で検出された 4隅ピクセル座標 (u, v)
+			obj_pts: (4, 3) マーカー物体座標系の 4隅 (mm)
+			depth_arr: (H, W) 深度画像 (raw units)
+			K: (3, 3) カメラ内部行列
+			depth_scale_mm: depth 値 → mm 変換係数
+			patch_radius: 各コーナーで深度をサンプルする窓半径 (2 → 5x5窓の中央値)
+
+		Returns:
+			(T_C_Mk: 4x4, ok: bool, info: dict)
+			ok=False の場合 T_C_Mk は identity。info には診断情報。
+		"""
+		import numpy as np
+		H, W = depth_arr.shape[:2]
+		fx, fy = K[0, 0], K[1, 1]
+		cx, cy = K[0, 2], K[1, 2]
+		corners_3d = []
+		corner_depths_mm = []
+		for pt in img_pts:
+			u_c, v_c = int(round(pt[0])), int(round(pt[1]))
+			# コーナー中心の周辺で depth をサンプル (単一ピクセル depth は 0 が出やすいので中央値)
+			depths = []
+			for du in range(-patch_radius, patch_radius + 1):
+				for dv in range(-patch_radius, patch_radius + 1):
+					u, v = u_c + du, v_c + dv
+					if 0 <= u < W and 0 <= v < H:
+						d_raw = float(depth_arr[v, u])
+						if d_raw > 0:
+							depths.append(d_raw * depth_scale_mm)
+			if len(depths) < 3:
+				corners_3d.append(None)
+				corner_depths_mm.append(0.0)
+				continue
+			# メジアン (外れ値除去)
+			z_mm = float(np.median(depths))
+			corner_depths_mm.append(z_mm)
+			# u, v から 3D 座標 (バックプロジェクション)
+			x_mm = (u_c - cx) * z_mm / fx
+			y_mm = (v_c - cy) * z_mm / fy
+			corners_3d.append([x_mm, y_mm, z_mm])
+		valid = [c for c in corners_3d if c is not None]
+		if len(valid) < 3:
+			return np.eye(4), False, {
+				"reason": f"valid corners = {len(valid)} < 3",
+				"corner_depths_mm": corner_depths_mm,
+			}
+		# 有効なコーナーだけで剛体変換 (obj_pts (marker frame) → cam_pts (camera frame))
+		obj_valid = np.asarray([obj_pts[i] for i in range(4) if corners_3d[i] is not None], dtype=np.float64)
+		cam_valid = np.asarray([corners_3d[i] for i in range(4) if corners_3d[i] is not None], dtype=np.float64)
+		try:
+			T = self._rigid_from_correspondences(obj_valid, cam_valid, allow_scale=False)
+		except Exception as e:
+			return np.eye(4), False, {
+				"reason": f"rigid fit failed: {e}",
+				"corner_depths_mm": corner_depths_mm,
+			}
+		# 残差 (mm) — 各コーナーの再投影誤差
+		cam_pred = (T[:3, :3] @ obj_valid.T).T + T[:3, 3]
+		residuals = np.linalg.norm(cam_pred - cam_valid, axis=1)
+		rmse = float(np.sqrt(np.mean(residuals ** 2)))
+		return T, True, {
+			"rmse_mm": rmse,
+			"corner_depths_mm": corner_depths_mm,
+			"n_valid_corners": int(len(valid)),
+		}
+
+	def _ankle_refine_pose_with_depth(self, T_orig, img_pts, depth_arr, K, depth_scale_mm,
+	                                    roi_pad_ratio: float = 0.15,
+	                                    min_inliers: int = 20,
+	                                    ransac_thresh_mm: float = 1.0,
+	                                    n_ransac_iter: int = 200):
+		"""検出済み ArUco pose を深度画像の平面フィットで精緻化する (Option A)。
+
+		【アルゴリズム】
+		1. マーカー4隅の bounding box を pad で拡張した ROI 内の深度画素を 3D 化
+		2. RANSAC で平面 n·p + d = 0 を推定 (外れ値耐性)
+		3. inlier 集合で SVD 最小二乗リファイン (平面パラメータの精度向上)
+		4. T_orig の位置 t を平面上に投影 (Z誤差消し込み)
+		5. T_orig のマーカー Z軸を平面法線に揃える回転 R_align を適用 (法線ズレ修正)
+
+		【効果】mono PnP の Z軸誤差 (0.3-1mm) を depth 平面フィット (0.05-0.2mm) に置換。
+		D405 の 0.1mm/unit 深度精度が最大限活かされる。
+
+		Args:
+			T_orig: 4x4 mono PnP + depth-flip 済みの初期 pose (未精緻化)
+			img_pts: (4, 2) 検出されたマーカー4隅のピクセル座標
+			depth_arr: (H, W) 深度画像 (raw units)
+			K: (3, 3) カメラ内部行列
+			depth_scale_mm: depth 値 → mm 変換係数
+			roi_pad_ratio: マーカー bounding box の pad 比率
+			min_inliers: 平面フィット inlier 最小数 (下回れば精緻化スキップ)
+			ransac_thresh_mm: RANSAC inlier 判定閾値 [mm]
+			n_ransac_iter: RANSAC 反復回数
+
+		Returns:
+			(T_refined: 4x4, refined: bool, info: dict)
+			refined=False の場合 T_orig をそのまま返す
+		"""
+		import numpy as np
+		H, W = depth_arr.shape[:2]
+		xs = img_pts[:, 0]; ys = img_pts[:, 1]
+		xmin, xmax = float(xs.min()), float(xs.max())
+		ymin, ymax = float(ys.min()), float(ys.max())
+		w = xmax - xmin; h = ymax - ymin
+		px = int(round(w * roi_pad_ratio))
+		py = int(round(h * roi_pad_ratio))
+		u0 = max(0, int(round(xmin)) - px)
+		u1 = min(W, int(round(xmax)) + px + 1)
+		v0 = max(0, int(round(ymin)) - py)
+		v1 = min(H, int(round(ymax)) + py + 1)
+		if u1 <= u0 or v1 <= v0:
+			return T_orig, False, {"reason": "empty ROI"}
+		depth_roi = depth_arr[v0:v1, u0:u1].astype(np.float32) * depth_scale_mm
+		valid = depth_roi > 0
+		if valid.sum() < min_inliers:
+			return T_orig, False, {"reason": f"too few depth pixels ({valid.sum()})"}
+		us = np.arange(u0, u1)
+		vs = np.arange(v0, v1)
+		uu, vv = np.meshgrid(us, vs)
+		zz = depth_roi
+		fx, fy = K[0, 0], K[1, 1]
+		cx, cy = K[0, 2], K[1, 2]
+		xx = (uu - cx) * zz / fx
+		yy = (vv - cy) * zz / fy
+		pts = np.stack([xx, yy, zz], axis=-1)[valid].astype(np.float32)
+		if len(pts) < min_inliers:
+			return T_orig, False, {"reason": f"too few 3D points ({len(pts)})"}
+		# --- RANSAC 平面フィット ---
+		best_n = None; best_d = None; best_inliers = 0
+		rng = np.random.default_rng(seed=42)
+		for _ in range(n_ransac_iter):
+			idx = rng.choice(len(pts), 3, replace=False)
+			p1, p2, p3 = pts[idx]
+			v1 = p2 - p1; v2 = p3 - p1
+			n = np.cross(v1, v2)
+			norm = np.linalg.norm(n)
+			if norm < 1e-6:
+				continue
+			n = n / norm
+			d = -float(n @ p1)
+			dists = np.abs(pts @ n + d)
+			inliers = int((dists < ransac_thresh_mm).sum())
+			if inliers > best_inliers:
+				best_inliers = inliers; best_n = n; best_d = d
+		if best_n is None or best_inliers < min_inliers:
+			return T_orig, False, {"reason": f"RANSAC failed (inliers={best_inliers})"}
+		# --- 最小二乗リファイン (inlier 集合) ---
+		dists = np.abs(pts @ best_n + best_d)
+		inlier_pts = pts[dists < ransac_thresh_mm]
+		centroid = inlier_pts.mean(axis=0)
+		try:
+			_, _, Vt = np.linalg.svd(inlier_pts - centroid, full_matrices=False)
+		except np.linalg.LinAlgError:
+			return T_orig, False, {"reason": "SVD failed"}
+		n_refined = Vt[2]
+		nn = float(np.linalg.norm(n_refined))
+		if nn < 1e-9:
+			return T_orig, False, {"reason": "degenerate normal"}
+		n_refined = n_refined / nn
+		d_refined = -float(n_refined @ centroid)
+		# T_orig の Z軸 (マーカー法線) と向きを合わせる
+		R_orig = T_orig[:3, :3].astype(np.float64)
+		t_orig = T_orig[:3, 3].astype(np.float64)
+		z_marker = R_orig[:, 2]
+		if float(n_refined @ z_marker) < 0:
+			n_refined = -n_refined
+			d_refined = -d_refined
+		# (1) 位置補正: t_orig を平面上に投影
+		dist_to_plane = float(n_refined @ t_orig + d_refined)
+		t_new = t_orig - dist_to_plane * n_refined
+		# (2) 姿勢補正: マーカー Z軸を平面法線に一致させる回転
+		axis = np.cross(z_marker, n_refined)
+		axis_norm = float(np.linalg.norm(axis))
+		delta_angle_deg = 0.0
+		if axis_norm < 1e-9:
+			R_align = np.eye(3)
+		else:
+			axis = axis / axis_norm
+			cos_a = float(np.clip(z_marker @ n_refined, -1.0, 1.0))
+			angle = float(np.arccos(cos_a))
+			delta_angle_deg = float(np.degrees(angle))
+			K_mat = np.array([[0, -axis[2], axis[1]],
+			                   [axis[2], 0, -axis[0]],
+			                   [-axis[1], axis[0], 0]], dtype=np.float64)
+			R_align = np.eye(3) + np.sin(angle) * K_mat + (1 - np.cos(angle)) * (K_mat @ K_mat)
+		R_new = R_align @ R_orig
+		# 直交化 (数値誤差対策)
+		U, _, Vt2 = np.linalg.svd(R_new)
+		R_new = U @ Vt2
+		if float(np.linalg.det(R_new)) < 0:
+			R_new = U @ np.diag([1.0, 1.0, -1.0]) @ Vt2
+		T_new = np.eye(4)
+		T_new[:3, :3] = R_new
+		T_new[:3, 3] = t_new
+		return T_new, True, {
+			"inliers": int(len(inlier_pts)),
+			"total": int(len(pts)),
+			"delta_t_mm": float(abs(dist_to_plane)),
+			"delta_angle_deg": delta_angle_deg,
+		}
 
 	def _ankle_detect_markers_in_frame(self, gray, depth_arr, K, dist,
 	                                   obj_pts, marker_size_mm,
@@ -4385,7 +5126,140 @@ class MainMenuGUI(_BaseWindow):
 				err_val = float(reproj[best_idx].item())
 			except Exception:
 				err_val = float(reproj[best_idx])
-			out[mid] = {"pose": T, "reproj_err": err_val, "depth_score": best_score}
+			pnp_Z = float(tv[2])
+			# solvePnP 素の結果。深度は既に「IPPEの表裏どちらを採るか」の判定に使われており、
+			# これは深度の粗い使い方なのでノイズに強い。
+			T_pnp_only = T.copy()
+
+			# 実測 (2026-08-29) で RGB のみが融合より 7〜14倍 安定だったため既定は "rgb"。
+			try:
+				method = str(self.ankle_pose_method.get())
+			except Exception:
+				method = "rgb"
+			# 冒頭の一定フレームだけ 3手法を計算して比較レポートに回す
+			try:
+				cmp_limit = int(self.ankle_compare_frames.get())
+			except Exception:
+				cmp_limit = 300
+			store = getattr(self, "_ankle_method_compare", None) or {}
+			done = len(store.get(int(mid), {}).get("pnp", [])) if store else 0
+			comparing = (cmp_limit > 0 and done < cmp_limit)
+
+			need_fusion = (method == "fusion") or comparing
+			need_corners = (method == "depth-corners") or comparing
+
+			T_fuse, ok_fuse, info_fuse = None, False, {}
+			if need_fusion:
+				try:
+					_expand = float(self.ankle_plane_expand.get())
+				except Exception:
+					_expand = 2.2
+				T_fuse, ok_fuse, info_fuse = self._ankle_pose_from_rgb_depth_fusion(
+					img_pts, obj_pts, depth_arr, K, dist, depth_scale_mm, expand=_expand)
+			use_fusion = (ok_fuse and info_fuse.get("fit_rmse_mm", 999.0) < 3.0)
+
+			T_depth, ok_depth, info_depth = None, False, {}
+			depth_Z_median = 0.0
+			if need_corners:
+				T_depth, ok_depth, info_depth = self._ankle_pose_from_depth_corners(
+					img_pts, obj_pts, depth_arr, K, depth_scale_mm)
+				try:
+					valid_ds = [d for d in info_depth.get("corner_depths_mm", []) if d > 0]
+					depth_Z_median = float(np.median(valid_ds)) if valid_ds else 0.0
+				except Exception:
+					pass
+
+			ok_corners = (ok_depth and info_depth.get("rmse_mm", 999.0) < 5.0
+			              and info_depth.get("n_valid_corners", 0) >= 3)
+
+			if method == "rgb":
+				# RGB のみ。深度は表裏判定と深度スケール検証にのみ使う。
+				pose_source = "rgb-solvePnP"
+			elif method == "depth-corners" and ok_corners:
+				T = T_depth
+				pose_source = "depth-corners"
+			elif method == "fusion" and use_fusion:
+				T = T_fuse
+				pose_source = "rgbd-fusion"
+			elif use_fusion:
+				T = T_fuse
+				pose_source = "rgbd-fusion"
+			elif ok_corners:
+				T = T_depth
+				pose_source = "depth-corners"
+			else:
+				pose_source = "rgb-solvePnP"
+
+			# 採用手法の集計 (実行後にまとめて報告する)
+			if not hasattr(self, "_ankle_pose_source_counts"):
+				self._ankle_pose_source_counts = {}
+			self._ankle_pose_source_counts[pose_source] = \
+				self._ankle_pose_source_counts.get(pose_source, 0) + 1
+
+			# 診断ログ (ID ごとに最初のフレームだけ)
+			if not hasattr(self, "_ankle_depth_diag_shown"):
+				self._ankle_depth_diag_shown = set()
+			diag_key = f"{mid}_first"
+			if diag_key not in self._ankle_depth_diag_shown:
+				self._ankle_depth_diag_shown.add(diag_key)
+				if use_fusion:
+					meas = info_fuse.get("measured_marker_mm")
+					rad = info_fuse.get("plane_radius_mm")
+					rms_p = info_fuse.get("plane_rms_mm") or 0.0
+					self._ankle_safe_print(
+						f"[ArUco診断 ID={mid}] 採用=rgbd-fusion  "
+						f"平面フィット点数={info_fuse.get('n_plane_points')} "
+						f"(inlier {100.0 * (info_fuse.get('inlier_ratio') or 0):.0f}%"
+						f"{', 台座まで拡張' if info_fuse.get('expanded') else ', マーカー内部のみ'}), "
+						f"平面平坦度RMS={rms_p:.3f}mm, "
+						f"角フィットRMSE={info_fuse.get('fit_rmse_mm', float('nan')):.3f}mm, "
+						f"距離={float(T[2, 3]):.1f}mm (solvePnP {pnp_Z:.1f}mm)")
+					if rad:
+						# 深度ノイズは空間相関があるので √N では稼げない。法線精度 ≈ σ/r。
+						est_deg = np.degrees(np.arctan2(rms_p, max(rad, 1e-6)))
+						self._ankle_safe_print(
+							f"    平面フィット半径 = {rad:.1f} mm "
+							f"→ 法線精度の目安 {est_deg:.2f}° (= 平坦度RMS ÷ 半径)。"
+							f"  半径を大きくするほど回転が安定します")
+					if meas:
+						diff_pct = 100.0 * (meas - float(marker_size_mm)) / max(float(marker_size_mm), 1e-6)
+						note = ""
+						if abs(diff_pct) > 2.0:
+							note = ("  [注意] ②の設定値と 2% 以上ずれています。"
+							        "印刷スケールを確認し、実測値を②に入れてください")
+						self._ankle_safe_print(
+							f"    実測マーカー寸法 = {meas:.2f} mm "
+							f"(②の設定 {float(marker_size_mm):.2f} mm, 差 {diff_pct:+.1f}%), "
+							f"辺長ばらつき {info_fuse.get('marker_edge_spread_mm', float('nan')):.2f} mm{note}")
+				else:
+					extra = ""
+					if need_fusion:
+						extra = f" (rgbd-fusion 不可: {info_fuse.get('reason')})"
+					self._ankle_safe_print(
+						f"[ArUco診断 ID={mid}] 採用={pose_source}{extra}  "
+						f"距離={float(T[2, 3]):.1f}mm, 再投影誤差={err_val:.3f}px")
+					meas = info_fuse.get("measured_marker_mm")
+					if meas:
+						diff_pct = 100.0 * (meas - float(marker_size_mm)) / max(float(marker_size_mm), 1e-6)
+						note = ""
+						if abs(diff_pct) > 2.0:
+							note = ("  [注意] ②の設定値と 2% 以上ずれています。"
+							        "RGBのみの手法では距離が直接この比率でずれるため、"
+							        "実測値を②に入れてください")
+						self._ankle_safe_print(
+							f"    実測マーカー寸法 (深度から) = {meas:.2f} mm "
+							f"(②の設定 {float(marker_size_mm):.2f} mm, 差 {diff_pct:+.1f}%){note}")
+
+			out[mid] = {"pose": T, "reproj_err": err_val, "depth_score": best_score,
+			             "pose_source": pose_source,
+			             "depth_Z_median": depth_Z_median,
+			             "pnp_Z": pnp_Z,
+			             "plane_rms_mm": info_fuse.get("plane_rms_mm"),
+			             "fit_rmse_mm": info_fuse.get("fit_rmse_mm"),
+			             # --- 手法比較用 (どれが実データで一番安定かを後で実測する) ---
+			             "pose_pnp": T_pnp_only,
+			             "pose_corners": (T_depth if ok_depth else None),
+			             "pose_fusion": (T_fuse if ok_fuse else None)}
 		return out
 
 	def _ankle_detect_from_bag(self, bag_path: str, aruco_dict_name: str,
@@ -4411,12 +5285,54 @@ class MainMenuGUI(_BaseWindow):
 			playback = None
 
 		color_profile = profile.get_stream(rs.stream.color)
-		intr = color_profile.as_video_stream_profile().get_intrinsics()
+		vsp = color_profile.as_video_stream_profile()
+		intr = vsp.get_intrinsics()
 		K = np.array([[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]], dtype=np.float64)
 		dist = np.array(intr.coeffs, dtype=np.float64)
 		depth_sensor = profile.get_device().first_depth_sensor()
 		depth_scale = float(depth_sensor.get_depth_scale())
 		depth_scale_mm = depth_scale * 1000.0
+
+		# 総フレーム数の推定 (再生時間 × fps / stride)。progress 表示のため。
+		estimated_total = 0
+		try:
+			bag_fps = float(vsp.fps())
+			duration_ns = playback.get_duration().total_seconds() if playback is not None else 0.0
+			# .total_seconds() は timedelta のメソッド。pyrealsense2 の get_duration() は
+			# timedelta 相当を返すことが多いが、環境により int (ns) の場合もある。
+			if hasattr(duration_ns, 'total_seconds'):
+				duration_ns = duration_ns.total_seconds()
+			duration_s = float(duration_ns) if duration_ns else 0.0
+			if bag_fps > 0 and duration_s > 0:
+				estimated_total = max(1, int(bag_fps * duration_s / max(stride, 1)))
+				print(f"[ankle detect] 総フレーム数を推定: {estimated_total} (duration={duration_s:.2f}s × fps={bag_fps:.1f} / stride={stride})")
+		except Exception as e:
+			print(f"[ankle detect] 総フレーム数推定失敗 (進捗率は表示されません): {e}")
+			estimated_total = 0
+
+		# --- Color / Depth の解像度と intrinsics を出力 (アライメント診断) ---
+		try:
+			depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+			d_intr = depth_profile.get_intrinsics()
+			print(f"[ankle detect] Color intrinsics: fx={intr.fx:.1f}, fy={intr.fy:.1f}, "
+			      f"cx={intr.ppx:.1f}, cy={intr.ppy:.1f}, {intr.width}x{intr.height}")
+			print(f"[ankle detect] Depth intrinsics: fx={d_intr.fx:.1f}, fy={d_intr.fy:.1f}, "
+			      f"cx={d_intr.ppx:.1f}, cy={d_intr.ppy:.1f}, {d_intr.width}x{d_intr.height}")
+			print(f"[ankle detect] Depth scale: {depth_scale} m/unit = {depth_scale_mm} mm/unit")
+			if abs(intr.width - d_intr.width) > 0 or abs(intr.height - d_intr.height) > 0:
+				print(f"[ankle detect] ⚠️ Color と Depth の解像度差 → align 必須 "
+				      f"(align.process() で depth を color 系にリサンプル予定)")
+		except Exception as e:
+			print(f"[ankle detect] intrinsics 診断失敗: {e}")
+
+		# 推定値を progress_cb に通知 (最初の update 呼び出しで反映される)
+		if progress_cb and estimated_total > 0:
+			try:
+				progress_cb(0, 0, 0.0, id_counts_running={},
+				            total_frames_known=estimated_total,
+				            extra_msg=f"総フレーム数 (推定) = {estimated_total} — 検出処理開始")
+			except TypeError:
+				pass
 
 		align = rs.align(rs.stream.color)
 
@@ -4446,6 +5362,87 @@ class MainMenuGUI(_BaseWindow):
 				depth_arr = np.asanyarray(depth.get_data())
 				timestamps.append(color.get_timestamp() / 1000.0)
 				gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if rgb.ndim == 3 else rgb
+
+				# --- 【最初のフレームで詳細診断】depth アライメントと scale を検証 ---
+				if processed == 0:
+					# depth_scale の自動補正 (SDK報告値が実データと乖離する場合)
+					try:
+						auto_fix = bool(self.ankle_depth_scale_autofix.get())
+					except Exception:
+						auto_fix = True
+					if auto_fix:
+						depth_scale_mm, _dsinfo = self._ankle_auto_correct_depth_scale(
+							gray, depth_arr, K, dist, obj_pts, target_ids,
+							detector, dictionary, params, use_new_api, depth_scale_mm)
+					try:
+						print(f"[深度診断] color shape: {rgb.shape}, depth shape: {depth_arr.shape}")
+						print(f"[深度診断] 使用する depth_scale_mm = {depth_scale_mm:.6f} mm/unit "
+						      f"(SDK報告値: {depth_scale * 1000.0:.6f})")
+						# 全体の depth 統計 (補正後のスケールで)
+						valid_mask = depth_arr > 0
+						if valid_mask.any():
+							valid_d = depth_arr[valid_mask].astype(np.float32) * depth_scale_mm
+							print(f"[深度診断] depth 全体 (有効値, mm): "
+							      f"min={float(valid_d.min()):.1f}, "
+							      f"median={float(np.median(valid_d)):.1f}, "
+							      f"max={float(valid_d.max()):.1f}, "
+							      f"有効率={100.0 * valid_mask.sum() / valid_mask.size:.1f}%")
+						# 画像中心の depth を参考出力
+						h, w = depth_arr.shape[:2]
+						cd_raw = int(depth_arr[h // 2, w // 2])
+						print(f"[深度診断] 画像中心 depth: raw={cd_raw}, mm={cd_raw * depth_scale_mm:.1f}")
+						# アライメント問題の警告
+						if rgb.shape[:2] != depth_arr.shape[:2]:
+							print(f"[深度診断] ⚠️ color と depth の解像度が不一致! "
+							      f"align.process() が正しく機能していない可能性")
+						# デバッグ画像出力 (color, colored depth) — 日本語パス対応の _ankle_imwrite を使用
+						try:
+							debug_dir = Path(bag_path).parent / "debug_frame0"
+							debug_dir.mkdir(parents=True, exist_ok=True)
+							saved = []
+							# color
+							color_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if rgb.ndim == 3 else rgb
+							if self._ankle_imwrite(debug_dir / "color.png", color_bgr):
+								saved.append("color.png")
+							# depth colormap (mm 単位で正規化 → JET)
+							depth_mm_img = depth_arr.astype(np.float32) * depth_scale_mm
+							# 100mm〜1000mm を 0〜255 にマッピング (D405 動作範囲を強調)
+							depth_vis = np.clip((depth_mm_img - 100.0) / 900.0 * 255.0, 0, 255).astype(np.uint8)
+							depth_vis[depth_arr == 0] = 0  # 無効ピクセル黒
+							depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+							if self._ankle_imwrite(debug_dir / "depth_colored.png", depth_color):
+								saved.append("depth_colored.png")
+							# ArUco 検出結果を color に重ね、各マーカーの深度値を注記した画像
+							try:
+								overlay = (cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).copy() if rgb.ndim == 3
+								           else cv2.cvtColor(rgb, cv2.COLOR_GRAY2BGR))
+								corners_det, ids_det, _ = (detector.detectMarkers(gray) if use_new_api
+								                            else cv2.aruco.detectMarkers(gray, dictionary, parameters=params))
+								if ids_det is not None:
+									cv2.aruco.drawDetectedMarkers(overlay, corners_det, ids_det)
+									# 各マーカー中心に深度値を描画 (アライメント確認用)
+									for c_det, i_det in zip(corners_det, ids_det):
+										pts = c_det.reshape(-1, 2)
+										cu, cv_ = int(round(pts[:, 0].mean())), int(round(pts[:, 1].mean()))
+										if 0 <= cu < depth_arr.shape[1] and 0 <= cv_ < depth_arr.shape[0]:
+											dmm = float(depth_arr[cv_, cu]) * depth_scale_mm
+											cv2.putText(overlay, f"ID{int(i_det[0])}: {dmm:.0f}mm",
+											            (cu - 40, cv_ - 12), cv2.FONT_HERSHEY_SIMPLEX,
+											            0.5, (0, 0, 255), 2)
+									if self._ankle_imwrite(debug_dir / "aruco_overlay.png", overlay):
+										saved.append("aruco_overlay.png")
+							except Exception:
+								pass
+							if saved:
+								print(f"[深度診断] デバッグ画像を保存: {debug_dir}")
+								print(f"  → {' / '.join(saved)} を確認してください")
+							else:
+								print(f"[深度診断] ⚠️ デバッグ画像を1つも保存できませんでした: {debug_dir}")
+						except Exception as e_img:
+							print(f"[深度診断] デバッグ画像保存失敗: {e_img}")
+					except Exception as e:
+						print(f"[深度診断] 診断出力失敗: {e}")
+
 				det = self._ankle_detect_markers_in_frame(
 					gray, depth_arr, K, dist, obj_pts, marker_size_mm,
 					depth_scale_mm, target_ids, detector, dictionary, params, use_new_api)
@@ -4458,10 +5455,20 @@ class MainMenuGUI(_BaseWindow):
 						poses[aid].append(np.full((4, 4), np.nan))
 						detected[aid].append(False)
 						reproj[aid].append(float("nan"))
+				self._ankle_accumulate_method_compare(det, target_ids)
 				processed += 1
 				frame_idx += 1
-				if progress_cb and processed % 5 == 0:
-					progress_cb(processed, frame_idx, timestamps[-1] if timestamps else 0.0)
+				# 進捗更新 (5フレームに1回でUI負荷を抑える。running カウントを渡す)
+				if progress_cb and (processed % 5 == 0 or processed == 1):
+					id_counts_running = {aid: int(sum(detected[aid])) for aid in target_ids}
+					try:
+						progress_cb(processed, frame_idx,
+						            timestamps[-1] if timestamps else 0.0,
+						            id_counts_running=id_counts_running)
+					except TypeError:
+						# 旧シグネチャ互換
+						progress_cb(processed, frame_idx,
+						            timestamps[-1] if timestamps else 0.0)
 		finally:
 			try:
 				pipeline.stop()
@@ -4550,6 +5557,16 @@ class MainMenuGUI(_BaseWindow):
 			depth_arr = depth_frames[frame_idx]
 			gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
 			timestamps.append(frame_idx / fps)
+			# 最初のフレームで depth_scale の自動補正を試みる
+			if processed == 0:
+				try:
+					auto_fix_v = bool(self.ankle_depth_scale_autofix.get())
+				except Exception:
+					auto_fix_v = True
+				if auto_fix_v:
+					depth_scale_mm, _ = self._ankle_auto_correct_depth_scale(
+						gray, depth_arr, K, dist, obj_pts, target_ids,
+						detector, dictionary, params, use_new_api, depth_scale_mm)
 			det = self._ankle_detect_markers_in_frame(
 				gray, depth_arr, K, dist, obj_pts, marker_size_mm,
 				depth_scale_mm, target_ids, detector, dictionary, params, use_new_api)
@@ -4562,10 +5579,16 @@ class MainMenuGUI(_BaseWindow):
 					poses[aid].append(np.full((4, 4), np.nan))
 					detected[aid].append(False)
 					reproj[aid].append(float("nan"))
+			self._ankle_accumulate_method_compare(det, target_ids)
 			processed += 1
 			frame_idx += 1
-			if progress_cb and processed % 5 == 0:
-				progress_cb(processed, frame_idx, timestamps[-1])
+			if progress_cb and (processed % 5 == 0 or processed == 1):
+				id_counts_running = {aid: int(sum(detected[aid])) for aid in target_ids}
+				try:
+					progress_cb(processed, frame_idx, timestamps[-1],
+					            id_counts_running=id_counts_running)
+				except TypeError:
+					progress_cb(processed, frame_idx, timestamps[-1])
 		cap.release()
 
 		return {
@@ -4587,33 +5610,183 @@ class MainMenuGUI(_BaseWindow):
 		}
 
 	# ---- 進捗ダイアログ ----
-	def _ankle_open_progress(self, title: str):
-		"""検出用の進捗ダイアログを開き、更新用closureを返す。"""
+	def _ankle_open_progress(self, title: str, total_frames: int = 0):
+		"""検出用の進捗ダイアログを開き、更新用closureを返す (リッチ表示版)。
+
+		Args:
+			title: ウィンドウタイトル
+			total_frames: 総フレーム数 (既知の場合)。0 なら indeterminate mode。
+
+		Returns:
+			(update, close, cancel_check) の3タプル
+			update(processed, frame_idx, t_sec, detected_ids=None, extra_msg=None):
+			    processed: これまでに処理したフレーム数
+			    frame_idx: 元のフレーム番号 (stride 考慮)
+			    t_sec: 再生時刻 [s]
+			    detected_ids: このフレームで検出された ID のリスト (per-ID カウント用)
+			    extra_msg: 追加ステップ表示 (例 "深度平面フィット中")
+		"""
+		import time as _time
 		win = tk.Toplevel(self)
 		win.title(title)
 		win.transient(self)
-		win.geometry("+%d+%d" % (self.winfo_rootx() + 60, self.winfo_rooty() + 60))
-		tk.Label(win, text=title, font=(self.ui_font_family, 10, "bold")).pack(padx=12, pady=(10, 4))
-		status_var = tk.StringVar(value="開始中…")
-		tk.Label(win, textvariable=status_var, width=52, anchor="w").pack(padx=12, pady=2)
-		pbar = ttk.Progressbar(win, mode="indeterminate", length=380)
-		pbar.pack(padx=12, pady=(4, 4))
-		pbar.start(80)
+		# 【重要】geometry でサイズを明示指定 (Windows で表示されない問題を回避)
+		x = self.winfo_rootx() + 80
+		y = self.winfo_rooty() + 80
+		win.geometry(f"560x340+{x}+{y}")
+		win.resizable(True, True)
+		win.minsize(500, 300)
+		try:
+			win.attributes('-topmost', True)
+		except Exception:
+			pass
+
+		# タイトル
+		ttk.Label(win, text=title,
+		          font=(self.ui_font_family, 11, "bold")).pack(padx=12, pady=(10, 6))
+
+		# メインステータス
+		status_var = tk.StringVar(value="開始中… (処理準備)")
+		ttk.Label(win, textvariable=status_var, anchor="w",
+		          font=(self.ui_font_family, 10, "bold")
+		          ).pack(padx=12, pady=(2, 4), fill=tk.X)
+
+		# 進捗バー
+		mode = "determinate" if total_frames > 0 else "indeterminate"
+		pbar = ttk.Progressbar(win, mode=mode, length=520,
+		                        maximum=max(total_frames, 100))
+		pbar.pack(padx=12, pady=(4, 6))
+		if mode == "indeterminate":
+			pbar.start(80)
+
+		percent_var = tk.StringVar(value="")
+		ttk.Label(win, textvariable=percent_var,
+		          font=(self.ui_font_family, 9),
+		          foreground="#005580").pack(padx=12, pady=(0, 4))
+
+		# 詳細情報 (経過時間, 速度, ETA)
+		detail_var = tk.StringVar(value="")
+		ttk.Label(win, textvariable=detail_var, anchor="w", justify=tk.LEFT,
+		          font=(self.ui_font_family, 9),
+		          foreground="#333333"
+		          ).pack(padx=12, pady=(2, 4), fill=tk.X)
+
+		# 現在の処理内容
+		step_var = tk.StringVar(value="待機中")
+		ttk.Label(win, text="■ 現在:", anchor="w", justify=tk.LEFT,
+		          font=(self.ui_font_family, 9, "bold")
+		          ).pack(padx=12, pady=(6, 0), anchor="w")
+		ttk.Label(win, textvariable=step_var, anchor="w", justify=tk.LEFT,
+		          font=(self.ui_font_family, 9), foreground="#005580", wraplength=520
+		          ).pack(padx=20, pady=(0, 4), fill=tk.X)
+
+		# 検出済 ID 別カウント
+		per_id_var = tk.StringVar(value="(検出待機中…)")
+		ttk.Label(win, text="■ マーカー検出状況:", anchor="w", justify=tk.LEFT,
+		          font=(self.ui_font_family, 9, "bold")
+		          ).pack(padx=12, pady=(6, 0), anchor="w")
+		ttk.Label(win, textvariable=per_id_var, anchor="w", justify=tk.LEFT,
+		          font=("Courier New", 9)
+		          ).pack(padx=20, pady=(0, 4), fill=tk.X)
+
 		self._ankle_detect_cancel = False
+		start_time = _time.time()
+		id_counts = {}       # id -> 検出できたフレーム数
+		id_seen = set()      # このフレームで検出済みの id (重複防止用に呼び側で clear)
+
 		def _cancel():
 			self._ankle_detect_cancel = True
-			status_var.set("キャンセル要求…完了を待機中")
-		tk.Button(win, text="キャンセル", command=_cancel).pack(padx=12, pady=(4, 10))
+			status_var.set("[キャンセル要求] 完了を待機中…")
+
+		ttk.Button(win, text="キャンセル", command=_cancel, width=15).pack(padx=12, pady=(8, 10))
 		win.protocol("WM_DELETE_WINDOW", _cancel)
-		def update(processed, frame_idx, t_sec):
-			status_var.set(f"処理済 {processed} フレーム (元frame_idx={frame_idx}, t≈{t_sec:.2f}s)")
+
+		# 初期レイアウトを強制 (widget が表示されない問題を回避)
+		try:
 			win.update_idletasks()
+			win.update()
+		except Exception:
+			pass
+
+		# 総フレーム数は後から更新可能 (bag ファイルは開いてみないと分からない)
+		total_frames_ref = [int(total_frames)]
+
+		def update(processed, frame_idx, t_sec, detected_ids=None, extra_msg=None,
+		           id_counts_running=None, total_frames_known=None):
+			"""進捗を更新。
+
+			id_counts_running が渡されれば直接そのカウントを表示 (推奨・最新機能)。
+			total_frames_known: 途中で総フレーム数が判明した場合、渡すと determinate に切替
+			detected_ids はレガシー用 (呼び時にのみ +1 加算、5フレーム毎呼びだと過小カウント)。
+			"""
+			# 総フレーム数の後追い更新
+			if total_frames_known and total_frames_known > total_frames_ref[0]:
+				total_frames_ref[0] = int(total_frames_known)
+				try:
+					pbar.stop()
+					pbar.configure(mode="determinate", maximum=int(total_frames_known))
+				except Exception:
+					pass
+			total = total_frames_ref[0]
+			elapsed = _time.time() - start_time
+			fps = processed / max(elapsed, 1e-3)
+			# メインステータス
+			if total > 0:
+				pct = 100.0 * processed / max(total, 1)
+				status_var.set(f"[処理中] フレーム {processed} / {total} 相当 ({pct:.1f}%)")
+				percent_var.set(f"{pct:.1f}% 完了")
+				try:
+					pbar['value'] = min(processed, total)
+				except Exception:
+					pass
+			else:
+				status_var.set(f"[処理中] フレーム {processed} を処理済")
+				percent_var.set("(総フレーム数は未確定 — 進捗率は表示できません)")
+			# 詳細
+			eta_str = ""
+			if total > 0 and processed > 0 and fps > 0:
+				eta = max(0.0, (total - processed) / fps)
+				eta_str = f"   残り予想: {int(eta // 60):02d}:{int(eta % 60):02d}"
+			detail_var.set(
+				f"経過時間: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+				f"   処理速度: {fps:.1f} frames/s"
+				f"   再生時刻: t≈{t_sec:.2f}s"
+				f"{eta_str}"
+			)
+			# 現在の処理内容
+			if extra_msg:
+				step_var.set(extra_msg)
+			else:
+				step_var.set(f"元フレーム {frame_idx} を処理: ArUco検出 → SUBPIX精緻化 → 深度平面フィット")
+			# ID 別カウント
+			if id_counts_running is not None:
+				# 呼び側の running カウントをそのまま反映 (推奨)
+				id_counts.clear()
+				id_counts.update({int(k): int(v) for k, v in id_counts_running.items()})
+			elif detected_ids is not None:
+				# レガシー: +1 加算 (呼び頻度に依存するので不正確)
+				for id_val in set(int(i) for i in detected_ids):
+					id_counts[id_val] = id_counts.get(id_val, 0) + 1
+			if id_counts:
+				lines = []
+				for id_val in sorted(id_counts.keys()):
+					cnt = id_counts[id_val]
+					rate = 100.0 * cnt / max(processed, 1)
+					lines.append(f"  ID={id_val:>3d}: {cnt:>5d}件 (検出率 {rate:5.1f}%)")
+				per_id_var.set("\n".join(lines))
+			try:
+				win.update_idletasks()
+				win.update()
+			except Exception:
+				pass
+
 		def close():
 			try:
 				pbar.stop()
 				win.destroy()
 			except Exception:
 				pass
+
 		return update, close, lambda: self._ankle_detect_cancel
 
 	# ---- キャッシュ (per-tab) ヘルパ ----
@@ -4666,6 +5839,10 @@ class MainMenuGUI(_BaseWindow):
 		"""現在の入力に基づき ArUco検出+PnPを実行する。"""
 		if not self._ankle_check_cv2():
 			return
+		# 診断ログのマーカー ID 履歴をクリア (実行ごとに最初のフレーム診断を出す)
+		self._ankle_depth_diag_shown = set()
+		self._ankle_pose_source_counts = {}
+		self._ankle_method_compare = {}
 		# 骨リストからArUco IDを収集
 		target_ids = set()
 		for b in self.ankle_bones:
@@ -4770,10 +5947,29 @@ class MainMenuGUI(_BaseWindow):
 				return
 			close_cb()
 
+		# 採用した姿勢推定手法の内訳を報告 (品質の目安になる)
+		counts = getattr(self, "_ankle_pose_source_counts", {}) or {}
+		src_lines = []
+		if counts:
+			total_det = sum(counts.values())
+			self._ankle_safe_print("[姿勢推定手法の内訳]")
+			for k, v in sorted(counts.items(), key=lambda kv: -kv[1]):
+				pct = 100.0 * v / max(total_det, 1)
+				self._ankle_safe_print(f"    {k}: {v} 件 ({pct:.1f}%)")
+				src_lines.append(f"  {k}: {pct:.1f}%")
+			fusion_pct = 100.0 * counts.get("rgbd-fusion", 0) / max(total_det, 1)
+			if fusion_pct < 80.0:
+				self._ankle_safe_print(
+					"    [注意] rgbd-fusion の採用率が低いです。マーカー面の深度が"
+					"欠けている可能性があります (映り込み・距離・角度を確認してください)")
+
 		# キャッシュ保存 + ステータス更新
 		self._ankle_set_current_cache(cache)
 		self._ankle_update_detection_status()
-		messagebox.showinfo("検出完了", self._ankle_cache_status_text(cache))
+		msg = self._ankle_cache_status_text(cache)
+		if src_lines:
+			msg += "\n\n姿勢推定手法:\n" + "\n".join(src_lines)
+		messagebox.showinfo("検出完了", msg)
 
 	# ---- 姿勢時系列 保存/読込 (.npz) ----
 	def _ankle_save_pose_cache_npz(self, path: str, cache: dict) -> None:
@@ -5540,17 +6736,18 @@ class MainMenuGUI(_BaseWindow):
 
 	# ---- Stage 5: 骨アニメーション + 骨対ヒートマップ ----
 	def _ankle_heatmap_bone_indices(self):
-		"""ヒートマップ用の骨A/骨B (ankle_bones上のindex) を返す。未選択は None。"""
-		def parse(label: str):
-			label = (label or "").strip()
-			if not label or label == "(未選択)":
-				return None
-			# 「N. 骨名」 → N-1
-			try:
-				return int(label.split(".", 1)[0]) - 1
-			except Exception:
-				return None
-		return parse(self.ankle_heatmap_prox_var.get()), parse(self.ankle_heatmap_dist_var.get())
+		"""ヒートマップ骨対 (骨A, 骨B) の ankle_bones 上インデックスを返す。
+
+		現行の可視化は N骨マルチヒートマップに移行済みで、UI ではペア指定を廃止。
+		本メソッドは残存参照 (self_pose の boneA_ref 世界フレーム基準) の互換維持用に
+		「骨リスト先頭2本」を既定として返す。骨が1本のみなら (0, None)、空なら (None, None)。
+		"""
+		n = len(self.ankle_bones)
+		if n == 0:
+			return None, None
+		if n == 1:
+			return 0, None
+		return 0, 1
 
 	def _ankle_pick_reference_pose(self, poses, detected, ref_frame: int):
 		"""参照フレーム(t=0)の姿勢を選ぶ。指定frameが検出失敗なら最近傍の検出済みfromへフォールバック。"""
@@ -5786,137 +6983,122 @@ class MainMenuGUI(_BaseWindow):
 		except Exception:
 			return 'RdYlGn'
 
-	def _sim_view_precompute_multi_heatmap(self, bones_data, progress_cb=None, cancel_flag=None):
-		"""N骨のマルチヒートマップを事前計算。
+	def _sim_view_precompute_multi_heatmap(self, bones_data, update_progress, cancel_var):
+		"""N骨のマルチヒートマップを事前計算 (膝/股と同じ高速エンジン _precompute_heatmaps_o3d を流用)。
 
 		各フレーム t / 各骨 i について
-		    scalars[t][i] = min over j!=i of signed_distance(bone_i vertex, bone_j surface)
+		    scalars[t][i][v] = min over j!=i of signed_distance(bone_i vertex_v (t), bone_j surface (t))
 		を返す。負値=めり込み・0=接触・正=離間。
 
+		内部実装: 骨ペア (i, j) ごとに膝/股の `_precompute_heatmaps_o3d` を呼び出す。
+		- 固定側 (dist_surface) = 骨 j のローカル姿勢メッシュ (BVH シーンをペアごと 1回だけ構築)
+		- 近位点 (prox_points) = 骨 i のローカル頂点
+		- transform_data[t] = {'matrix': Trel_ij[t]}  ここで Trel_ij[t] = inv(Ts_j[t]) @ Ts_i[t]
+		  (骨 j ローカル系から見た骨 i の姿勢)
+		- 剛体変換の不変性を利用し、近位点を逆変換して固定シーンで一括問い合わせ
+
 		Args:
-			bones_data: list of (bone_idx, name, mesh_L, T_series (N,4,4))
-			progress_cb: fn(current, total, msg) -> bool (False で中断)
-			cancel_flag: list/ref with [0]=truthy でキャンセル
+			bones_data: list of (bone_idx, name, mesh_L, T_series (N_frames,4,4))
+			update_progress: fn(current, total, msg) -> bool (False で中断)
+			cancel_var: tk.BooleanVar (True で中断)
 
 		Returns:
-			list of dict{bone_idx: np.ndarray(N_verts,)}  長さ N (フレーム数)
-			失敗時: 空配列
+			list of dict{bone_idx: np.ndarray(N_verts_i,)}  長さ N_frames
+			失敗/中断時: 空配列
 		"""
 		import numpy as np
-		try:
-			import open3d as o3d
-		except ImportError:
-			return []
 		if not bones_data:
 			return []
 		N = len(bones_data[0][3])
+		n_bones = len(bones_data)
+		# 骨 i のローカル頂点 (mesh_L.points)
+		local_pts = {}
+		for (idx, name, mesh_L, Ts) in bones_data:
+			local_pts[idx] = np.asarray(mesh_L.points, dtype=float)
+
+		# 骨 i × 骨 j ごとの距離配列時系列 (list of numpy(N_verts_i,)) を計算
+		# per_pair_dist[(i, j)][t] = 骨 i の頂点 v から 骨 j 表面への signed distance (t フレーム目)
+		per_pair_dist = {}
+		n_pairs = n_bones * (n_bones - 1)
+		pair_count = 0
+		for (idx_i, name_i, mesh_L_i, Ts_i) in bones_data:
+			for (idx_j, name_j, mesh_L_j, Ts_j) in bones_data:
+				if idx_i == idx_j:
+					continue
+				pair_count += 1
+				if cancel_var.get():
+					return []
+				# ペア (i, j) の transform_data を構築
+				#   Trel_ij[t] = inv(Ts_j[t]) @ Ts_i[t] (骨 j ローカル系から見た骨 i の姿勢)
+				transform_data_pair = []
+				for t in range(N):
+					try:
+						Tj_inv = np.linalg.inv(Ts_j[t])
+					except np.linalg.LinAlgError:
+						Tj_inv = np.eye(4)
+					transform_data_pair.append({'matrix': Tj_inv @ Ts_i[t]})
+
+				# ペア進捗ラップ (全ペア中の進捗を通算)
+				def _pair_progress(cur, tot, msg, _pi=pair_count, _np=n_pairs, _ni=name_i, _nj=name_j):
+					# 全体進捗 = (前ペア完了分 + 当ペア内進捗) / 全ペア
+					overall = ((_pi - 1) + cur / max(tot, 1)) / max(_np, 1) * 100
+					try:
+						update_progress(int(overall * 100), 10000,
+						                f"[{_pi}/{_np}] {_ni} → {_nj}: {cur}/{tot} frames")
+					except Exception:
+						pass
+					return not cancel_var.get()
+
+				# 膝/股の高速エンジンを呼び出し (BVH 1回構築 + フレームチャンク一括)
+				try:
+					prox_region = pv.PolyData(local_pts[idx_i])
+					lazy = self._precompute_heatmaps_o3d(
+						prox_joint_region=prox_region,
+						dist_surface=mesh_L_j,
+						prox_points=local_pts[idx_i],
+						transform_data=transform_data_pair,
+						update_progress=_pair_progress,
+						cancel_var=cancel_var)
+					if cancel_var.get():
+						return []
+					# lazy は _LazyHeatmapList もしくは list of PolyData 相当
+					distances_list = []
+					if hasattr(lazy, 'distances'):
+						distances_list = [np.asarray(d, dtype=np.float32) if d is not None else None
+						                  for d in lazy.distances]
+					else:
+						# fallback: list of PolyData
+						for hm in lazy:
+							if hm is None or 'distance' not in getattr(hm, 'array_names', []):
+								distances_list.append(None)
+							else:
+								distances_list.append(np.asarray(hm['distance'], dtype=np.float32))
+					per_pair_dist[(idx_i, idx_j)] = distances_list
+				except Exception as e:
+					print(f"[multi-heatmap] ペア ({name_i} → {name_j}) 計算失敗: {e}")
+					per_pair_dist[(idx_i, idx_j)] = [None] * N
+
+		if cancel_var.get():
+			return []
+
+		# 各フレーム t / 各骨 i について min over j!=i を取る
 		result = []
 		for t in range(N):
-			if cancel_flag is not None and cancel_flag[0]:
-				return []
-			# 各骨の変換後メッシュ・BVH scene を構築
-			transformed = {}
-			scenes = {}
-			for (idx, name, mesh_L, Ts) in bones_data:
-				m_W = self._ankle_apply_T_to_mesh(mesh_L, Ts[t])
-				m_surf = m_W if isinstance(m_W, pv.PolyData) else m_W.extract_surface()
-				m_surf = m_surf.triangulate()
-				transformed[idx] = m_surf
-				try:
-					verts = np.asarray(m_surf.points, dtype=np.float32)
-					faces_raw = np.asarray(m_surf.faces)
-					if faces_raw.size < 4:
-						scenes[idx] = None
-						continue
-					faces = faces_raw.reshape(-1, 4)[:, 1:4].astype(np.int32)
-					scene = o3d.t.geometry.RaycastingScene()
-					scene.add_triangles(o3d.t.geometry.TriangleMesh(
-						o3d.core.Tensor(verts, o3d.core.float32),
-						o3d.core.Tensor(faces, o3d.core.int32)))
-					scenes[idx] = scene
-				except Exception:
-					scenes[idx] = None
-			# 各骨 i について、他の全骨 j との signed distance の頂点毎最小値
-			per_frame = {}
+			frame_map = {}
 			for (idx_i, name_i, mesh_L_i, Ts_i) in bones_data:
-				pts_i = np.asarray(transformed[idx_i].points, dtype=np.float32)
-				if pts_i.size == 0:
-					per_frame[idx_i] = np.zeros(0, dtype=np.float32)
-					continue
-				min_sd = np.full(len(pts_i), np.inf, dtype=np.float32)
+				n_v = len(local_pts[idx_i])
+				min_sd = np.full(n_v, np.inf, dtype=np.float32)
 				for (idx_j, name_j, mesh_L_j, Ts_j) in bones_data:
 					if idx_j == idx_i:
 						continue
-					scene_j = scenes.get(idx_j)
-					if scene_j is None:
+					dists = per_pair_dist.get((idx_i, idx_j))
+					if dists is None or t >= len(dists) or dists[t] is None:
 						continue
-					try:
-						sd = scene_j.compute_signed_distance(
-							o3d.core.Tensor(pts_i, o3d.core.float32)).numpy()
-						min_sd = np.minimum(min_sd, sd.astype(np.float32))
-					except Exception:
-						pass
-				# 他骨無しなら +inf → clim 上限外 (透明)
-				per_frame[idx_i] = min_sd
-			result.append(per_frame)
-			if progress_cb is not None:
-				try:
-					if progress_cb(t + 1, N, f"ヒートマップ計算中 {t+1}/{N}") is False:
-						return []
-				except Exception:
-					pass
+					if len(dists[t]) == n_v:
+						min_sd = np.minimum(min_sd, dists[t])
+				frame_map[idx_i] = min_sd
+			result.append(frame_map)
 		return result
-
-	def _sim_view_show_precompute_dialog(self, total_frames, n_bones):
-		"""ankle 用のシンプルな事前計算ダイアログ (hip の _show_precompute_dialog を軽量化)。
-
-		Returns:
-			(dialog, update_progress, start_var, skip_var, cancel_var)
-		"""
-		win = tk.Toplevel(self)
-		win.title("事前計算 (マルチヒートマップ)")
-		win.geometry("500x260")
-		win.resizable(False, False)
-		win.grab_set()
-		start_var = tk.BooleanVar(value=False)
-		skip_var = tk.BooleanVar(value=False)
-		cancel_var = tk.BooleanVar(value=False)
-
-		ttk.Label(win, text="ヒートマップの事前計算",
-		          font=(self.ui_font_family, 12, "bold")).pack(pady=10)
-		info = (f"骨数: {n_bones} 本\n"
-		        f"フレーム数: {total_frames}\n"
-		        f"計算量目安: 骨数×(骨数-1)×フレーム数 = {n_bones*(n_bones-1)*total_frames} 距離計算\n\n"
-		        "事前計算するとアニメーション中の描画が高速化されます。\n"
-		        "スキップした場合、ヒートマップは表示されません。")
-		ttk.Label(win, text=info, justify=tk.LEFT).pack(pady=5, padx=15, anchor=tk.W)
-
-		pbar = ttk.Progressbar(win, mode='determinate', length=440)
-		pbar.pack(pady=8, padx=15)
-		status_var = tk.StringVar(value="待機中")
-		ttk.Label(win, textvariable=status_var, foreground="#005580").pack(pady=2)
-
-		btn_frame = ttk.Frame(win)
-		btn_frame.pack(pady=10)
-		ttk.Button(btn_frame, text="計算開始", width=14,
-		           command=lambda: start_var.set(True)).pack(side=tk.LEFT, padx=5)
-		ttk.Button(btn_frame, text="スキップ (ヒートマップなし)", width=24,
-		           command=lambda: skip_var.set(True)).pack(side=tk.LEFT, padx=5)
-		ttk.Button(btn_frame, text="キャンセル", width=14,
-		           command=lambda: cancel_var.set(True)).pack(side=tk.LEFT, padx=5)
-
-		win.protocol("WM_DELETE_WINDOW", lambda: cancel_var.set(True))
-
-		def update_progress(current, total, msg):
-			try:
-				pbar['value'] = (current / max(total, 1)) * 100
-				status_var.set(msg)
-				win.update()
-			except Exception:
-				pass
-			return not cancel_var.get()
-
-		return win, update_progress, start_var, skip_var, cancel_var
 
 	def _sim_view_create_control_panel(self, n_frames, frame_times, callbacks, features=None):
 		"""hip と同じ再生コントロールウィンドウを作成 (N骨汎用)。
@@ -6078,6 +7260,451 @@ class MainMenuGUI(_BaseWindow):
 			'is_programmatic_update': is_programmatic_update,
 		}
 
+	def _ankle_accumulate_method_compare(self, det: dict, target_ids) -> None:
+		"""各フレームで3手法の姿勢を貯めておく (実データでどれが一番安定かを後で実測するため)。
+
+		runtime 専用。npz には保存しない。
+		"""
+		import numpy as np
+		store = getattr(self, "_ankle_method_compare", None)
+		if store is None:
+			store = {}
+			self._ankle_method_compare = store
+		for aid in target_ids:
+			slot = store.setdefault(int(aid), {"pnp": [], "corners": [], "fusion": []})
+			d = det.get(aid)
+			for key, field in (("pnp", "pose_pnp"), ("corners", "pose_corners"),
+			                    ("fusion", "pose_fusion")):
+				val = None if d is None else d.get(field)
+				slot[key].append(np.asarray(val, dtype=float) if val is not None
+				                 else np.full((4, 4), np.nan))
+
+	@staticmethod
+	def _ankle_rot_jitter(poses, fps: float = 15.0, lp_hz: float = 1.0):
+		"""姿勢時系列の高周波回転ジッターを測る。
+
+		強めに平滑化したものを「真の動き」とみなし、生との角度差をジッターとする。
+		Returns: (median_deg, p95_deg, n_used) — 測れない場合は (None, None, 0)
+		"""
+		import numpy as np
+		try:
+			from scipy.signal import butter, filtfilt
+			from scipy.spatial.transform import Rotation as _Rot
+		except Exception:
+			return None, None, 0
+		P = np.asarray(poses, dtype=float)
+		if P.ndim != 3 or len(P) < 60:
+			return None, None, 0
+		ok = np.all(np.isfinite(P.reshape(len(P), -1)), axis=1)
+		vidx = np.where(ok)[0]
+		if len(vidx) < 60:
+			return None, None, 0
+		quats = np.zeros((len(vidx), 4))
+		for k, t in enumerate(vidx):
+			Rm = P[t][:3, :3]
+			try:
+				U, _, Vt = np.linalg.svd(Rm)
+				Rm = U @ Vt
+				if np.linalg.det(Rm) < 0:
+					Rm = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+				quats[k] = _Rot.from_matrix(Rm).as_quat()
+			except Exception:
+				return None, None, 0
+			if k > 0 and float(np.dot(quats[k], quats[k - 1])) < 0:
+				quats[k] = -quats[k]
+		nyq = max(fps / 2.0, 1e-6)
+		wn = float(np.clip(lp_hz / nyq, 1e-3, 0.99))
+		try:
+			b, a = butter(2, wn, btype='low')
+			pad = min(len(quats) - 1, 3 * max(len(a), len(b)))
+			qs = np.stack([filtfilt(b, a, quats[:, c], padtype='odd', padlen=pad)
+			               for c in range(4)], axis=1)
+		except Exception:
+			return None, None, 0
+		qs /= np.maximum(np.linalg.norm(qs, axis=1, keepdims=True), 1e-12)
+		dR = (_Rot.from_quat(quats) * _Rot.from_quat(qs).inv()).as_rotvec()
+		jit = np.degrees(np.linalg.norm(dR, axis=1))
+		return float(np.median(jit)), float(np.percentile(jit, 95)), int(len(vidx))
+
+	def _ankle_report_method_comparison(self, bones_data, fps: float = 15.0):
+		"""3手法 (solvePnPのみ / 4隅深度 / RGB+Depth融合) のジッターを実データで比較する。
+
+		ハードを作り直す前に「深度が本当に効いているのか」を実測で確かめるための診断。
+		"""
+		store = getattr(self, "_ankle_method_compare", None)
+		if not store:
+			return
+		self._ankle_safe_print("=" * 70)
+		self._ankle_safe_print("[手法比較] 同じ実データで3手法の回転ジッターを実測")
+		self._ankle_safe_print("=" * 70)
+		labels = {"pnp": "solvePnP のみ (RGBのみ)",
+		          "corners": "4隅深度",
+		          "fusion": "RGB+Depth融合 (現行)"}
+		for (idx, name, mesh_L, Ts) in bones_data:
+			bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+			aid = int(bone.get("aruco_id", -1))
+			slot = store.get(aid)
+			if not slot:
+				continue
+			self._ankle_safe_print(f"  {name} (ID={aid}):")
+			results = {}
+			for key in ("pnp", "corners", "fusion"):
+				med, p95, n = self._ankle_rot_jitter(slot.get(key, []), fps=fps)
+				if med is None:
+					self._ankle_safe_print(f"      {labels[key]:26s}: 測定不可")
+					continue
+				results[key] = med
+				self._ankle_safe_print(
+					f"      {labels[key]:26s}: 中央値 {med:6.3f}° / p95 {p95:6.3f}°  (n={n})")
+			if len(results) >= 2:
+				best = min(results, key=results.get)
+				cur = results.get("fusion")
+				if best != "fusion" and cur is not None:
+					self._ankle_safe_print(
+						f"      → この骨では [{labels[best]}] の方が "
+						f"{cur / max(results[best], 1e-9):.1f}倍 安定しています")
+				else:
+					self._ankle_safe_print("      → 現行の RGB+Depth融合 が最良です")
+		self._ankle_safe_print("=" * 70)
+
+	def _ankle_report_pose_quality(self, cache, bones_data, fps: float = 15.0):
+		"""実データからマーカーの角度ジッターを実測し、骨先端での振れ幅に換算して報告する。
+
+		【なぜ必要か】
+		マーカーは小さく (20mm)、骨は大きい (400mm超)。
+		マーカーの角度誤差 δ は、マーカーから距離 L の骨表面で δ×L の変位に増幅される。
+		20mm マーカーで 400mm の骨を制御するのは てこ比 15〜20:1 なので、
+		わずかな角度ジッターが目に見えるガタつきになる。
+		推測ではなく実測値で議論するための診断。
+
+		【ジッターの測り方】
+		生の回転を強めに平滑化したものを「真の動き」とみなし、
+		生との差の高周波成分をジッターとする (静止区間が無くても測れる)。
+		"""
+		import numpy as np
+		try:
+			from scipy.signal import butter, filtfilt
+			from scipy.spatial.transform import Rotation as _Rot
+		except Exception:
+			return
+		cache_bones = cache.get("bones", {}) or {}
+		self._ankle_safe_print("=" * 70)
+		self._ankle_safe_print("[姿勢品質レポート] マーカー角度ジッター → 骨での振れ幅")
+		self._ankle_safe_print("=" * 70)
+
+		# 強めの low-pass (真の動きの推定用)。ロボット試験は低速なので 1Hz で十分。
+		nyq = max(fps / 2.0, 1e-6)
+		wn = float(np.clip(1.0 / nyq, 1e-3, 0.99))
+		try:
+			b, a = butter(2, wn, btype='low')
+		except Exception:
+			return
+
+		for (idx, name, mesh_L, Ts) in bones_data:
+			bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+			aid = int(bone.get("aruco_id", -1))
+			if aid not in cache_bones:
+				continue
+			try:
+				poses = np.asarray(cache_bones[aid]["poses"], dtype=float)
+				det = np.asarray(cache_bones[aid]["detected"], dtype=bool)
+				vidx = np.where(det)[0]
+				if len(vidx) < 60:
+					continue
+				# 検出済みフレームの回転をクォータニオン化 (半球を揃える)
+				quats = np.zeros((len(vidx), 4))
+				for k, t in enumerate(vidx):
+					Rm = poses[t][:3, :3]
+					U, _, Vt = np.linalg.svd(Rm)
+					Rm = U @ Vt
+					if np.linalg.det(Rm) < 0:
+						Rm = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+					quats[k] = _Rot.from_matrix(Rm).as_quat()
+					if k > 0 and float(np.dot(quats[k], quats[k - 1])) < 0:
+						quats[k] = -quats[k]
+				# 平滑化して「真の動き」を推定
+				pad = min(len(quats) - 1, 3 * max(len(a), len(b)))
+				qs = np.stack([filtfilt(b, a, quats[:, c], padtype='odd', padlen=pad)
+				               for c in range(4)], axis=1)
+				qs /= np.maximum(np.linalg.norm(qs, axis=1, keepdims=True), 1e-12)
+				# 生との角度差 = ジッター
+				R_raw = _Rot.from_quat(quats)
+				R_smooth = _Rot.from_quat(qs)
+				dR = (R_raw * R_smooth.inv()).as_rotvec()
+				jit_deg = np.degrees(np.linalg.norm(dR, axis=1))
+				jit_med = float(np.median(jit_deg))
+				jit_p95 = float(np.percentile(jit_deg, 95))
+				# 並進ジッター
+				tr = poses[vidx][:, :3, 3]
+				trs = np.stack([filtfilt(b, a, tr[:, c], padtype='odd', padlen=pad)
+				                for c in range(3)], axis=1)
+				jt_med = float(np.median(np.linalg.norm(tr - trs, axis=1)))
+
+				# てこ比: マーカーから骨表面までの距離
+				lever = 0.0
+				T_L_Mk = bone.get("marker_to_bone_T")
+				if T_L_Mk is not None and mesh_L is not None:
+					try:
+						t_mk = np.asarray(T_L_Mk, dtype=float)[:3, 3]
+						pv_pts = np.asarray(mesh_L.points)
+						if len(pv_pts) > 20000:
+							pv_pts = pv_pts[::max(1, len(pv_pts) // 20000)]
+						dists = np.linalg.norm(pv_pts - t_mk, axis=1)
+						lever = float(np.percentile(dists, 95))
+					except Exception:
+						lever = 0.0
+				swing_med = np.deg2rad(jit_med) * lever + jt_med
+				swing_p95 = np.deg2rad(jit_p95) * lever + jt_med
+				self._ankle_safe_print(
+					f"  {name} (ID={aid}): 角度ジッター 中央値 {jit_med:.3f}° / p95 {jit_p95:.3f}°, "
+					f"並進ジッター {jt_med:.3f} mm")
+
+				# --- 光学的な限界との比較 ---
+				# 平面マーカーの姿勢ジッターは、コーナー検出ノイズ sigma_px と
+				# 画面上のマーカー見かけ半径 r_px から
+				#     jitter ≈ COND * sigma_px / r_px
+				# で決まる。COND は平面PnPの条件数 (傾きが弱い自由度である分の悪化) で、
+				# 合成実験では 2.6 で安定していた。
+				# ここでは実測ジッターから逆算して sigma_px を求め、
+				# サブピクセル検出の実力上限 (0.03〜0.05px) と比べる。
+				COND = 2.6
+				SUBPIX_FLOOR_PX = 0.05
+				try:
+					K_i = cache.get("intrinsics", {}) or {}
+					fx = float(K_i.get("fx", 645.9))
+					msize = float(cache.get("marker_size_mm", 20.0))
+					dist_mm = float(np.linalg.norm(poses[vidx[0]][:3, 3]))
+					r_px = (msize / 2.0) * np.sqrt(2.0) * fx / max(dist_mm, 1e-6)
+					sigma_px = np.tan(np.deg2rad(jit_med / COND)) * r_px
+					floor_deg = COND * np.degrees(np.arctan2(SUBPIX_FLOOR_PX, max(r_px, 1e-6)))
+					self._ankle_safe_print(
+						f"      角検出: マーカー見かけ半径 {r_px:.1f} px "
+						f"(実寸 {msize:.1f}mm @ {dist_mm:.0f}mm) "
+						f"→ 実効コーナー精度 {sigma_px:.3f} px")
+					if sigma_px <= SUBPIX_FLOOR_PX * 1.5:
+						self._ankle_safe_print(
+							f"      [評価] サブピクセル検出の実力上限 (~{SUBPIX_FLOOR_PX} px) に到達済み。"
+							f"この構成での下限は {floor_deg:.3f}° で、ソフトでの改善余地はありません")
+					else:
+						self._ankle_safe_print(
+							f"      [評価] 実力上限 {SUBPIX_FLOOR_PX} px なら {floor_deg:.3f}° まで下げられます "
+							f"(現状 {jit_med:.3f}°)。照明・ピント・モーションブラーを確認してください")
+					# 物理的に何を変えればどこまで行けるか (角度は倍率に反比例)
+					self._ankle_safe_print("      物理的な改善案 (角度精度は見かけ半径に反比例):")
+					opts = [("カメラを 150mm まで近づける", dist_mm / 150.0),
+					        ("マーカーを 40mm にする", 40.0 / max(msize, 1e-6)),
+					        ("ChArUco 5x5 40mm (16交点)", (40.0 / max(msize, 1e-6)) * np.sqrt(16.0 / 4.0))]
+					for label, gain in opts:
+						if gain <= 1.01:
+							continue
+						self._ankle_safe_print(
+							f"        ・{label}: {jit_med / gain:.3f}° "
+							f"→ 骨での振れ {np.deg2rad(jit_med / gain) * lever:.2f} mm")
+				except Exception:
+					pass
+				if lever > 0:
+					self._ankle_safe_print(
+						f"      てこ長 {lever:.0f} mm (マーカー→骨表面 p95) "
+						f"→ 骨での振れ 中央値 {swing_med:.2f} mm / p95 {swing_p95:.2f} mm")
+					if swing_p95 > 3.0:
+						need = np.degrees(np.arctan(1.0 / max(lever, 1e-6)))
+						self._ankle_safe_print(
+							f"      [評価] 目に見えるガタつきです。骨先端で 1mm 以内にするには "
+							f"角度ジッターを {need:.2f}° 以下にする必要があります。"
+							f"現状の {jit_p95:.2f}° からは マーカー大型化 or ChArUco 化 が必要です")
+			except Exception:
+				continue
+		self._ankle_safe_print("=" * 70)
+
+	@staticmethod
+	def _ankle_hampel_inliers(x, window: int = 9, n_sigma: float = 3.0):
+		"""Hampel フィルタで外れ値を検出し、inlier の bool マスクを返す。
+
+		各点について、周囲 window 個の中央値・MAD を求め、
+		|x - median| > n_sigma * 1.4826 * MAD なら外れ値とする。
+		移動平均と違い、外れ値自身に引きずられないので誤検出の除去に向く。
+		"""
+		import numpy as np
+		x = np.asarray(x, dtype=float)
+		n = len(x)
+		mask = np.ones(n, dtype=bool)
+		if n < window or window < 3:
+			return mask
+		half = window // 2
+		for i in range(n):
+			lo = max(0, i - half)
+			hi = min(n, i + half + 1)
+			seg = x[lo:hi]
+			med = float(np.median(seg))
+			mad = float(np.median(np.abs(seg - med)))
+			sigma = 1.4826 * mad
+			if sigma > 1e-12 and abs(x[i] - med) > n_sigma * sigma:
+				mask[i] = False
+		return mask
+
+	def _ankle_smooth_pose_series(self, bones_data, cutoff_hz: float = 5.0,
+	                               frame_rate_hz: float = 30.0,
+	                               detected_map=None,
+	                               reject_outliers: bool = True,
+	                               outlier_sigma: float = 3.0):
+		"""骨のpose時系列を頑健に平滑化してガタつきを除去する。
+
+		処理は3段構成:
+		  1. **外れ値除去** — 並進3成分と回転(クォータニオン)4成分に Hampel フィルタをかけ、
+		     突発的に飛んだフレームを「未検出」扱いに落とす。
+		     (単純な low-pass だと外れ値が前後に滲んで波打つため、先に取り除く)
+		  2. **欠損補間** — 未検出/外れ値のフレームを、前後の有効フレームから補間する。
+		     並進は線形、回転は SLERP。従来の「直前値を保持」は階段状の段差を生むため廃止。
+		  3. **平滑化** — 並進は各成分に Butterworth、回転はクォータニオン4成分に
+		     Butterworth をかけてから正規化。
+		     Rodrigues 軸角は ±π 付近で不連続になり回転軸の符号も反転しうるため、
+		     半球を揃えたクォータニオンで扱う。
+		     filtfilt (双方向) なので位相遅れは生じない。
+
+		Args:
+			bones_data: list of (idx, name, mesh_L, T_series)
+			cutoff_hz: low-pass カットオフ周波数 [Hz]
+			frame_rate_hz: 実フレームレート [Hz]。Nyquist の算出に使うので実測値を渡すこと
+			detected_map: {bone_idx: bool配列} 検出済みフレームのマスク (None なら全フレーム有効)
+			reject_outliers: True で Hampel による外れ値除去を行う
+			outlier_sigma: 外れ値判定のしきい値 (小さいほど厳しい)
+
+		Returns:
+			(smoothed_bones_data, stats)
+			stats: {bone_idx: {"outliers": int, "interpolated": int, "n": int}}
+		"""
+		import numpy as np
+		from scipy.signal import butter, filtfilt
+		from scipy.spatial.transform import Rotation as _Rot, Slerp
+
+		nyq = max(frame_rate_hz / 2.0, 1e-6)
+		wn = float(np.clip(cutoff_hz / nyq, 1e-3, 0.99))
+		b, a = butter(N=4, Wn=wn, btype='low')
+		min_len = 3 * max(len(a), len(b)) + 1
+
+		def _lowpass(x):
+			if len(x) <= min_len:
+				return x
+			try:
+				return filtfilt(b, a, x, padtype='odd',
+				                padlen=min(len(x) - 1, 3 * max(len(a), len(b))))
+			except Exception:
+				return x
+
+		smoothed = []
+		stats = {}
+		for (idx, name, mesh_L, Ts) in bones_data:
+			Ts = np.asarray(Ts, dtype=float)
+			N = len(Ts)
+			st = {"outliers": 0, "interpolated": 0, "n": N}
+			if N < 5:
+				smoothed.append((idx, name, mesh_L, Ts))
+				stats[idx] = st
+				continue
+
+			# --- 有効フレームの初期マスク ---
+			if detected_map is not None and idx in detected_map:
+				valid = np.asarray(detected_map[idx], dtype=bool).copy()
+				if len(valid) != N:
+					valid = np.ones(N, dtype=bool)
+			else:
+				valid = np.ones(N, dtype=bool)
+			# 姿勢が NaN/特異なフレームも無効化
+			for t in range(N):
+				if not np.all(np.isfinite(Ts[t])):
+					valid[t] = False
+			if valid.sum() < 4:
+				smoothed.append((idx, name, mesh_L, Ts))
+				stats[idx] = st
+				continue
+
+			# --- 並進とクォータニオンを取り出す ---
+			trans = Ts[:, :3, 3].copy()
+			quats = np.zeros((N, 4), dtype=float)   # (x, y, z, w)
+			for t in range(N):
+				if not valid[t]:
+					continue
+				try:
+					Rm = Ts[t][:3, :3]
+					# 数値誤差で非直交になっている場合に備えて直交化してから変換
+					U, _, Vt = np.linalg.svd(Rm)
+					Rm = U @ Vt
+					if np.linalg.det(Rm) < 0:
+						Rm = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+					quats[t] = _Rot.from_matrix(Rm).as_quat()
+				except Exception:
+					valid[t] = False
+			if valid.sum() < 4:
+				smoothed.append((idx, name, mesh_L, Ts))
+				stats[idx] = st
+				continue
+
+			# --- 半球を揃える (q と -q は同じ回転。符号が飛ぶと平滑化が壊れる) ---
+			vidx = np.where(valid)[0]
+			for k in range(1, len(vidx)):
+				if float(np.dot(quats[vidx[k]], quats[vidx[k - 1]])) < 0.0:
+					quats[vidx[k]] = -quats[vidx[k]]
+
+			# --- 1. 外れ値除去 (Hampel) ---
+			if reject_outliers and len(vidx) >= 9:
+				bad = np.zeros(N, dtype=bool)
+				for c in range(3):
+					m = self._ankle_hampel_inliers(trans[vidx, c], window=9, n_sigma=outlier_sigma)
+					bad[vidx[~m]] = True
+				for c in range(4):
+					m = self._ankle_hampel_inliers(quats[vidx, c], window=9, n_sigma=outlier_sigma)
+					bad[vidx[~m]] = True
+				# 有効フレームが極端に減る場合は除去しない (誤検出の暴走を防ぐ)
+				if bad.sum() < 0.3 * len(vidx):
+					st["outliers"] = int(bad.sum())
+					valid[bad] = False
+					vidx = np.where(valid)[0]
+
+			if len(vidx) < 4:
+				smoothed.append((idx, name, mesh_L, Ts))
+				stats[idx] = st
+				continue
+
+			# --- 2. 欠損補間 (並進=線形 / 回転=SLERP) ---
+			st["interpolated"] = int(N - len(vidx))
+			all_t = np.arange(N, dtype=float)
+			trans_full = np.stack(
+				[np.interp(all_t, vidx.astype(float), trans[vidx, c]) for c in range(3)], axis=1)
+			try:
+				rots = _Rot.from_quat(quats[vidx])
+				slerp = Slerp(vidx.astype(float), rots)
+				# Slerp は補間区間外を扱えないので、両端は最近傍の有効値でクランプ
+				t_clamped = np.clip(all_t, float(vidx[0]), float(vidx[-1]))
+				quats_full = slerp(t_clamped).as_quat()
+			except Exception:
+				quats_full = np.stack(
+					[np.interp(all_t, vidx.astype(float), quats[vidx, c]) for c in range(4)], axis=1)
+			# 補間後も半球を揃え直す
+			for t in range(1, N):
+				if float(np.dot(quats_full[t], quats_full[t - 1])) < 0.0:
+					quats_full[t] = -quats_full[t]
+
+			# --- 3. 平滑化 ---
+			trans_s = np.stack([_lowpass(trans_full[:, c]) for c in range(3)], axis=1)
+			quats_s = np.stack([_lowpass(quats_full[:, c]) for c in range(4)], axis=1)
+			norms = np.linalg.norm(quats_s, axis=1, keepdims=True)
+			norms[norms < 1e-12] = 1.0
+			quats_s = quats_s / norms
+
+			# --- 復元 ---
+			Ts_new = np.zeros_like(Ts)
+			try:
+				Rs = _Rot.from_quat(quats_s).as_matrix()
+			except Exception:
+				Rs = np.repeat(np.eye(3)[None, :, :], N, axis=0)
+			for t in range(N):
+				Ts_new[t] = np.eye(4)
+				Ts_new[t, :3, :3] = Rs[t]
+				Ts_new[t, :3, 3] = trans_s[t]
+			smoothed.append((idx, name, mesh_L, Ts_new))
+			stats[idx] = st
+		return smoothed, stats
+
 	def on_ankle_animate(self) -> None:
 		"""ArUco姿勢時系列と骨キャリブから、N骨のアニメーション + マルチヒートマップを表示。
 
@@ -6111,6 +7738,258 @@ class MainMenuGUI(_BaseWindow):
 			bones_data.append((idx, name, mesh_L, Ts))
 		n_bones = len(bones_data)
 
+		# --- 【診断ログ】 T_L←Mk (marker_to_bone_T) の平行移動量を出力 ---
+		# 骨があり得ないくらい離れる場合、この translation が異常値になっていないか確認する
+		print("=" * 70)
+		print("[ankle animate] キャリブレーション診断")
+		print("=" * 70)
+		for (idx, name, mesh_L, Ts) in bones_data:
+			bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+			T_L_Mk = bone.get("marker_to_bone_T")
+			if T_L_Mk is None:
+				print(f"  {name}: T_L←Mk = None (原プラン or 未キャリブ)")
+				continue
+			T = np.asarray(T_L_Mk, dtype=float)
+			tr = T[:3, 3]
+			t_norm = float(np.linalg.norm(tr))
+			# メッシュの bounding box 対角長 = 骨のスケール
+			try:
+				b = np.asarray(mesh_L.bounds).reshape(3, 2)
+				bone_diag = float(np.linalg.norm(b[:, 1] - b[:, 0]))
+			except Exception:
+				bone_diag = 0.0
+			warn = ""
+			if t_norm > bone_diag * 2 and bone_diag > 0:
+				warn = "  ⚠️ 警告: マーカーが骨サイズの2倍以上離れている → キャリブ異常の可能性!"
+			print(f"  {name}: T_L←Mk translation = ({tr[0]:+.2f}, {tr[1]:+.2f}, {tr[2]:+.2f}) mm, "
+			      f"norm = {t_norm:.2f} mm, 骨サイズ = {bone_diag:.1f} mm{warn}")
+			# 最終フレーム t=0 の T_C←bone の位置も出力
+			try:
+				pos0 = Ts[0][:3, 3]
+				print(f"    → t=0 での骨位置 (W系): ({pos0[0]:+.1f}, {pos0[1]:+.1f}, {pos0[2]:+.1f}) mm")
+			except Exception:
+				pass
+		# 骨間距離の診断
+		if n_bones >= 2:
+			for i in range(n_bones):
+				for j in range(i+1, n_bones):
+					try:
+						p_i = bones_data[i][3][0][:3, 3]
+						p_j = bones_data[j][3][0][:3, 3]
+						d = float(np.linalg.norm(p_i - p_j))
+						warn = ""
+						if d > 300:
+							warn = "  ⚠️ 300mm 超は解剖学的にありえません (キャリブ or W選択の問題)"
+						elif d < 5:
+							warn = "  ⚠️ 5mm 以下は近すぎ (キャリブ or マーカー重複の可能性)"
+						print(f"  骨間距離 [{bones_data[i][1]} ↔ {bones_data[j][1]}] "
+						      f"@ t=0: {d:.1f} mm{warn}")
+					except Exception:
+						pass
+		# マーカーのカメラ距離診断 (D405 推奨動作距離: ~7-50cm)
+		cache_bones_diag = cache.get("bones", {}) or {}
+		for (idx, name, mesh_L, Ts) in bones_data:
+			bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+			aid = int(bone.get("aruco_id", -1))
+			if aid not in cache_bones_diag:
+				continue
+			try:
+				poses_C = np.asarray(cache_bones_diag[aid]["poses"], dtype=float)
+				det = np.asarray(cache_bones_diag[aid]["detected"], dtype=bool)
+				# 最初の検出済みフレームの marker 位置を取得
+				valid_idx = np.where(det)[0]
+				if len(valid_idx) == 0:
+					continue
+				pos = poses_C[valid_idx[0]][:3, 3]
+				dist_from_cam = float(np.linalg.norm(pos))
+				warn = ""
+				if dist_from_cam > 500:
+					warn = "  ⚠️ D405 推奨動作距離 (~50cm) を大きく超える → 精度大幅劣化"
+				elif dist_from_cam < 70:
+					warn = "  ⚠️ D405 最短距離 (~7cm) より近い → 深度取得不可"
+				print(f"  {name} マーカー @ frame {valid_idx[0]}: "
+				      f"位置 = ({pos[0]:+.1f}, {pos[1]:+.1f}, {pos[2]:+.1f}) mm, "
+				      f"カメラからの距離 = {dist_from_cam:.1f} mm{warn}")
+			except Exception:
+				pass
+		print("=" * 70)
+
+		# --- 【診断モード】 メッシュ重心をマーカー位置に強制 ---
+		# 【問題】mesh 座標系の原点が骨実体から遠い + キャリブが不正確な場合、
+		# T_C←bone · v_mesh の変換で geometry が大きく離れて表示される。
+		# 【診断】T_L←Mk を「centroid → 単位変換」で上書きし、mesh 重心が
+		# 直接マーカー位置に来るように強制する (元のキャリブ情報は無視)。
+		# これで骨の見た目位置 = マーカーの物理位置 になり、
+		# ArUco 検出そのものの妥当性を確認できる。
+		try:
+			force_centroid_to_marker = bool(self.ankle_recenter_meshes.get())
+		except Exception:
+			force_centroid_to_marker = True
+		if force_centroid_to_marker:
+			print("[ankle animate] 🔧 診断モード: 骨重心をマーカー位置に強制配置 ON")
+			print("  ※ 元のキャリブ情報 (T_L←Mk) は無視されます。マーカー検出の妥当性検証用。")
+			cache_bones_force = cache.get("bones", {}) or {}
+			forced = []
+			try:
+				mode = str(self.ankle_workflow_mode.get())
+			except Exception:
+				mode = "self_pose"
+			ref = int(self.ankle_ref_frame.get()) if hasattr(self, 'ankle_ref_frame') else 0
+			for (idx, name, mesh_L, Ts) in bones_data:
+				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+				aid = int(bone.get("aruco_id", -1))
+				if aid not in cache_bones_force:
+					forced.append((idx, name, mesh_L, Ts))
+					continue
+				try:
+					b_cache = cache_bones_force[aid]
+					poses_C = np.asarray(b_cache["poses"], dtype=float)   # T_C←Mk(t)
+					det = np.asarray(b_cache["detected"], dtype=bool)
+					# 重心をマーカー位置に対応させる、新しい T_L←Mk_new
+					c = np.asarray(mesh_L.points).mean(axis=0)
+					T_L_Mk_new = np.eye(4)
+					T_L_Mk_new[:3, 3] = c  # 重心が「新しい bone-local 座標系での marker 位置」
+					T_Mk_L_new = np.linalg.inv(T_L_Mk_new)
+					# 各フレーム: T_C←bone = T_C←Mk · inv(T_L←Mk_new)
+					N_f = len(Ts)
+					Ts_new = np.zeros((N_f, 4, 4), dtype=float)
+					last_valid = None
+					for t in range(N_f):
+						if t < len(det) and bool(det[t]):
+							Ts_new[t] = poses_C[t] @ T_Mk_L_new
+							last_valid = Ts_new[t]
+						else:
+							Ts_new[t] = last_valid if last_valid is not None else np.eye(4)
+					forced.append((idx, name, mesh_L, Ts_new))
+					print(f"  {name}: 重心 ({c[0]:+.1f}, {c[1]:+.1f}, {c[2]:+.1f}) mm を マーカー位置に強制配置")
+				except Exception as e:
+					print(f"  {name}: 強制配置失敗 ({e}) — 元 Ts のまま")
+					forced.append((idx, name, mesh_L, Ts))
+			bones_data = forced
+			# 再度骨間距離を確認 (これは物理マーカー位置の差 = ArUco 検出精度の指標)
+			if n_bones >= 2:
+				for i in range(n_bones):
+					for j in range(i+1, n_bones):
+						try:
+							p_i = bones_data[i][3][0][:3, 3]
+							p_j = bones_data[j][3][0][:3, 3]
+							d = float(np.linalg.norm(p_i - p_j))
+							note = ""
+							if d > 300:
+								note = "  ⚠️ マーカー間距離自体が大きい → ArUco検出の Z軸精度低下の可能性 (D405 は近距離推奨)"
+							print(f"  [強制配置後] マーカー距離 [{bones_data[i][1]} ↔ {bones_data[j][1]}] @ t=0: {d:.1f} mm{note}")
+						except Exception:
+							pass
+			print("=" * 70)
+
+		# --- 時系列平滑化 (外れ値除去 → 欠損補間 → low-pass) — ガタガタ削減 ---
+		try:
+			smooth_enabled = bool(self.ankle_smooth_enable.get())
+		except Exception:
+			smooth_enabled = True  # 既定 ON
+		try:
+			smooth_cutoff_hz = float(self.ankle_smooth_cutoff_hz.get())
+		except Exception:
+			smooth_cutoff_hz = 3.0
+		try:
+			reject_outliers = bool(self.ankle_reject_outliers.get())
+		except Exception:
+			reject_outliers = True
+
+		# 実フレームレートをタイムスタンプから推定 (15fps 録画を 30fps と誤認すると
+		# Nyquist が2倍になり、指定カットオフの半分しか効かない)
+		fps_est = 30.0
+		try:
+			if len(frame_times) > 2:
+				dts = np.diff(np.asarray(frame_times, dtype=float))
+				dts = dts[(dts > 1e-6) & np.isfinite(dts)]
+				if len(dts) > 0:
+					fps_est = float(np.clip(1.0 / float(np.median(dts)), 1.0, 240.0))
+		except Exception:
+			fps_est = 30.0
+
+		# 骨ごとの検出マスク (未検出フレームは補間対象にする)
+		detected_map = {}
+		try:
+			cache_bones_sm = cache.get("bones", {}) or {}
+			for (idx, name, mesh_L, Ts) in bones_data:
+				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+				aid = int(bone.get("aruco_id", -1))
+				if aid in cache_bones_sm:
+					det_arr = np.asarray(cache_bones_sm[aid].get("detected"), dtype=bool)
+					if len(det_arr) == len(Ts):
+						detected_map[idx] = det_arr
+		except Exception:
+			detected_map = {}
+
+		# 平滑化の前に、生データの品質を実測して報告する
+		try:
+			self._ankle_report_pose_quality(cache, bones_data, fps=fps_est)
+		except Exception as e:
+			print(f"[ankle animate] 姿勢品質レポート失敗: {e}")
+		try:
+			self._ankle_report_method_comparison(bones_data, fps=fps_est)
+		except Exception as e:
+			print(f"[ankle animate] 手法比較レポート失敗: {e}")
+
+		if smooth_enabled and N >= 20:
+			try:
+				bones_data, sm_stats = self._ankle_smooth_pose_series(
+					bones_data,
+					cutoff_hz=smooth_cutoff_hz,
+					frame_rate_hz=fps_est,
+					detected_map=detected_map,
+					reject_outliers=reject_outliers)
+				print(f"[ankle animate] 平滑化 適用: cutoff={smooth_cutoff_hz} Hz, "
+				      f"実測フレームレート={fps_est:.1f} fps "
+				      f"(Nyquist={fps_est/2:.1f} Hz)")
+				for (idx, name, mesh_L, Ts) in bones_data:
+					s = sm_stats.get(idx, {})
+					if s:
+						print(f"    {name}: 外れ値除去 {s.get('outliers', 0)} 件 / "
+						      f"補間 {s.get('interpolated', 0)} フレーム / 全 {s.get('n', 0)} フレーム")
+				if smooth_cutoff_hz > fps_est / 2.0:
+					print(f"    [警告] カットオフ {smooth_cutoff_hz} Hz が Nyquist "
+					      f"{fps_est/2:.1f} Hz を超えています → 平滑化はほぼ効きません。"
+					      f"{max(1.0, fps_est/6.0):.1f} Hz 程度まで下げてください")
+			except Exception as e:
+				print(f"[ankle animate] 平滑化失敗 ({e}) — 生データで続行")
+				import traceback; traceback.print_exc()
+
+		# --- 骨固定モード: 選択骨があれば全骨に inv(T_fixed(t)) を前掛け ---
+		# 結果: fixed 骨は常に identity (静止)、他の骨は fixed 骨の座標系での相対姿勢
+		fixed_idx = None
+		for (idx, name, mesh_L, Ts) in bones_data:
+			bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+			if bone.get("fixed"):
+				fixed_idx = idx
+				break
+		if fixed_idx is not None:
+			# 固定骨の T_series を取得
+			T_fixed_series = None
+			for (idx, _, _, Ts) in bones_data:
+				if idx == fixed_idx:
+					T_fixed_series = Ts
+					break
+			if T_fixed_series is not None:
+				N_frames = len(T_fixed_series)
+				T_fixed_inv = np.zeros((N_frames, 4, 4), dtype=float)
+				for t in range(N_frames):
+					try:
+						T_fixed_inv[t] = np.linalg.inv(T_fixed_series[t])
+					except np.linalg.LinAlgError:
+						T_fixed_inv[t] = np.eye(4)
+				# 全骨に前掛け
+				new_bones_data = []
+				for (idx, name, mesh_L, Ts) in bones_data:
+					Ts_new = np.zeros_like(Ts)
+					for t in range(N_frames):
+						Ts_new[t] = T_fixed_inv[t] @ Ts[t]
+					new_bones_data.append((idx, name, mesh_L, Ts_new))
+				bones_data = new_bones_data
+				fixed_name = self.ankle_bones[fixed_idx].get("name", f"骨{fixed_idx+1}")
+				print(f"[ankle animate] 骨固定モード: '{fixed_name}' を基準に他骨の相対運動を表示")
+
 		# フレーム時刻 (キャッシュにあれば使う、なければ 1/30s 刻み)
 		ts_cache = cache.get("timestamps", None)
 		if ts_cache is not None and len(ts_cache) >= N:
@@ -6118,39 +7997,78 @@ class MainMenuGUI(_BaseWindow):
 		else:
 			frame_times = [t / 30.0 for t in range(N)]
 
-		# --- 3. 事前計算ダイアログ (マルチヒートマップ) ---
+		# --- 3. 事前計算ダイアログ (膝/股と共通のダイアログを流用) ---
 		heatmap_data = []  # list of dict {bone_idx: distances} per frame
 		if n_bones >= 2:
-			dlg_win, upd_progress, start_var, skip_var, cancel_var = \
-				self._sim_view_show_precompute_dialog(N, n_bones)
-			# モーダル待機
-			while dlg_win.winfo_exists():
+			# 膝/股と同じ _show_precompute_dialog を流用 (has_cartilage=False で FEMオプション無効)
+			progress_window, update_progress, cancel_var, options_dict, start_var, skip_var = \
+				self._show_precompute_dialog(N, has_cartilage=False)
+			# モーダル待機 (膝/股と同じパターン)
+			while progress_window.winfo_exists():
 				if start_var.get() or skip_var.get() or cancel_var.get():
 					break
 				try:
-					dlg_win.update()
+					progress_window.update()
 				except Exception:
 					break
 				time.sleep(0.01)
 			if cancel_var.get():
 				try:
-					dlg_win.destroy()
+					progress_window.destroy()
 				except Exception:
 					pass
 				return
-			if start_var.get():
-				# 計算実行
+			if start_var.get() and options_dict.get('enable_precompute', tk.BooleanVar(value=True)).get():
+				# --- メッシュ簡略化 (膝/股の use_simplify オプションと同等の挙動) ---
+				# 膝/股は関節領域 (10-20k点) を使うため高速。ankle は骨モデル全体 (数十万〜数百万点)
+				# を使うと _precompute_heatmaps_o3d のチャンクサイズが小さくなり大幅減速する。
+				# → use_simplify=True (既定) なら ~15k点に間引く。視覚的にはほぼ変わらず、計算は
+				#   膝/股と同スケールになる。
+				use_simplify = True
+				try:
+					use_simplify = bool(options_dict['use_simplify'].get())
+				except Exception:
+					pass
+				TARGET_VERTS = 15000 if use_simplify else 60000
+				simplified_bones_data = []
+				for (idx, name, mesh_L, Ts) in bones_data:
+					mesh_use = mesh_L
+					try:
+						# 表面抽出→三角形化→頂点数が多ければ decimate
+						surf = mesh_L.extract_surface() if hasattr(mesh_L, 'extract_surface') else mesh_L
+						surf = surf.triangulate()
+						n_v = surf.n_points
+						if n_v > TARGET_VERTS:
+							reduction = 1.0 - (TARGET_VERTS / n_v)
+							try:
+								mesh_use = surf.decimate(target_reduction=float(reduction), preserve_topology=False)
+								mesh_use = mesh_use.triangulate()
+								print(f"[ankle animate] {name}: {n_v} → {mesh_use.n_points} 頂点 に間引き (reduction={reduction:.3f})")
+							except Exception as de:
+								print(f"[ankle animate] {name}: decimate失敗 ({de}) → 表面のみ使用")
+								mesh_use = surf
+						else:
+							mesh_use = surf
+							print(f"[ankle animate] {name}: {n_v} 頂点 (間引き不要)")
+					except Exception as e:
+						print(f"[ankle animate] {name}: 簡略化失敗 ({e}) → 元メッシュ使用")
+					simplified_bones_data.append((idx, name, mesh_use, Ts))
+				# 元の bones_data を差し替え (以降のアクター作成・表示にも簡略化メッシュを使用)
+				bones_data = simplified_bones_data
+
+				# 計算実行 (膝/股と同じ高速エンジン _precompute_heatmaps_o3d をペア毎に流用)
 				try:
 					heatmap_data = self._sim_view_precompute_multi_heatmap(
 						bones_data,
-						progress_cb=upd_progress,
-						cancel_flag=[False])
+						update_progress=update_progress,
+						cancel_var=cancel_var)
 					print(f"[ankle animate] マルチヒートマップ計算完了: {len(heatmap_data)} frames")
 				except Exception as e:
 					print(f"[ankle animate] ヒートマップ計算失敗: {e}")
+					import traceback; traceback.print_exc()
 					heatmap_data = []
 			try:
-				dlg_win.destroy()
+				progress_window.destroy()
 			except Exception:
 				pass
 
@@ -6283,9 +8201,6 @@ class MainMenuGUI(_BaseWindow):
 								for j in range(len(d)):
 									arr.SetValue(j, float(d[j]))
 								arr.Modified()
-							else:
-								# 頂点数が合わない場合は再アサイン
-								pd_in.GetPointData().SetScalars(pv.pyvista_ndarray(d.astype(np.float32)).VTKObject if hasattr(pv, 'pyvista_ndarray') else None)
 						except Exception:
 							pass
 						# 最大めり込み量 (負値の絶対値)
@@ -6302,6 +8217,11 @@ class MainMenuGUI(_BaseWindow):
 						text=f"Frame: {fi}/{max(N-1,0)} | Time: {frame_times[fi]:.3f}s")
 					widgets['max_pent_label'].config(
 						text=f"Max Pent: {max_pent:.2f} mm" if heatmap_enabled else "Max Pent: -- mm")
+				except Exception:
+					pass
+				# ArUco マーカー軸を毎フレーム更新
+				try:
+					_update_markers(fi)
 				except Exception:
 					pass
 				# 6軸表示 (骨1のフレームに対する骨2の相対姿勢を表示、N>=2 のとき)
@@ -6546,6 +8466,62 @@ class MainMenuGUI(_BaseWindow):
 						pass
 			after_id[0] = self.after(5, animation_loop)
 
+		# --- 11.5. ArUco マーカー軸の可視化 (診断用) ---
+		# 各マーカーの位置に小さな軸線 (RGB=XYZ) を描画。SetUserMatrix で毎フレーム動かす
+		marker_actors = {}  # bone_idx -> (x_actor, y_actor, z_actor)
+		show_markers = False
+		try:
+			show_markers = bool(self.ankle_show_markers.get())
+		except Exception:
+			pass
+		if show_markers:
+			marker_axis_len = 15.0  # 15mm 軸
+			cache_bones = cache.get("bones", {}) or {}
+			for (idx, name, mesh_L, Ts) in bones_data:
+				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+				aid = int(bone.get("aruco_id", -1))
+				if aid not in cache_bones:
+					continue
+				# マーカーは常にフレーム0姿勢を基準にした線分アクター (SetUserMatrix で駆動)
+				origin = np.array([0.0, 0.0, 0.0])
+				xL = pv.Line(origin, [marker_axis_len, 0, 0])
+				yL = pv.Line(origin, [0, marker_axis_len, 0])
+				zL = pv.Line(origin, [0, 0, marker_axis_len])
+				xa = anim_plotter.add_mesh(xL, color="red", line_width=3, name=f"mk_{idx}_x")
+				ya = anim_plotter.add_mesh(yL, color="green", line_width=3, name=f"mk_{idx}_y")
+				za = anim_plotter.add_mesh(zL, color="blue", line_width=3, name=f"mk_{idx}_z")
+				marker_actors[idx] = (xa, ya, za)
+
+		# フレーム毎マーカー軸更新 (show_frame 内で呼ばれる)
+		def _update_markers(fi):
+			if not marker_actors:
+				return
+			import vtk
+			cache_bones2 = cache.get("bones", {}) or {}
+			for (idx, name, mesh_L, Ts) in bones_data:
+				actors_xyz = marker_actors.get(idx)
+				if actors_xyz is None:
+					continue
+				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+				aid = int(bone.get("aruco_id", -1))
+				if aid not in cache_bones2:
+					continue
+				b_cache = cache_bones2[aid]
+				poses_C = np.asarray(b_cache["poses"], dtype=float)  # (N, 4, 4) T_C←Mk
+				if fi >= len(poses_C):
+					continue
+				# W = C (camera_ref) を前提。他モードでも近似的に妥当
+				T_marker_W = poses_C[fi]
+				m = vtk.vtkMatrix4x4()
+				for i in range(4):
+					for j in range(4):
+						m.SetElement(i, j, float(T_marker_W[i, j]))
+				for act in actors_xyz:
+					try:
+						act.SetUserMatrix(m)
+					except Exception:
+						pass
+
 		# --- 12. カメラ・キー ---
 		anim_plotter.camera_position = 'iso'
 		anim_plotter.reset_camera()
@@ -6554,6 +8530,27 @@ class MainMenuGUI(_BaseWindow):
 
 		# 最初のフレーム
 		show_frame(0, force_render=True)
+		_update_markers(0)
+
+		# 全アクターの変換後 bounds を含むように camera を再フィット
+		# (SetUserMatrix 後の位置に基づいて画面全体に収める)
+		try:
+			all_bounds = []
+			for (idx, name, mesh_L, Ts) in bones_data:
+				m_W = self._ankle_apply_T_to_mesh(mesh_L, Ts[0])
+				b = m_W.bounds
+				if b is not None:
+					all_bounds.append(b)
+			if all_bounds:
+				bnd = np.asarray(all_bounds)
+				xmin, xmax = float(bnd[:, 0].min()), float(bnd[:, 1].max())
+				ymin, ymax = float(bnd[:, 2].min()), float(bnd[:, 3].max())
+				zmin, zmax = float(bnd[:, 4].min()), float(bnd[:, 5].max())
+				anim_plotter.reset_camera(bounds=[xmin, xmax, ymin, ymax, zmin, zmax])
+				print(f"[ankle animate] カメラをフィット: X[{xmin:.0f},{xmax:.0f}], "
+				      f"Y[{ymin:.0f},{ymax:.0f}], Z[{zmin:.0f},{zmax:.0f}] mm")
+		except Exception as e:
+			print(f"[ankle animate] カメラフィット失敗: {e}")
 
 		# ウィンドウ close コールバック
 		try:
@@ -6646,6 +8643,68 @@ class MainMenuGUI(_BaseWindow):
 			info_lines.append(f"RGB内部: fx={intr.fx:.1f}, fy={intr.fy:.1f}, "
 			                  f"cx={intr.ppx:.1f}, cy={intr.ppy:.1f}, {intr.width}x{intr.height}")
 			info_lines.append(f"歪み係数: {[round(c,5) for c in intr.coeffs]}")
+
+			# --- ステレオ構成の確認 ---
+			# 左右カメラで ArUco を検出して三角測量する手法が有効かを判断するには
+			# 基線長 B が要る。奥行き精度は sigma_Z = Z^2 * sigma_disp / (f * B) で、
+			# B が短いと単眼PnPの横方向精度に全く歯が立たない。
+			try:
+				ir1 = profile.get_stream(rs.stream.infrared, 1)
+				ir2 = profile.get_stream(rs.stream.infrared, 2)
+				extr = ir1.get_extrinsics_to(ir2)
+				baseline_mm = float(np.linalg.norm(np.asarray(extr.translation))) * 1000.0
+				info_lines.append("")
+				info_lines.append(f"■ ステレオ構成")
+				info_lines.append(f"基線長 (左右カメラ間): {baseline_mm:.2f} mm")
+				Z = 220.0
+				sig_px = 0.054      # 実測のコーナー検出精度
+				marker_mm = 20.0
+				if baseline_mm > 0.1:
+					sig_z = Z * Z * sig_px / (intr.fx * baseline_mm)
+					tilt_stereo = np.degrees(np.arctan2(np.sqrt(2) * sig_z, marker_mm))
+					lat_mm = sig_px / intr.fx * Z
+					tilt_mono = 2.6 * np.degrees(np.arctan2(
+						lat_mm, marker_mm / 2 * np.sqrt(2)))
+					info_lines.append(
+						f"距離 {Z:.0f}mm / 角検出 {sig_px} px のとき:")
+					info_lines.append(
+						f"  三角測量の奥行き精度: {sig_z:.3f} mm "
+						f"→ 傾き {tilt_stereo:.2f}°")
+					info_lines.append(
+						f"  単眼PnPの横方向精度:   {lat_mm:.4f} mm "
+						f"→ 傾き {tilt_mono:.2f}°")
+					if tilt_stereo > tilt_mono:
+						info_lines.append(
+							f"  ⇒ 三角測量した3D点だけで姿勢を組むと "
+							f"{tilt_stereo / max(tilt_mono, 1e-9):.1f}倍 悪化します。")
+						info_lines.append(
+							f"    左右の再投影誤差を同時最小化する方式 (バンドル調整) なら "
+							f"観測が2倍になり 1.4〜1.8倍の改善が見込めます。")
+					else:
+						info_lines.append("  ⇒ 三角測量が有利な構成です。")
+			except Exception as e:
+				info_lines.append(f"(ステレオ情報の取得に失敗: {e})")
+
+			# 録画時に左右ストリームを保存できるか
+			try:
+				dev2 = profile.get_device()
+				sensors = dev2.query_sensors()
+				sn = []
+				for s in sensors:
+					for sp in s.get_stream_profiles()[:200]:
+						try:
+							if sp.stream_type() == rs.stream.infrared:
+								sn.append(sp.stream_index())
+						except Exception:
+							pass
+				if sn:
+					info_lines.append(
+						f"赤外(左右)ストリーム: index {sorted(set(sn))} が利用可能")
+					info_lines.append(
+						"※ ステレオ方式を使うには、録画時にこれらを .db3 に含める必要があります"
+						" (既存の録画には入っていません)")
+			except Exception:
+				pass
 		finally:
 			try:
 				pipeline.stop()
