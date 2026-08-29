@@ -514,9 +514,6 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_smooth_cutoff_hz = tk.DoubleVar(value=2.5)
 		self.ankle_reject_outliers = tk.BooleanVar(value=True)  # Hampel 外れ値除去
 		self.ankle_show_markers = tk.BooleanVar(value=True)    # ArUcoマーカー軸を可視化
-		# 可視化エンジンの選択: "legacy"(従来 on_animate) | "unified"(統合 _sim_engine_run)
-		# 既定は legacy。hip/knee の動作を変えないため、明示的に切り替えたときだけ統合を使う。
-		self.sim_engine_mode = tk.StringVar(value="legacy  従来 (実績あり)")
 		# 診断モード: 骨重心をマーカー位置に強制配置 (キャリブを無視する切り分け用。既定OFF)
 		self.ankle_recenter_meshes = tk.BooleanVar(value=False)
 		# depth_scale の自動補正 (SDK報告値が実データと乖離する場合)
@@ -971,23 +968,8 @@ class MainMenuGUI(_BaseWindow):
 		self.check_tf_button.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
 
 		# シミュレーション実行（ヒートマップ事前計算→アニメーション）
-		self.animate_button = ttk.Button(tf_frame, text="シミュレーション実行", command=self.on_animate_dispatch)
+		self.animate_button = ttk.Button(tf_frame, text="シミュレーション実行", command=self.on_animate)
 		self.animate_button.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 6))
-
-		# --- 可視化エンジンの選択 (既定=従来。統合は ankle と同一のエンジン) ---
-		eng = ttk.Frame(tf_frame)
-		eng.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 6))
-		ttk.Label(eng, text="可視化エンジン:").grid(row=0, column=0, sticky="w")
-		ttk.Combobox(eng, textvariable=self.sim_engine_mode, width=34, state="readonly",
-		             values=["legacy  従来 (実績あり)",
-		                     "unified  統合 (ankleと共通・検証中)"]
-		             ).grid(row=0, column=1, sticky="w", padx=(6, 0))
-		ttk.Label(eng,
-		          text="※ 従来 = これまでの on_animate。動作は一切変わりません。\n"
-		               "   統合 = ankle と同じエンジン。ここを直すと3タブすべてに反映されます。\n"
-		               "   統合は可視化とヒートマップまで担当し、軟骨/FEM/レポートを使う設定では自動的に従来へ切替わります。",
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=720, justify="left"
-		          ).grid(row=1, column=0, columnspan=2, sticky="w", padx=(16, 0), pady=(2, 0))
 
 	# region knee simulator (FRS-2015 ロボット準拠 膝関節)
 	def _create_knee_simulator_tab(self) -> None:
@@ -2527,7 +2509,7 @@ class MainMenuGUI(_BaseWindow):
 			self.prox_color = self._knee_color("femur")  # 大腿骨（④の表示色設定、既定=肌色）
 			self.dist_color = self._knee_color("tibia")  # 脛骨（④の表示色設定、既定=水色）
 			# hip 共通エンジンを起動（モーダル：ウィンドウを閉じるまでブロック）
-			self.on_animate_dispatch()
+			self.on_animate()
 		finally:
 			for nm, val in saved.items():
 				try:
@@ -7154,608 +7136,6 @@ class MainMenuGUI(_BaseWindow):
 	# ankle が使用中。将来 hip/knee も同じヘルパに載せ替え可 (TODO)。
 	# ================================================================
 
-	# ================================================================
-	# 統合可視化エンジン (_sim_engine_*)  —  hip / knee / ankle 共通
-	# ================================================================
-	# 【設計方針】
-	#  ・骨は「N本のリスト」として扱う。hip/knee は N=2 の特殊ケースとして自然に収まる。
-	#  ・関節種別に依存する処理（座標系の作り方・姿勢時系列の作り方・ヒートマップの計算）は
-	#    呼び出し側が行い、結果を「シーン」として engine に渡す。
-	#  ・engine が担うのは描画・再生・UI だけ。ここを直せば3タブすべてに反映される。
-	#
-	# 【シーンの形】
-	#   scene = {
-	#     "window_title": str,
-	#     "bones": [ {"name","mesh","poses"(N,4,4),"color","opacity",
-	#                 "scalars": [ndarray]*N or None}, ... ],
-	#     "frame_times": [float]*N,            # 0 起点の相対秒
-	#     "heatmap": {"enabled": bool, "clim": (lo,hi), "title": str},
-	#     "background_meshes": [ {"mesh","color","opacity"} ],
-	#     "overlay_text": fn(frame_idx)->str or None,     # 右上テキスト
-	#     "extra_actors": fn(plotter)->fn(frame_idx) or None,  # 追加描画とその更新関数
-	#     "on_csv_export": fn() or None,
-	#     "features": {"csv":bool,"export_model":bool,"screenshot":bool},
-	#   }
-
-	@staticmethod
-	def _sim_apply_T_to_mesh(mesh, T):
-		"""pvメッシュに4x4同次変換を適用したコピーを返す（関節種別に依存しない）。"""
-		import numpy as np
-		m = mesh.copy()
-		if m.n_points > 0:
-			pts = np.hstack([m.points, np.ones((m.n_points, 1))])
-			m.points = (np.asarray(T, dtype=float) @ pts.T).T[:, :3]
-		return m
-
-	@staticmethod
-	def _sim_hex_to_rgb01(h):
-		"""'#RRGGBB' → (r,g,b) 0-1。失敗時は灰色。"""
-		try:
-			h = str(h).lstrip('#')
-			return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0)
-		except Exception:
-			return (0.7, 0.7, 0.7)
-
-	def _sim_engine_run(self, scene) -> None:
-		"""N骨シーンを描画・再生する統合エンジン。hip / knee / ankle 共通。
-
-		呼び出し側は scene を組み立てるだけでよい。engine は関節種別を一切知らない。
-		"""
-		import numpy as np
-		bones = scene.get("bones", []) or []
-		if not bones:
-			messagebox.showwarning("シミュレーション", "表示する骨がありません。")
-			return
-		frame_times = list(scene.get("frame_times") or [])
-		N = len(frame_times)
-		if N == 0:
-			N = len(bones[0]["poses"])
-			frame_times = [t / 30.0 for t in range(N)]
-		hm = scene.get("heatmap", {}) or {}
-		heatmap_enabled = bool(hm.get("enabled"))
-		clim_lo, clim_hi = hm.get("clim", (-10.0, 0.0))
-		features = scene.get("features") or {
-			"csv": bool(scene.get("on_csv_export")), "export_model": True, "screenshot": True}
-
-		# --- 1. プロッター ---
-		pv.global_theme.allow_empty_mesh = True
-		sw = self.winfo_screenwidth()
-		sh = self.winfo_screenheight()
-		anim_plotter = pv.Plotter(title=str(scene.get("window_title", "シミュレーション")),
-		                          window_size=(int(sw * 0.9), int(sh * 0.9)))
-		anim_plotter.set_background("white")
-
-		# 参考表示メッシュ (初期スキャン等・動かない)
-		for bg in (scene.get("background_meshes") or []):
-			try:
-				anim_plotter.add_mesh(bg["mesh"], color=bg.get("color", "lightgray"),
-				                      opacity=float(bg.get("opacity", 0.15)),
-				                      smooth_shading=True)
-			except Exception as e:
-				print(f"[sim engine] 参考メッシュ表示失敗: {e}")
-
-		# --- 2. 骨アクター ---
-		hm_cmap = self._sim_view_heatmap_cmap()
-		actors = []            # index を bones と揃える
-		first_T_inv = []
-		bar_shown = [False]
-		for bi, b in enumerate(bones):
-			poses = np.asarray(b["poses"], dtype=float)
-			color = b.get("color", "#DEB887")
-			m0 = self._sim_apply_T_to_mesh(b["mesh"], poses[0])
-			has_sc = heatmap_enabled and b.get("scalars") is not None
-			if has_sc:
-				d0 = b["scalars"][0]
-				if d0 is None or len(d0) != m0.n_points:
-					d0 = np.full(m0.n_points, np.inf, dtype=np.float32)
-				m0['distance'] = np.asarray(d0, dtype=np.float32)
-				sb = ({'title': hm.get("title", "distance [mm]"), 'color': 'black'}
-				      if not bar_shown[0] else None)
-				actor = anim_plotter.add_mesh(
-					m0, scalars='distance', cmap=hm_cmap, clim=[clim_lo, clim_hi],
-					opacity=float(b.get("opacity", 1.0)), smooth_shading=True,
-					show_edges=False, name=f'bone_{bi}', scalar_bar_args=sb)
-				bar_shown[0] = True
-				# 離間(範囲上) は骨本来の色 / めり込み(範囲下) は濃赤
-				try:
-					r, g, bl = self._sim_hex_to_rgb01(color)
-					lut = actor.GetMapper().GetLookupTable()
-					lut.SetUseAboveRangeColor(True)
-					lut.SetAboveRangeColor(r, g, bl, 1.0)
-					lut.SetUseBelowRangeColor(True)
-					lut.SetBelowRangeColor(0.5, 0.0, 0.0, 1.0)
-				except Exception:
-					pass
-				try:
-					mp = actor.GetMapper()
-					mp.SetResolveCoincidentTopologyToPolygonOffset()
-					mp.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
-				except Exception:
-					pass
-			else:
-				actor = anim_plotter.add_mesh(
-					m0, color=color, opacity=float(b.get("opacity", 1.0)),
-					smooth_shading=True, show_edges=False,
-					name=f'bone_{bi}', label=b.get("name", f"bone{bi}"))
-			actors.append(actor)
-			try:
-				first_T_inv.append(np.linalg.inv(poses[0]))
-			except np.linalg.LinAlgError:
-				first_T_inv.append(np.eye(4))
-
-		# 追加描画 (ArUcoマーカー軸など)。更新関数を受け取る
-		extra_update = None
-		try:
-			mk = scene.get("extra_actors")
-			if callable(mk):
-				extra_update = mk(anim_plotter)
-		except Exception as e:
-			print(f"[sim engine] 追加アクター生成失敗: {e}")
-
-		def _apply_matrix(actor, T4):
-			import vtk
-			m = vtk.vtkMatrix4x4()
-			for i in range(4):
-				for j in range(4):
-					m.SetElement(i, j, float(T4[i, j]))
-			try:
-				actor.SetUserMatrix(m)
-			except Exception:
-				pass
-
-		# --- 3. 再生状態 ---
-		current_frame = [0]
-		actual_frame_counter = [0]
-		animation_start_time = [None]
-		playback_speed = [1.0]
-		last_scale_update_time = [0.0]
-		scale_update_interval = [0.2]
-		after_id = [None]
-		is_animation_active = [True]
-		is_paused = [True]        # 開いた直後は停止。再生ボタンで開始する
-		is_seeking = [False]
-		overlay_actor = [None]
-
-		# --- 4. 1フレーム描画 ---
-		def show_frame(frame_idx, force_render=False):
-			if not force_render and not is_animation_active[0]:
-				return
-			if hasattr(anim_plotter, 'closed') and anim_plotter.closed:
-				is_animation_active[0] = False
-				return
-			try:
-				fi = int(frame_idx) % max(N, 1)
-				for bi, b in enumerate(bones):
-					poses = b["poses"]
-					dT = np.asarray(poses[fi], dtype=float) @ first_T_inv[bi]
-					_apply_matrix(actors[bi], dT)
-				# ヒートマップ scalars 更新
-				max_pent = 0.0
-				if heatmap_enabled:
-					for bi, b in enumerate(bones):
-						sc = b.get("scalars")
-						if sc is None or fi >= len(sc):
-							continue
-						d = sc[fi]
-						if d is None:
-							continue
-						try:
-							pd_in = actors[bi].GetMapper().GetInput()
-							arr = pd_in.GetPointData().GetScalars()
-							if arr is not None and arr.GetNumberOfTuples() == len(d):
-								for j in range(len(d)):
-									arr.SetValue(j, float(d[j]))
-								arr.Modified()
-						except Exception:
-							pass
-						try:
-							dmin = float(np.nanmin(d))
-							if dmin < 0 and abs(dmin) > max_pent:
-								max_pent = abs(dmin)
-						except Exception:
-							pass
-				# 制御パネルのラベル
-				try:
-					ctrl_widgets['frame_label'].config(
-						text=f"Frame: {fi}/{max(N-1,0)} | Time: {frame_times[fi]:.3f}s")
-					ctrl_widgets['max_pent_label'].config(
-						text=(f"Max Pent: {max_pent:.2f} mm" if heatmap_enabled
-						      else "Max Pent: -- mm"))
-				except Exception:
-					pass
-				# 追加アクターの更新
-				if extra_update is not None:
-					try:
-						extra_update(fi)
-					except Exception:
-						pass
-				# 右上テキスト
-				try:
-					fn = scene.get("overlay_text")
-					if callable(fn):
-						txt = fn(fi)
-						if txt:
-							if overlay_actor[0] is None:
-								overlay_actor[0] = anim_plotter.add_text(
-									txt, position='upper_right', font_size=11,
-									color='black', font='courier')
-							else:
-								overlay_actor[0].SetText(3, txt)
-				except Exception:
-					pass
-				if force_render or is_animation_active[0]:
-					try:
-						if hasattr(anim_plotter, 'render_window') and anim_plotter.render_window:
-							anim_plotter.render()
-					except Exception:
-						pass
-			except Exception as e:
-				print(f"[sim engine] フレーム{frame_idx} 描画失敗: {e}")
-				traceback.print_exc()
-
-		# --- 5. 制御パネルのコールバック ---
-		def _cb_frame_seek(fi):
-			is_seeking[0] = True
-			current_frame[0] = fi
-			show_frame(fi, force_render=True)
-			try:
-				time_val = frame_times[fi]
-				actual_frame_counter[0] = int(time_val / 0.005)
-				actual_time = actual_frame_counter[0] * 0.005
-				ctrl_widgets['actual_label'].config(text=f"Actual: {actual_time:.3f}s")
-				if animation_start_time[0] is not None:
-					animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
-			except Exception:
-				pass
-			is_seeking[0] = False
-
-		def _cb_pause_toggle():
-			is_paused[0] = not is_paused[0]
-			if not is_paused[0]:
-				actual_time = actual_frame_counter[0] * 0.005
-				animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
-			return is_paused[0]
-
-		def _cb_speed_change(speed):
-			playback_speed[0] = speed
-			if animation_start_time[0] is not None and not is_paused[0]:
-				actual_time = actual_frame_counter[0] * 0.005
-				animation_start_time[0] = time.time() - (actual_time / speed)
-
-		def _cb_export_model():
-			"""現在フレームの全骨 (変換後) を1つに結合して保存。"""
-			was_paused = is_paused[0]
-			is_paused[0] = True
-			try:
-				fi = current_frame[0]
-				fp = filedialog.asksaveasfilename(
-					title=f"現在のモデルを出力 (Frame {fi})",
-					defaultextension=".stl",
-					filetypes=[("STL files", "*.stl"), ("OBJ files", "*.obj")],
-					initialfile=f"frame_{fi}.stl")
-				if not fp:
-					return
-				merged = None
-				for b in bones:
-					m_W = self._sim_apply_T_to_mesh(b["mesh"], np.asarray(b["poses"][fi], dtype=float))
-					merged = m_W if merged is None else (merged + m_W)
-				if merged is None:
-					messagebox.showwarning("出力", "出力するメッシュがありません。")
-					return
-				merged.save(fp)
-				messagebox.showinfo("出力完了", f"Frame {fi} のモデルを出力しました:\n{fp}")
-			except Exception as e:
-				messagebox.showerror("出力失敗", f"モデル出力に失敗しました:\n{e}")
-			finally:
-				if not was_paused:
-					is_paused[0] = False
-					try:
-						ctrl_widgets['pause_button'].config(text="一時停止")
-					except Exception:
-						pass
-					actual_time = actual_frame_counter[0] * 0.005
-					animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
-
-		def _cb_screenshot():
-			fp = filedialog.asksaveasfilename(
-				title="スクリーンショット保存", defaultextension=".png",
-				filetypes=[("PNG image", "*.png"), ("すべてのファイル", "*.*")],
-				initialfile=f"frame_{current_frame[0]}.png")
-			if not fp:
-				return
-			try:
-				anim_plotter.screenshot(fp)
-				messagebox.showinfo("スクリーンショット", f"保存しました:\n{fp}")
-			except Exception as e:
-				messagebox.showerror("スクリーンショット失敗", f"{e}")
-
-		def _cb_close():
-			is_animation_active[0] = False
-			if after_id[0] is not None:
-				try:
-					self.after_cancel(after_id[0])
-				except Exception:
-					pass
-				after_id[0] = None
-			try:
-				if hasattr(anim_plotter, 'close') and not (
-						hasattr(anim_plotter, 'closed') and anim_plotter.closed):
-					anim_plotter.close()
-			except Exception:
-				pass
-
-		# --- 6. 制御パネル ---
-		ctrl_widgets = self._sim_view_create_control_panel(
-			n_frames=N,
-			frame_times=frame_times,
-			callbacks={
-				'on_frame_seek': _cb_frame_seek,
-				'on_pause_toggle': _cb_pause_toggle,
-				'on_speed_change': _cb_speed_change,
-				'on_csv_export': scene.get("on_csv_export"),
-				'on_export_model': _cb_export_model,
-				'on_screenshot': _cb_screenshot,
-				'on_close': _cb_close,
-			},
-			features=features)
-		try:
-			ctrl_widgets['pause_button'].config(text="再生")
-		except Exception:
-			pass
-
-		# --- 7. 再生ループ (実時間同期・5ms) ---
-		max_time = frame_times[-1] if frame_times else 0.0
-
-		def animation_loop():
-			if not is_animation_active[0]:
-				return
-			if hasattr(anim_plotter, 'closed') and anim_plotter.closed:
-				is_animation_active[0] = False
-				return
-			if not is_paused[0] and not is_seeking[0]:
-				if animation_start_time[0] is None:
-					animation_start_time[0] = time.time()
-				elapsed_real = time.time() - animation_start_time[0]
-				elapsed_anim = elapsed_real * playback_speed[0]
-				actual_frame_counter[0] = int(elapsed_anim / 0.005)
-				actual_time = actual_frame_counter[0] * 0.005
-				if actual_time > max_time and max_time > 0:
-					# 末尾に到達 → 先頭へ戻してエンドレス再生
-					actual_frame_counter[0] = 0
-					actual_time = 0.0
-					animation_start_time[0] = time.time()
-					current_frame[0] = 0
-					show_frame(0)
-				try:
-					ctrl_widgets['actual_label'].config(text=f"Actual: {actual_time:.3f}s")
-				except Exception:
-					pass
-				target = current_frame[0]
-				for i in range(current_frame[0], N):
-					if frame_times[i] <= actual_time:
-						target = i
-					else:
-						break
-				if target == current_frame[0] and current_frame[0] > 0:
-					if actual_time < frame_times[current_frame[0]]:
-						target = 0
-						for i in range(N):
-							if frame_times[i] <= actual_time:
-								target = i
-							else:
-								break
-				if target != current_frame[0]:
-					current_frame[0] = target
-					show_frame(target)
-				now = time.time()
-				if (not ctrl_widgets['user_is_dragging'][0]
-				    and now - last_scale_update_time[0] >= scale_update_interval[0]):
-					try:
-						ctrl_widgets['is_programmatic_update'][0] = True
-						ctrl_widgets['playback_scale'].set(current_frame[0])
-						ctrl_widgets['is_programmatic_update'][0] = False
-						last_scale_update_time[0] = now
-					except Exception:
-						pass
-			after_id[0] = self.after(5, animation_loop)
-
-		# --- 8. カメラ・キー・初期表示 ---
-		anim_plotter.camera_position = 'iso'
-		anim_plotter.reset_camera()
-		anim_plotter.add_key_event('p', lambda: ctrl_widgets['pause_button'].invoke())
-		anim_plotter.add_key_event('P', lambda: ctrl_widgets['pause_button'].invoke())
-
-		show_frame(0, force_render=True)
-
-		# 全骨が画面に収まるようカメラを合わせる
-		try:
-			bnds = []
-			for b in bones:
-				m_W = self._sim_apply_T_to_mesh(b["mesh"], np.asarray(b["poses"][0], dtype=float))
-				if m_W.bounds is not None:
-					bnds.append(m_W.bounds)
-			if bnds:
-				a = np.asarray(bnds)
-				anim_plotter.reset_camera(bounds=[
-					float(a[:, 0].min()), float(a[:, 1].max()),
-					float(a[:, 2].min()), float(a[:, 3].max()),
-					float(a[:, 4].min()), float(a[:, 5].max())])
-		except Exception as e:
-			print(f"[sim engine] カメラフィット失敗: {e}")
-
-		try:
-			anim_plotter.iren.add_observer('ExitEvent', lambda obj, ev: _cb_close())
-		except Exception:
-			pass
-
-		try:
-			anim_plotter.show(auto_close=False, interactive_update=True)
-		except TypeError:
-			anim_plotter.show(auto_close=False)
-
-		after_id[0] = self.after(5, animation_loop)
-
-	# ---- 統合エンジン用: hip / knee のシーンビルダと切替 ----
-	# 【重要】従来の on_animate は一切変更しない。切替が「従来」のときは
-	# 完全に今までと同じコードパスを通るので、hip / knee の動作は変わらない。
-
-	def _sim_hip_uses_legacy_only(self) -> bool:
-		"""FEM / レポート生成が要求されている場合は統合エンジンでは扱えない。
-
-		統合エンジンは「可視化 + ヒートマップ」までを担当する方針のため、
-		FEM接触解析や Word/Excel レポート生成を使うときは従来エンジンに委ねる。
-		"""
-		try:
-			if bool(self.prox_cartilage_model_path.get().strip()):
-				return True
-			if bool(self.dist_cartilage_model_path.get().strip()):
-				return True
-		except Exception:
-			pass
-		return False
-
-	def _sim_build_hip_scene(self):
-		"""hip の入力から統合エンジン用シーンを組み立てる。
-
-		従来の on_animate と同じ前処理 (PP → 座標系 → ワールド整列) を行うが、
-		on_animate 本体には触れないため一時的にロジックが重複する。
-		統合エンジンを既定に切り替えた段階で従来側を削除すれば重複は解消する。
-
-		Returns: scene dict, または組み立て失敗時 None
-		"""
-		import numpy as np
-		# 必要ファイルの確認 (従来と同じ条件)
-		if not all([
-			self.prox_model_path.get(), self.prox_pp_abcd_path.get(),
-			self.prox_pp_olmn_path.get(), self.dist_model_path.get(),
-			self.dist_pp_abc_path.get(), self.dist_pp_olmn_path.get(),
-			self.transform_group_path.get()]):
-			messagebox.showerror("エラー", "全てのファイルを選択してください。")
-			return None
-		try:
-			transform_data = self._load_transform_matrices(self.transform_group_path.get())
-			if not transform_data:
-				messagebox.showerror("エラー", "変位・姿勢変化データが空です。")
-				return None
-
-			prox_mesh = pv.read(self.prox_model_path.get())
-			pa, la = self._parse_pp_file(self.prox_pp_abcd_path.get())
-			po, lo = self._parse_pp_file(self.prox_pp_olmn_path.get())
-			prox_points = np.vstack([pa, po]); prox_labels = la + lo
-
-			dist_mesh = pv.read(self.dist_model_path.get())
-			da, dla = self._parse_pp_file(self.dist_pp_abc_path.get())
-			do, dlo = self._parse_pp_file(self.dist_pp_olmn_path.get())
-			dist_points = np.vstack([da, do]); dist_labels = dla + dlo
-
-			p_o, p_x, p_y, p_z = self._build_coordinate_system(prox_points, prox_labels)
-			d_o, d_x, d_y, d_z = self._build_coordinate_system_dist(dist_points, dist_labels)
-
-			# --- 近位座標系をワールドに整列 ---
-			Rp = np.column_stack([p_x, p_y, p_z])
-			prox_to_world = np.eye(4)
-			prox_to_world[:3, :3] = Rp.T
-			prox_to_world[:3, 3] = -Rp.T @ p_o
-			h = np.hstack([prox_mesh.points, np.ones((prox_mesh.points.shape[0], 1))])
-			prox_mesh.points = (prox_to_world @ h.T).T[:, :3]
-
-			# --- 遠位も同じ変換を適用してから、遠位座標系をワールドに整列 ---
-			h = np.hstack([dist_mesh.points, np.ones((dist_mesh.points.shape[0], 1))])
-			dist_mesh.points = (prox_to_world @ h.T).T[:, :3]
-			d_o_w = (prox_to_world @ np.append(d_o, 1))[:3]
-			Rd = np.column_stack([d_x, d_y, d_z])
-			Rd_w = Rp.T @ Rd
-			dist_to_world = np.eye(4)
-			dist_to_world[:3, :3] = Rd_w.T
-			dist_to_world[:3, 3] = -Rd_w.T @ d_o_w
-			h = np.hstack([dist_mesh.points, np.ones((dist_mesh.points.shape[0], 1))])
-			dist_mesh.points = (dist_to_world @ h.T).T[:, :3]
-
-			# --- 変位データ → 遠位骨の姿勢時系列 ---
-			Nf = len(transform_data)
-			poses_prox = np.repeat(np.eye(4)[None, :, :], Nf, axis=0)
-			poses_dist = np.zeros((Nf, 4, 4), dtype=float)
-			for t, fd in enumerate(transform_data):
-				ang = fd["angles"]; tr = fd["translations"]
-				poses_dist[t] = self._build_transform_matrix(
-					rz=ang[0], rx=ang[1], ry=ang[2], ml=tr[0], ap=tr[1], pd=tr[2])
-			frame_times = [float(fd["time"]) for fd in transform_data]
-			t0 = frame_times[0] if frame_times else 0.0
-			frame_times = [v - t0 for v in frame_times]
-
-			def _overlay(fi):
-				try:
-					fd = transform_data[fi]
-					a = fd["angles"]; tr = fd["translations"]
-					return (f"FE: {a[0]:+7.2f}°\n"
-					        f"VV: {a[1]:+7.2f}°\n"
-					        f"IE: {a[2]:+7.2f}°\n"
-					        f"ML: {tr[0]:+7.2f} mm\n"
-					        f"AP: {tr[1]:+7.2f} mm\n"
-					        f"PD: {tr[2]:+7.2f} mm")
-				except Exception:
-					return None
-
-			knee = False
-			try:
-				knee = (self.joint_var.get() == 2)
-			except Exception:
-				pass
-			return {
-				"window_title": "シミュレーション (統合エンジン)",
-				"bones": [
-					{"name": "大腿骨" if knee else "骨盤", "mesh": prox_mesh,
-					 "poses": poses_prox,
-					 "color": getattr(self, "prox_color", "#DEB887"),
-					 "opacity": 0.5, "scalars": None},
-					{"name": "脛骨" if knee else "大腿骨", "mesh": dist_mesh,
-					 "poses": poses_dist,
-					 "color": getattr(self, "dist_color", "#ADD8E6"),
-					 "opacity": 0.5, "scalars": None},
-				],
-				"frame_times": frame_times,
-				"heatmap": {"enabled": False, "clim": (-10.0, 0.0), "title": "distance [mm]"},
-				"background_meshes": [],
-				"overlay_text": _overlay,
-				"extra_actors": None,
-				"on_csv_export": None,
-				"features": {"csv": False, "export_model": True, "screenshot": True},
-			}
-		except Exception as e:
-			messagebox.showerror("シーン構築失敗",
-			                     f"統合エンジン用データの準備に失敗しました:\n{e}")
-			traceback.print_exc()
-			return None
-
-	def on_animate_dispatch(self) -> None:
-		"""可視化エンジンの選択に応じて 従来 / 統合 を振り分ける。
-
-		既定は「従来」。統合を選んでも、FEM や軟骨(レポート)を使う設定のときは
-		自動的に従来エンジンへフォールバックする。
-		"""
-		mode = "legacy"
-		try:
-			mode = str(self.sim_engine_mode.get()).strip().split()[0]
-		except Exception:
-			mode = "legacy"
-		if mode != "unified":
-			self.on_animate()
-			return
-		if self._sim_hip_uses_legacy_only():
-			print("[sim engine] 軟骨/FEM/レポートを使う設定のため従来エンジンで実行します")
-			messagebox.showinfo(
-				"従来エンジンで実行",
-				"軟骨モデルが指定されているため、FEM・レポート機能を含む従来エンジンで実行します。\n"
-				"（統合エンジンは可視化とヒートマップまでを担当します）")
-			self.on_animate()
-			return
-		scene = self._sim_build_hip_scene()
-		if scene is None:
-			return
-		print(f"[sim engine] 統合エンジンで実行: 骨 {len(scene['bones'])} 本 / "
-		      f"{len(scene['frame_times'])} フレーム")
-		self._sim_engine_run(scene)
-
 	@staticmethod
 	def _sim_view_heatmap_cmap():
 		"""接触ヒートマップの共通カラーマップ (-10mm=赤 → 0mm=緑)。hip と揃える。"""
@@ -8915,114 +8295,236 @@ class MainMenuGUI(_BaseWindow):
 			except Exception:
 				pass
 
-		# --- 4. シーンを組み立てて統合エンジンへ渡す ---
-		# ここから先の描画・再生・UI は hip / knee と共通の _sim_engine_run が担う。
-		# 関節種別に依存するのは「シーンの作り方」だけ。
-		heatmap_enabled = bool(heatmap_data)
+		# --- 4. プロッター作成 (hip と同じスタイル) ---
+		pv.global_theme.allow_empty_mesh = True
+		sw = self.winfo_screenwidth()
+		sh = self.winfo_screenheight()
+		anim_plotter = pv.Plotter(title="ankle: シミュレーション",
+		                          window_size=(int(sw * 0.9), int(sh * 0.9)))
+		anim_plotter.set_background("white")
 
-		# 骨ごとのスカラー時系列 (ヒートマップ) を bones の形に詰め替える
-		scene_bones = []
-		for (idx, name, mesh_L, Ts) in bones_data:
-			sc = None
-			if heatmap_enabled:
-				sc = [heatmap_data[t].get(idx) if t < len(heatmap_data) else None
-				      for t in range(N)]
-			scene_bones.append({
-				"name": name,
-				"mesh": mesh_L,
-				"poses": Ts,
-				"color": self._ankle_color_of(idx),
-				"opacity": 1.0,
-				"scalars": sc,
-				"_idx": idx,
-			})
-
-		# 参考表示: 初期スキャン (原プランのみ設定されている)
-		background = []
+		# 初期スキャン (半透明・参考表示)
 		scan_path = self.ankle_initial_scan_path.get().strip()
 		if scan_path:
 			try:
-				background.append({"mesh": pv.read(scan_path),
-				                   "color": "lightgray", "opacity": 0.15})
+				anim_plotter.add_mesh(pv.read(scan_path), color="lightgray",
+				                       opacity=0.15, smooth_shading=True, name='initial_scan')
 			except Exception as e:
 				print(f"[ankle animate] 初期スキャン表示失敗: {e}")
 
-		# 右上テキスト: 骨A→骨B の相対姿勢 (N>=2 のとき)
-		def _overlay(fi):
-			if n_bones < 2:
-				return None
-			try:
-				T_A = np.asarray(scene_bones[0]["poses"][fi], dtype=float)
-				T_B = np.asarray(scene_bones[1]["poses"][fi], dtype=float)
-				T_rel = np.linalg.inv(T_A) @ T_B
-				R = T_rel[:3, :3]
-				tv = T_rel[:3, 3]
-				sy = float(np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2))
-				if sy > 1e-6:
-					rz = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
-					ry = float(np.degrees(np.arctan2(-R[2, 0], sy)))
-					rx = float(np.degrees(np.arctan2(R[2, 1], R[2, 2])))
-				else:
-					rz = float(np.degrees(np.arctan2(-R[0, 1], R[1, 1])))
-					ry = float(np.degrees(np.arctan2(-R[2, 0], sy)))
-					rx = 0.0
-				return (f"骨A→B 相対姿勢\n"
-				        f"Rx: {rx:+7.2f}°\n"
-				        f"Ry: {ry:+7.2f}°\n"
-				        f"Rz: {rz:+7.2f}°\n"
-				        f"tx: {tv[0]:+7.2f} mm\n"
-				        f"ty: {tv[1]:+7.2f} mm\n"
-				        f"tz: {tv[2]:+7.2f} mm")
-			except Exception:
-				return None
+		# --- 5. 各骨のアクター作成 (ヒートマップあり=scalars で色付け、なし=単色) ---
+		heatmap_enabled = bool(heatmap_data)
+		hm_cmap = self._sim_view_heatmap_cmap()
+		CLIM_LO, CLIM_HI = -10.0, 0.0
 
-		# 追加描画: ArUco マーカー軸 (ankle 固有。engine には汎用フックとして渡す)
-		def _make_marker_actors(plotter):
-			try:
-				if not bool(self.ankle_show_markers.get()):
-					return None
-			except Exception:
-				return None
-			cache_bones_mk = cache.get("bones", {}) or {}
-			axis_len = 15.0
-			mk_actors = {}
-			for si, b in enumerate(scene_bones):
-				idx = b["_idx"]
-				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
-				aid = int(bone.get("aruco_id", -1))
-				if aid not in cache_bones_mk:
-					continue
-				o = np.array([0.0, 0.0, 0.0])
-				xa = plotter.add_mesh(pv.Line(o, [axis_len, 0, 0]), color="red",
-				                      line_width=3, name=f"mk_{si}_x")
-				ya = plotter.add_mesh(pv.Line(o, [0, axis_len, 0]), color="green",
-				                      line_width=3, name=f"mk_{si}_y")
-				za = plotter.add_mesh(pv.Line(o, [0, 0, axis_len]), color="blue",
-				                      line_width=3, name=f"mk_{si}_z")
-				mk_actors[si] = (aid, (xa, ya, za))
-			if not mk_actors:
-				return None
+		actors = {}                 # bone_idx -> actor (骨本体、SetUserMatrix で駆動)
+		mesh_L_map = {}             # bone_idx -> mesh_L (ローカル)
+		anim_first_T_inv = {}       # bone_idx -> inv(Ts[0])
+		bone_colors = {}            # bone_idx -> hex color
 
-			def _update(fi):
-				import vtk
-				for si, (aid, acts) in mk_actors.items():
-					try:
-						poses_C = np.asarray(cache_bones_mk[aid]["poses"], dtype=float)
-						if fi >= len(poses_C):
+		for (idx, name, mesh_L, Ts) in bones_data:
+			mesh_L_map[idx] = mesh_L
+			color = self._ankle_color_of(idx)
+			bone_colors[idx] = color
+			# 初期姿勢メッシュ (Ts[0] を適用)
+			m0 = self._ankle_apply_T_to_mesh(mesh_L, Ts[0])
+			if heatmap_enabled:
+				# scalars を持たせる (初期フレームの distances)
+				d0 = heatmap_data[0].get(idx)
+				if d0 is None or len(d0) != m0.n_points:
+					d0 = np.full(m0.n_points, np.inf, dtype=np.float32)
+				m0['distance'] = d0
+				actor = anim_plotter.add_mesh(m0, scalars='distance', cmap=hm_cmap,
+				                              clim=[CLIM_LO, CLIM_HI], opacity=1.0,
+				                              smooth_shading=True, show_edges=False,
+				                              name=f'bone_{idx}',
+				                              scalar_bar_args={'title': 'distance [mm]', 'color': 'black'} if idx == bones_data[0][0] else None)
+				# 離間 (>0) は骨本来の色、めり込み (< -10) は 濃赤
+				try:
+					def _hex_to_rgb01(h):
+						h = h.lstrip('#')
+						return (int(h[0:2], 16) / 255.0,
+						        int(h[2:4], 16) / 255.0,
+						        int(h[4:6], 16) / 255.0)
+					r, g, b = _hex_to_rgb01(color)
+					lut = actor.GetMapper().GetLookupTable()
+					lut.SetUseAboveRangeColor(True)
+					lut.SetAboveRangeColor(r, g, b, 1.0)
+					lut.SetUseBelowRangeColor(True)
+					lut.SetBelowRangeColor(0.5, 0.0, 0.0, 1.0)
+				except Exception:
+					pass
+				# 距離が inf (他骨無し) は透明
+				try:
+					mp = actor.GetMapper()
+					mp.SetResolveCoincidentTopologyToPolygonOffset()
+					mp.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -100.0)
+				except Exception:
+					pass
+			else:
+				actor = anim_plotter.add_mesh(m0, color=color, opacity=1.0,
+				                              smooth_shading=True, show_edges=False,
+				                              name=f'bone_{idx}', label=name)
+			actors[idx] = actor
+			anim_first_T_inv[idx] = np.linalg.inv(Ts[0])
+
+		# --- 6. アクターに SetUserMatrix を適用するヘルパ ---
+		def _apply_matrix(actor, T4):
+			import vtk
+			m = vtk.vtkMatrix4x4()
+			for i in range(4):
+				for j in range(4):
+					m.SetElement(i, j, float(T4[i, j]))
+			try:
+				actor.SetUserMatrix(m)
+			except Exception:
+				pass
+
+		# --- 7. アニメーション状態変数 (hip と同じ形) ---
+		current_frame = [0]
+		actual_frame_counter = [0]
+		animation_start_time = [None]
+		playback_speed = [1.0]
+		last_scale_update_time = [0.0]
+		scale_update_interval = [0.2]
+		after_id = [None]
+		is_animation_active = [True]
+		is_paused = [True]        # 開いた直後は停止。再生ボタンで開始する
+		is_seeking = [False]
+
+		# 6軸情報テキスト (upper_right)
+		six_axis_text_actor = [None]
+
+		# --- 8. show_frame: 1フレーム描画 ---
+		def show_frame(frame_idx, force_render=False):
+			if not force_render and not is_animation_active[0]:
+				return
+			if hasattr(anim_plotter, 'closed') and anim_plotter.closed:
+				is_animation_active[0] = False
+				return
+			try:
+				fi = int(frame_idx) % max(N, 1)
+				# 各骨アクターに (T(t) * inv(T(0))) を適用
+				for (idx, name, mesh_L, Ts) in bones_data:
+					dT = Ts[fi] @ anim_first_T_inv[idx]
+					_apply_matrix(actors[idx], dT)
+				# ヒートマップ scalars 更新
+				max_pent = 0.0
+				if heatmap_enabled and fi < len(heatmap_data):
+					frame_hm = heatmap_data[fi]
+					for (idx, name, mesh_L, Ts) in bones_data:
+						d = frame_hm.get(idx)
+						if d is None:
 							continue
-						T = poses_C[fi]
-						m = vtk.vtkMatrix4x4()
-						for i in range(4):
-							for j in range(4):
-								m.SetElement(i, j, float(T[i, j]))
-						for a in acts:
-							a.SetUserMatrix(m)
+						actor = actors[idx]
+						try:
+							pd_in = actor.GetMapper().GetInput()
+							arr = pd_in.GetPointData().GetScalars()
+							if arr is not None and arr.GetNumberOfTuples() == len(d):
+								for j in range(len(d)):
+									arr.SetValue(j, float(d[j]))
+								arr.Modified()
+						except Exception:
+							pass
+						# 最大めり込み量 (負値の絶対値)
+						try:
+							dmin = float(np.nanmin(d))
+							if dmin < 0 and abs(dmin) > max_pent:
+								max_pent = abs(dmin)
+						except Exception:
+							pass
+				# 情報ラベル更新 (制御パネル)
+				try:
+					widgets = ctrl_widgets  # closure から参照
+					widgets['frame_label'].config(
+						text=f"Frame: {fi}/{max(N-1,0)} | Time: {frame_times[fi]:.3f}s")
+					widgets['max_pent_label'].config(
+						text=f"Max Pent: {max_pent:.2f} mm" if heatmap_enabled else "Max Pent: -- mm")
+				except Exception:
+					pass
+				# ArUco マーカー軸を毎フレーム更新
+				try:
+					_update_markers(fi)
+				except Exception:
+					pass
+				# 6軸表示 (骨1のフレームに対する骨2の相対姿勢を表示、N>=2 のとき)
+				try:
+					if n_bones >= 2:
+						T_A = bones_data[0][3][fi]
+						T_B = bones_data[1][3][fi]
+						T_rel = np.linalg.inv(T_A) @ T_B
+						R = T_rel[:3, :3]
+						t_vec = T_rel[:3, 3]
+						# ZYX Euler (deg)
+						sy = float(np.sqrt(R[0,0]**2 + R[1,0]**2))
+						if sy > 1e-6:
+							rz = float(np.degrees(np.arctan2(R[1,0], R[0,0])))
+							ry = float(np.degrees(np.arctan2(-R[2,0], sy)))
+							rx = float(np.degrees(np.arctan2(R[2,1], R[2,2])))
+						else:
+							rz = float(np.degrees(np.arctan2(-R[0,1], R[1,1])))
+							ry = float(np.degrees(np.arctan2(-R[2,0], sy)))
+							rx = 0.0
+						txt = (f"骨A→B 相対姿勢\n"
+						       f"Rx: {rx:+7.2f}°\n"
+						       f"Ry: {ry:+7.2f}°\n"
+						       f"Rz: {rz:+7.2f}°\n"
+						       f"tx: {t_vec[0]:+7.2f} mm\n"
+						       f"ty: {t_vec[1]:+7.2f} mm\n"
+						       f"tz: {t_vec[2]:+7.2f} mm")
+						if six_axis_text_actor[0] is None:
+							six_axis_text_actor[0] = anim_plotter.add_text(
+								txt, position='upper_right', font_size=11,
+								color='black', font='courier')
+						else:
+							try:
+								six_axis_text_actor[0].SetText(3, txt)
+							except Exception:
+								pass
+				except Exception:
+					pass
+				# 描画
+				if force_render or is_animation_active[0]:
+					try:
+						if hasattr(anim_plotter, 'render_window') and anim_plotter.render_window:
+							anim_plotter.render()
 					except Exception:
 						pass
-			return _update
+			except Exception as e:
+				print(f"[ankle animate] フレーム{frame_idx} 描画失敗: {e}")
+				traceback.print_exc()
 
-		# CSV 出力 (ankle 固有: 骨ごとの最小距離・最大めり込み)
+		# --- 9. 制御パネルのコールバック ---
+		def _cb_frame_seek(fi):
+			is_seeking[0] = True
+			current_frame[0] = fi
+			show_frame(fi, force_render=True)
+			try:
+				time_val = frame_times[fi]
+				actual_frame_counter[0] = int(time_val / 0.005)
+				actual_time = actual_frame_counter[0] * 0.005
+				ctrl_widgets['actual_label'].config(text=f"Actual: {actual_time:.3f}s")
+				if animation_start_time[0] is not None:
+					animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
+			except Exception:
+				pass
+			is_seeking[0] = False
+
+		def _cb_pause_toggle():
+			is_paused[0] = not is_paused[0]
+			if not is_paused[0]:
+				actual_time = actual_frame_counter[0] * 0.005
+				animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
+			return is_paused[0]
+
+		def _cb_speed_change(speed):
+			playback_speed[0] = speed
+			if animation_start_time[0] is not None and not is_paused[0]:
+				actual_time = actual_frame_counter[0] * 0.005
+				animation_start_time[0] = time.time() - (actual_time / speed)
+
 		def _cb_csv_export():
+			"""マルチヒートマップの Max Penetration とフレーム時刻を CSV に出力。"""
 			if not heatmap_data:
 				messagebox.showwarning("CSV出力", "ヒートマップ事前計算がありません。")
 				return
@@ -9036,43 +8538,265 @@ class MainMenuGUI(_BaseWindow):
 				with open(fp, 'w', newline='', encoding='utf-8-sig') as f:
 					w = csv.writer(f)
 					header = ["Frame", "Time [s]"]
-					for b in scene_bones:
-						header.append(f"{b['name']}_min_dist [mm]")
-						header.append(f"{b['name']}_max_pen [mm]")
+					for (idx, name, _, _) in bones_data:
+						header.append(f"{name}_min_dist [mm]")
+						header.append(f"{name}_max_pen [mm]")
 					w.writerow(header)
 					for t in range(N):
 						row = [t, f"{frame_times[t]:.4f}"]
-						for b in scene_bones:
-							d = b["scalars"][t] if b["scalars"] else None
+						for (idx, name, _, _) in bones_data:
+							d = heatmap_data[t].get(idx) if t < len(heatmap_data) else None
 							if d is None or len(d) == 0:
 								row.extend(["", ""])
-								continue
-							finite = d[np.isfinite(d)]
-							if finite.size == 0:
-								row.extend(["", ""])
 							else:
-								dmin = float(np.min(finite))
-								row.append(f"{dmin:.4f}")
-								row.append(f"{abs(dmin):.4f}" if dmin < 0 else "0.0000")
+								finite = d[np.isfinite(d)]
+								if finite.size == 0:
+									row.extend(["", ""])
+								else:
+									dmin = float(np.min(finite))
+									row.append(f"{dmin:.4f}")
+									row.append(f"{abs(dmin):.4f}" if dmin < 0 else "0.0000")
 						w.writerow(row)
 				messagebox.showinfo("CSV出力完了", f"保存しました:\n{fp}")
 			except Exception as e:
 				messagebox.showerror("CSV出力失敗", f"CSV保存に失敗しました:\n{e}")
 
-		scene = {
-			"window_title": "ankle: シミュレーション",
-			"bones": scene_bones,
-			"frame_times": frame_times,
-			"heatmap": {"enabled": heatmap_enabled, "clim": (-10.0, 0.0),
-			             "title": "distance [mm]"},
-			"background_meshes": background,
-			"overlay_text": _overlay,
-			"extra_actors": _make_marker_actors,
-			"on_csv_export": (_cb_csv_export if heatmap_enabled else None),
-			"features": {"csv": heatmap_enabled, "export_model": True, "screenshot": True},
-		}
-		self._sim_engine_run(scene)
+		def _cb_export_model():
+			"""現在フレームの各骨 (変換後) を1つのメッシュに結合して保存。"""
+			was_paused = is_paused[0]
+			is_paused[0] = True
+			try:
+				fp = filedialog.asksaveasfilename(
+					title=f"現在のモデルを出力 (Frame {current_frame[0]})",
+					defaultextension=".stl",
+					filetypes=[("STL files", "*.stl"), ("OBJ files", "*.obj")],
+					initialfile=f"ankle_frame_{current_frame[0]}.stl")
+				if not fp:
+					return
+				fi = current_frame[0]
+				merged = None
+				for (idx, name, mesh_L, Ts) in bones_data:
+					m_W = self._ankle_apply_T_to_mesh(mesh_L, Ts[fi])
+					merged = m_W if merged is None else (merged + m_W)
+				if merged is None:
+					messagebox.showwarning("出力", "出力するメッシュがありません。")
+					return
+				merged.save(fp)
+				messagebox.showinfo("出力完了", f"Frame {fi} のモデルを出力しました:\n{fp}")
+			except Exception as e:
+				messagebox.showerror("出力失敗", f"モデル出力に失敗しました:\n{e}")
+			finally:
+				if not was_paused:
+					is_paused[0] = False
+					ctrl_widgets['pause_button'].config(text="一時停止")
+					actual_time = actual_frame_counter[0] * 0.005
+					animation_start_time[0] = time.time() - (actual_time / playback_speed[0])
 
+		def _cb_screenshot():
+			fp = filedialog.asksaveasfilename(
+				title="スクリーンショット保存", defaultextension=".png",
+				filetypes=[("PNG image", "*.png"), ("すべてのファイル", "*.*")],
+				initialfile=f"ankle_frame_{current_frame[0]}.png")
+			if not fp:
+				return
+			try:
+				anim_plotter.screenshot(fp)
+				messagebox.showinfo("スクリーンショット", f"保存しました:\n{fp}")
+			except Exception as e:
+				messagebox.showerror("スクリーンショット失敗", f"{e}")
+
+		def _cb_close():
+			is_animation_active[0] = False
+			if after_id[0] is not None:
+				try:
+					self.after_cancel(after_id[0])
+				except Exception:
+					pass
+				after_id[0] = None
+			try:
+				if hasattr(anim_plotter, 'close') and not (hasattr(anim_plotter, 'closed') and anim_plotter.closed):
+					anim_plotter.close()
+			except Exception:
+				pass
+
+		# --- 10. 制御パネル生成 ---
+		ctrl_widgets = self._sim_view_create_control_panel(
+			n_frames=N,
+			frame_times=frame_times,
+			callbacks={
+				'on_frame_seek': _cb_frame_seek,
+				'on_pause_toggle': _cb_pause_toggle,
+				'on_speed_change': _cb_speed_change,
+				'on_csv_export': _cb_csv_export,
+				'on_export_model': _cb_export_model,
+				'on_screenshot': _cb_screenshot,
+				'on_close': _cb_close,
+			},
+			features={'csv': heatmap_enabled, 'export_model': True, 'screenshot': True})
+		# 開いた直後は停止状態なので、ボタンの表示も「再生」にしておく
+		try:
+			ctrl_widgets['pause_button'].config(text="再生")
+		except Exception:
+			pass
+
+		# --- 11. 再生ループ (hip と同じ 5ms/実時間同期) ---
+		max_time = frame_times[-1] if frame_times else 0.0
+
+		def animation_loop():
+			if not is_animation_active[0]:
+				return
+			if hasattr(anim_plotter, 'closed') and anim_plotter.closed:
+				is_animation_active[0] = False
+				return
+			if not is_paused[0] and not is_seeking[0]:
+				if animation_start_time[0] is None:
+					animation_start_time[0] = time.time()
+				elapsed_real = time.time() - animation_start_time[0]
+				elapsed_anim = elapsed_real * playback_speed[0]
+				actual_frame_counter[0] = int(elapsed_anim / 0.005)
+				actual_time = actual_frame_counter[0] * 0.005
+				if actual_time > max_time and max_time > 0:
+					# 末尾に到達 → 先頭へ戻してエンドレス再生
+					actual_frame_counter[0] = 0
+					actual_time = 0.0
+					animation_start_time[0] = time.time()
+					current_frame[0] = 0
+					show_frame(0)
+				try:
+					ctrl_widgets['actual_label'].config(text=f"Actual: {actual_time:.3f}s")
+				except Exception:
+					pass
+				# 現在フレームから前方検索
+				target = current_frame[0]
+				for i in range(current_frame[0], N):
+					if frame_times[i] <= actual_time:
+						target = i
+					else:
+						break
+				if target == current_frame[0] and current_frame[0] > 0:
+					if actual_time < frame_times[current_frame[0]]:
+						target = 0
+						for i in range(N):
+							if frame_times[i] <= actual_time:
+								target = i
+							else:
+								break
+				if target != current_frame[0]:
+					current_frame[0] = target
+					show_frame(target)
+				# 再生バーは 200ms 毎に更新 (ドラッグ中は更新しない)
+				now = time.time()
+				if (not ctrl_widgets['user_is_dragging'][0]
+				    and now - last_scale_update_time[0] >= scale_update_interval[0]):
+					try:
+						ctrl_widgets['is_programmatic_update'][0] = True
+						ctrl_widgets['playback_scale'].set(current_frame[0])
+						ctrl_widgets['is_programmatic_update'][0] = False
+						last_scale_update_time[0] = now
+					except Exception:
+						pass
+			after_id[0] = self.after(5, animation_loop)
+
+		# --- 11.5. ArUco マーカー軸の可視化 (診断用) ---
+		# 各マーカーの位置に小さな軸線 (RGB=XYZ) を描画。SetUserMatrix で毎フレーム動かす
+		marker_actors = {}  # bone_idx -> (x_actor, y_actor, z_actor)
+		show_markers = False
+		try:
+			show_markers = bool(self.ankle_show_markers.get())
+		except Exception:
+			pass
+		if show_markers:
+			marker_axis_len = 15.0  # 15mm 軸
+			cache_bones = cache.get("bones", {}) or {}
+			for (idx, name, mesh_L, Ts) in bones_data:
+				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+				aid = int(bone.get("aruco_id", -1))
+				if aid not in cache_bones:
+					continue
+				# マーカーは常にフレーム0姿勢を基準にした線分アクター (SetUserMatrix で駆動)
+				origin = np.array([0.0, 0.0, 0.0])
+				xL = pv.Line(origin, [marker_axis_len, 0, 0])
+				yL = pv.Line(origin, [0, marker_axis_len, 0])
+				zL = pv.Line(origin, [0, 0, marker_axis_len])
+				xa = anim_plotter.add_mesh(xL, color="red", line_width=3, name=f"mk_{idx}_x")
+				ya = anim_plotter.add_mesh(yL, color="green", line_width=3, name=f"mk_{idx}_y")
+				za = anim_plotter.add_mesh(zL, color="blue", line_width=3, name=f"mk_{idx}_z")
+				marker_actors[idx] = (xa, ya, za)
+
+		# フレーム毎マーカー軸更新 (show_frame 内で呼ばれる)
+		def _update_markers(fi):
+			if not marker_actors:
+				return
+			import vtk
+			cache_bones2 = cache.get("bones", {}) or {}
+			for (idx, name, mesh_L, Ts) in bones_data:
+				actors_xyz = marker_actors.get(idx)
+				if actors_xyz is None:
+					continue
+				bone = self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}
+				aid = int(bone.get("aruco_id", -1))
+				if aid not in cache_bones2:
+					continue
+				b_cache = cache_bones2[aid]
+				poses_C = np.asarray(b_cache["poses"], dtype=float)  # (N, 4, 4) T_C←Mk
+				if fi >= len(poses_C):
+					continue
+				# W = C (camera_ref) を前提。他モードでも近似的に妥当
+				T_marker_W = poses_C[fi]
+				m = vtk.vtkMatrix4x4()
+				for i in range(4):
+					for j in range(4):
+						m.SetElement(i, j, float(T_marker_W[i, j]))
+				for act in actors_xyz:
+					try:
+						act.SetUserMatrix(m)
+					except Exception:
+						pass
+
+		# --- 12. カメラ・キー ---
+		anim_plotter.camera_position = 'iso'
+		anim_plotter.reset_camera()
+		anim_plotter.add_key_event('p', lambda: ctrl_widgets['pause_button'].invoke())
+		anim_plotter.add_key_event('P', lambda: ctrl_widgets['pause_button'].invoke())
+
+		# 最初のフレーム
+		show_frame(0, force_render=True)
+		_update_markers(0)
+
+		# 全アクターの変換後 bounds を含むように camera を再フィット
+		# (SetUserMatrix 後の位置に基づいて画面全体に収める)
+		try:
+			all_bounds = []
+			for (idx, name, mesh_L, Ts) in bones_data:
+				m_W = self._ankle_apply_T_to_mesh(mesh_L, Ts[0])
+				b = m_W.bounds
+				if b is not None:
+					all_bounds.append(b)
+			if all_bounds:
+				bnd = np.asarray(all_bounds)
+				xmin, xmax = float(bnd[:, 0].min()), float(bnd[:, 1].max())
+				ymin, ymax = float(bnd[:, 2].min()), float(bnd[:, 3].max())
+				zmin, zmax = float(bnd[:, 4].min()), float(bnd[:, 5].max())
+				anim_plotter.reset_camera(bounds=[xmin, xmax, ymin, ymax, zmin, zmax])
+				print(f"[ankle animate] カメラをフィット: X[{xmin:.0f},{xmax:.0f}], "
+				      f"Y[{ymin:.0f},{ymax:.0f}], Z[{zmin:.0f},{zmax:.0f}] mm")
+		except Exception as e:
+			print(f"[ankle animate] カメラフィット失敗: {e}")
+
+		# ウィンドウ close コールバック
+		try:
+			anim_plotter.iren.add_observer('ExitEvent', lambda obj, ev: _cb_close())
+		except Exception:
+			pass
+
+		# ノンブロッキング表示
+		try:
+			anim_plotter.show(auto_close=False, interactive_update=True)
+		except TypeError:
+			anim_plotter.show(auto_close=False)
+
+		# ループ開始
+		after_id[0] = self.after(5, animation_loop)
 
 	# ---- RealSense D405 ライブ撮影 (友人スクリプトのUXを踏襲、出力は .bag) ----
 	def _ankle_rs_parse_resolution(self):
