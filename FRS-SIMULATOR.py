@@ -475,6 +475,12 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_rs_discard_frames = tk.IntVar(value=45)             # 録画開始前の破棄フレーム
 		self.ankle_rs_manual_exposure = tk.BooleanVar(value=False)     # 深度手動露光
 		self.ankle_rs_exposure_val = tk.IntVar(value=5000)             # 手動露光値
+		# カラー露光 (ArUco のモーションブラーを決める最重要パラメータ)
+		# 実測: ブラー 4px で回転誤差 2.1倍、8px で 8.3倍かつ検出率 29% に激減。
+		# 露光[ms] × マーカーの画面上の速度[px/s] = ブラー[px] なので、露光を直接短くするのが効く。
+		self.ankle_rs_color_manual_exposure = tk.BooleanVar(value=True)
+		self.ankle_rs_color_exposure_us = tk.IntVar(value=5000)        # マイクロ秒 (5000us = 5ms)
+		self.ankle_rs_color_gain = tk.IntVar(value=64)                 # 露光を詰めた分ゲインで補う
 		self.ankle_rs_status = tk.StringVar(value="(未接続)")
 		# タブ共通の位置合わせパラメータ (膝と同構造・全骨で共有)
 		self.ankle_reg_ransac_distance = tk.DoubleVar(value=1.0)     # RANSAC距離(mm)
@@ -517,7 +523,7 @@ class MainMenuGUI(_BaseWindow):
 		# 姿勢推定手法: "rgb" | "fusion" | "depth-corners"
 		# 実測 (2026-08-29) では rgb が 融合より 7〜14倍 安定だったため rgb を既定にする。
 		# 深度は「IPPEの表裏判定」と「深度スケール検証」にのみ使う。
-		self.ankle_pose_method = tk.StringVar(value="rgb")
+		self.ankle_pose_method = tk.StringVar(value="rgb  ★推奨 (最も安定)")
 		# 手法比較を行うフレーム数 (0 で無効)。冒頭だけ3手法を計算して比較レポートを出す。
 		self.ankle_compare_frames = tk.IntVar(value=300)
 		# 動作モード:
@@ -2776,20 +2782,41 @@ class MainMenuGUI(_BaseWindow):
 		                ).grid(row=0, column=4, sticky="w", padx=(0, 4))
 		ttk.Entry(rf1, textvariable=self.ankle_rs_exposure_val, width=8
 		          ).grid(row=0, column=5, sticky="w")
+		# --- カラー露光: ArUco のブラーを決めるので独立して制御する ---
+		rf1b = ttk.Frame(rs_frame)
+		rf1b.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 2))
+		ttk.Checkbutton(rf1b, text="カラー手動露光 (ArUco精度に直結)",
+		                variable=self.ankle_rs_color_manual_exposure
+		                ).grid(row=0, column=0, sticky="w")
+		ttk.Label(rf1b, text="露光:").grid(row=0, column=1, sticky="w", padx=(12, 2))
+		ttk.Spinbox(rf1b, from_=100, to=33000, increment=500,
+		            textvariable=self.ankle_rs_color_exposure_us, width=8
+		            ).grid(row=0, column=2, sticky="w")
+		ttk.Label(rf1b, text="μs").grid(row=0, column=3, sticky="w", padx=(2, 12))
+		ttk.Label(rf1b, text="ゲイン:").grid(row=0, column=4, sticky="w", padx=(0, 2))
+		ttk.Spinbox(rf1b, from_=16, to=248, increment=8,
+		            textvariable=self.ankle_rs_color_gain, width=6
+		            ).grid(row=0, column=5, sticky="w")
+		ttk.Label(rs_frame,
+		          text="※ モーションブラーが姿勢精度の最大の悪化要因（実測で最悪 8.3 倍）。"
+		               "露光 5000μs=5ms なら、骨が 20mm/s で動いても 220mm 距離でブラーは約 0.3px に収まる。"
+		               "露光を詰めると暗くなるので、照明を明るくするかゲインを上げて補うこと。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 4))
 		rf2 = ttk.Frame(rs_frame)
-		rf2.grid(row=1, column=0, sticky="w", padx=12, pady=(2, 4))
+		rf2.grid(row=3, column=0, sticky="w", padx=12, pady=(2, 4))
 		ttk.Button(rf2, text="接続確認", command=self.on_ankle_rs_test_connection
 		           ).grid(row=0, column=0, padx=(0, 8))
 		ttk.Button(rf2, text="プレビュー+録画 (.db3保存)", command=self.on_ankle_rs_capture
 		           ).grid(row=0, column=1, padx=(0, 8))
 		ttk.Label(rs_frame, textvariable=self.ankle_rs_status,
 		          foreground="#005580", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=2, column=0, sticky="w", padx=12, pady=(0, 2))
+		          ).grid(row=4, column=0, sticky="w", padx=12, pady=(0, 2))
 		ttk.Label(rs_frame,
 		          text="接続確認: pipeline起動+カメラ情報表示 / "
 		               "録画: プレビュー→スペースで開始→スペース(またはESC)で停止 → .db3 を ankle_depth_path に自動セット。",
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
+		          ).grid(row=5, column=0, sticky="w", padx=12, pady=(0, 6))
 
 		# ① 初期状態スキャン
 		init_frame = ttk.LabelFrame(container, text="① 初期状態スキャン（ピン+マーカー装着後）— 原プランのみ",
@@ -2832,17 +2859,21 @@ class MainMenuGUI(_BaseWindow):
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=700, justify="left"
 		          ).grid(row=2, column=0, columnspan=4, sticky="w", padx=(20, 0))
 		ttk.Label(af, text="姿勢推定手法:").grid(row=3, column=0, sticky="w", pady=(8, 0))
-		ttk.Combobox(af, textvariable=self.ankle_pose_method, width=16, state="readonly",
-		             values=["rgb", "fusion", "depth-corners"]
+		ttk.Combobox(af, textvariable=self.ankle_pose_method, width=30, state="readonly",
+		             values=["rgb  ★推奨 (最も安定)",
+		                     "depth-corners  (4〜10倍 悪化)",
+		                     "fusion  (6〜14倍 悪化)"]
 		             ).grid(row=3, column=1, sticky="w", pady=(8, 0))
 		ttk.Label(af, text="比較する冒頭フレーム数:").grid(row=3, column=2, sticky="w", pady=(8, 0))
 		ttk.Spinbox(af, from_=0, to=2000, increment=100,
 		            textvariable=self.ankle_compare_frames, width=6
 		            ).grid(row=3, column=3, sticky="w", pady=(8, 0))
 		ttk.Label(af,
-		          text="※ rgb = solvePnP のみ（推奨）。深度は「表裏判定」と「深度スケール検証」にのみ使います。\n"
-		               "   実機計測では rgb が fusion より 7〜14倍 安定でした。"
-		               "冒頭の指定フレームだけ3手法を計算し、実行後に比較レポートを出します (0 で無効)。",
+		          text="※ rgb = RGB画像の角だけで姿勢を出す。深度は表裏判定と深度スケール検証にのみ使用。\n"
+		               "   depth-corners = 角の位置の深度を読んで3D化。角は境界なので深度が最も荒れる。\n"
+		               "   fusion = マーカー面の深度に平面をあて、RGBの視線と交差させる。平面の法線が約3°ばらつく。\n"
+		               "   実機計測では rgb が最良。この設定は ④検出の実行時に効くので、変えたら ④ を押し直すこと。\n"
+		               "   冒頭の指定フレームだけ3手法を計算し、実行後に比較レポートを出します (0 で無効)。",
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=700, justify="left"
 		          ).grid(row=4, column=0, columnspan=4, sticky="w", padx=(20, 0))
 		ttk.Label(af, text="平面フィット範囲 (fusion 用・マーカー幅の倍率):").grid(
@@ -3500,6 +3531,9 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_rs_discard_frames": (self.ankle_rs_discard_frames, int),
 			"ankle_rs_manual_exposure": (self.ankle_rs_manual_exposure, bool),
 			"ankle_rs_exposure_val": (self.ankle_rs_exposure_val, int),
+			"ankle_rs_color_manual_exposure": (self.ankle_rs_color_manual_exposure, bool),
+			"ankle_rs_color_exposure_us": (self.ankle_rs_color_exposure_us, int),
+			"ankle_rs_color_gain": (self.ankle_rs_color_gain, int),
 			# 動作モード (原プラン/新プラン)
 			"ankle_workflow_mode": (self.ankle_workflow_mode, str),
 			"ankle_self_pose_world": (self.ankle_self_pose_world, str),
@@ -3742,6 +3776,11 @@ class MainMenuGUI(_BaseWindow):
 		return Path(__file__).with_name(filename)
 
 	def _save_ankle_state(self) -> None:
+		# 姿勢時系列も一緒に保存しておく (④の結果を次回起動へ引き継ぐ)
+		try:
+			self._ankle_autosave_all_pose_caches()
+		except Exception:
+			pass
 		try:
 			if getattr(self, "_ankle_tabs", None):
 				self._ankle_tabs[self._ankle_active_tab]['snapshot'] = self._ankle_snapshot_current()
@@ -3777,6 +3816,8 @@ class MainMenuGUI(_BaseWindow):
 			if self._ankle_active_tab < 0 or self._ankle_active_tab >= len(self._ankle_tabs):
 				self._ankle_active_tab = 0
 			self._ankle_restore_snapshot(self._ankle_tabs[self._ankle_active_tab].get("snapshot", {}))
+		# 姿勢時系列 (④の結果) も自動復元する
+		self._ankle_autoload_pose_caches()
 
 	# ---- ankle: Stage 2〜5 プレースホルダ ----
 	def _ankle_not_impl(self, feature: str) -> None:
@@ -5132,9 +5173,12 @@ class MainMenuGUI(_BaseWindow):
 			T_pnp_only = T.copy()
 
 			# 実測 (2026-08-29) で RGB のみが融合より 7〜14倍 安定だったため既定は "rgb"。
+			# 表示ラベル ("rgb  ★推奨 (最も安定)" 等) から手法名だけを取り出す
 			try:
-				method = str(self.ankle_pose_method.get())
+				method = str(self.ankle_pose_method.get()).strip().split()[0]
 			except Exception:
+				method = "rgb"
+			if method not in ("rgb", "fusion", "depth-corners"):
 				method = "rgb"
 			# 冒頭の一定フレームだけ 3手法を計算して比較レポートに回す
 			try:
@@ -5965,6 +6009,7 @@ class MainMenuGUI(_BaseWindow):
 
 		# キャッシュ保存 + ステータス更新
 		self._ankle_set_current_cache(cache)
+		self._ankle_autosave_pose_cache()      # 再起動しても引き継げるよう自動保存
 		self._ankle_update_detection_status()
 		msg = self._ankle_cache_status_text(cache)
 		if src_lines:
@@ -5972,6 +6017,126 @@ class MainMenuGUI(_BaseWindow):
 		messagebox.showinfo("検出完了", msg)
 
 	# ---- 姿勢時系列 保存/読込 (.npz) ----
+	# ---- 姿勢時系列の自動永続化 (再起動しても ④ の結果を引き継ぐ) ----
+	def _ankle_pose_cache_dir(self):
+		"""姿勢キャッシュの保存先ディレクトリ。無ければ作る。"""
+		d = Path(__file__).parent / "cache" / "ankle_pose"
+		d.mkdir(parents=True, exist_ok=True)
+		return d
+
+	def _ankle_pose_cache_path(self, tab_key: str):
+		"""試験タブ名から自動保存ファイルのパスを作る。
+
+		タブ名は日本語や記号を含みうるので、安全な文字だけ残した名前 + 短いハッシュにする。
+		(名前だけだと衝突しうるため、元の名前のハッシュを添える)
+		"""
+		import hashlib
+		key = str(tab_key or "default")
+		safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in key)[:40]
+		h = hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+		return self._ankle_pose_cache_dir() / f"pose_{safe}_{h}.npz"
+
+	def _ankle_autosave_pose_cache(self, tab_key: str = None) -> None:
+		"""現在タブの姿勢時系列を自動保存する。④の検出完了時と終了時に呼ばれる。"""
+		try:
+			key = tab_key if tab_key is not None else self._ankle_current_tab_key()
+			if not key:
+				return
+			cache = self._ankle_pose_cache.get(key)
+			path = self._ankle_pose_cache_path(key)
+			if not cache:
+				# キャッシュが消えていれば、古い保存も消して整合を保つ
+				if path.exists():
+					try:
+						path.unlink()
+					except Exception:
+						pass
+				return
+			self._ankle_save_pose_cache_npz(str(path), cache)
+			print(f"[ankle姿勢 自動保存] {path.name} "
+			      f"({int(cache.get('frame_count', 0))}フレーム)")
+		except Exception as e:
+			print(f"[ankle姿勢 自動保存] 失敗: {e}")
+
+	def _ankle_autosave_all_pose_caches(self) -> None:
+		"""全タブぶんを自動保存する (終了時)。"""
+		try:
+			for key in list(getattr(self, "_ankle_pose_cache", {}).keys()):
+				self._ankle_autosave_pose_cache(key)
+		except Exception as e:
+			print(f"[ankle姿勢 自動保存] 一括保存に失敗: {e}")
+
+	def _ankle_autoload_pose_caches(self) -> None:
+		"""起動時に、各試験タブの姿勢時系列を自動復元する。
+
+		復元後に「今の②設定と食い違っていないか」を検査し、違えば警告を出す。
+		(マーカー実寸や辞書を変えたのに古い検出結果を使い続ける事故を防ぐ)
+		"""
+		try:
+			tabs = getattr(self, "_ankle_tabs", []) or []
+			restored = []
+			for tab in tabs:
+				key = tab.get("name", "")
+				if not key:
+					continue
+				path = self._ankle_pose_cache_path(key)
+				if not path.exists():
+					continue
+				try:
+					cache = self._ankle_load_pose_cache_npz(str(path))
+				except Exception as e:
+					print(f"[ankle姿勢 自動復元] {path.name} 読込失敗: {e}")
+					continue
+				self._ankle_pose_cache[key] = cache
+				restored.append((key, int(cache.get("frame_count", 0)), cache))
+			if restored:
+				print("=" * 70)
+				print(f"[ankle姿勢 自動復元] {len(restored)} タブぶんの検出結果を復元しました")
+				for key, n, cache in restored:
+					src = Path(str(cache.get("source", ""))).name
+					print(f"    {key}: {n} フレーム  (元データ: {src})")
+				print("  ※ ②の設定を変えた場合は ④ を再実行してください")
+				print("=" * 70)
+			self._ankle_warn_if_cache_stale()
+		except Exception as e:
+			print(f"[ankle姿勢 自動復元] 失敗: {e}")
+
+	def _ankle_warn_if_cache_stale(self) -> None:
+		"""復元したキャッシュが現在の②設定と食い違っていないか検査して警告する。"""
+		try:
+			cache = self._ankle_get_current_cache()
+			if not cache:
+				return
+			issues = []
+			try:
+				cur_size = float(self.ankle_marker_size_mm.get())
+				old_size = float(cache.get("marker_size_mm", cur_size))
+				if abs(cur_size - old_size) > 1e-6:
+					issues.append(f"マーカー実寸 {old_size} mm → 現在 {cur_size} mm")
+			except Exception:
+				pass
+			try:
+				cur_dict = str(self.ankle_aruco_dict_var.get())
+				old_dict = str(cache.get("aruco_dict", cur_dict))
+				if cur_dict != old_dict:
+					issues.append(f"ArUco辞書 {old_dict} → 現在 {cur_dict}")
+			except Exception:
+				pass
+			try:
+				src = str(cache.get("source", ""))
+				cur_src = self.ankle_depth_path.get().strip() or self.ankle_video_path.get().strip()
+				if src and cur_src and Path(src).name != Path(cur_src).name:
+					issues.append(f"元データ {Path(src).name} → 現在 {Path(cur_src).name}")
+			except Exception:
+				pass
+			if issues:
+				print("[ankle姿勢] [警告] 復元した検出結果は現在の設定と異なります:")
+				for it in issues:
+					print(f"    - {it}")
+				print("    → ④ ArUco検出+PnP実行 を押し直すことを推奨します")
+		except Exception:
+			pass
+
 	def _ankle_save_pose_cache_npz(self, path: str, cache: dict) -> None:
 		"""キャッシュを .npz に保存。"""
 		import numpy as np
@@ -6677,6 +6842,7 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			messagebox.showerror("読込エラー", f"読込に失敗しました:\n{e}"); return
 		self._ankle_set_current_cache(cache)
+		self._ankle_autosave_pose_cache()      # 手動読込も次回起動に引き継ぐ
 		self.ankle_pose_series_path.set(path)
 		self._ankle_update_detection_status()
 		messagebox.showinfo("読込完了", self._ankle_cache_status_text(cache))
@@ -8596,6 +8762,69 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			print(f"[ankle rs] 露光設定エラー: {e}")
 
+	def _ankle_rs_configure_color_exposure(self, profile):
+		"""カラーセンサーの露光/ゲインを設定する。
+
+		【なぜ重要か】ArUco の姿勢精度を最も悪化させるのはモーションブラー。
+		実測 (合成, 20mm@220mm) ではブラー 4px で回転誤差 2.1倍、
+		8px で 8.3倍かつ検出率 29% まで低下した。
+		ブラー[px] = マーカーの画面上の速度[px/s] x 露光[s] なので、
+		fps を上げるよりも **露光を直接短くする** のが本筋。
+		(fps は露光の上限を決めるだけで、露光そのものではない)
+
+		露光を詰めると暗くなるため、ゲインで補うか照明を明るくする。
+		"""
+		import pyrealsense2 as rs
+		try:
+			color_sensor = None
+			for sensor in profile.get_device().query_sensors():
+				try:
+					if sensor.get_info(rs.camera_info.name).lower().find("rgb") >= 0:
+						color_sensor = sensor
+						break
+				except Exception:
+					continue
+			if color_sensor is None:
+				# 名前で見つからない場合は color ストリームを持つセンサーを探す
+				for sensor in profile.get_device().query_sensors():
+					try:
+						if any(sp.stream_type() == rs.stream.color
+						       for sp in sensor.get_stream_profiles()[:50]):
+							color_sensor = sensor
+							break
+					except Exception:
+						continue
+			if color_sensor is None:
+				print("[ankle rs] カラーセンサーが見つかりません - 露光は自動のまま")
+				return
+
+			if bool(self.ankle_rs_color_manual_exposure.get()):
+				exp_us = int(self.ankle_rs_color_exposure_us.get())
+				gain = int(self.ankle_rs_color_gain.get())
+				if color_sensor.supports(rs.option.enable_auto_exposure):
+					color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+				if color_sensor.supports(rs.option.exposure):
+					rng = color_sensor.get_option_range(rs.option.exposure)
+					exp_us = int(max(rng.min, min(rng.max, exp_us)))
+					color_sensor.set_option(rs.option.exposure, float(exp_us))
+					print(f"[ankle rs] Color Exposure = {exp_us} us ({exp_us/1000.0:.2f} ms) [手動]")
+					print(f"           マーカーが 60 px/s で動く場合のブラー目安: "
+					      f"{60.0 * exp_us / 1e6:.2f} px")
+				else:
+					print("[ankle rs] 警告: カラーの手動露光がサポートされていません")
+				if color_sensor.supports(rs.option.gain):
+					rng = color_sensor.get_option_range(rs.option.gain)
+					gain = int(max(rng.min, min(rng.max, gain)))
+					color_sensor.set_option(rs.option.gain, float(gain))
+					print(f"[ankle rs] Color Gain = {gain}")
+			else:
+				if color_sensor.supports(rs.option.enable_auto_exposure):
+					color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+				print("[ankle rs] Color Auto Exposure ON "
+				      "(暗いと露光が伸びてモーションブラーが乗ります)")
+		except Exception as e:
+			print(f"[ankle rs] カラー露光設定エラー: {e}")
+
 	def on_ankle_rs_test_connection(self) -> None:
 		"""D405の接続を確認し、シリアル/内部パラメータ/深度スケールを表示。"""
 		if not self._ankle_check_rs():
@@ -9008,12 +9237,16 @@ class MainMenuGUI(_BaseWindow):
 			            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 0), 2, cv2.LINE_AA)
 			return out, n_det
 
-		# 露光設定
+		# 露光設定 (深度 + カラー)
 		try:
 			depth_sensor = profile.get_device().first_depth_sensor()
 			self._ankle_rs_configure_depth_exposure(depth_sensor)
 		except Exception as e:
-			print(f"[ankle rs] 露光設定失敗: {e}")
+			print(f"[ankle rs] 深度露光設定失敗: {e}")
+		try:
+			self._ankle_rs_configure_color_exposure(profile)
+		except Exception as e:
+			print(f"[ankle rs] カラー露光設定失敗: {e}")
 
 		# 破棄フレーム数
 		try:
