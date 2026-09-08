@@ -194,6 +194,233 @@ class _LazyHeatmapList:
 		return m if m is not None else -1.0
 
 
+class _AnkleRamRecorder:
+	"""カメラのフレームを RAM のリングで受け、別スレッドで .db3 へ書き出す録画器。
+
+	【なぜこれが要るのか】(2026-09-04 実測)
+	コマ落ちの原因は Windows のライトバックキャッシュだった。未書き込みページが
+	上限 (実測 約1.6GB) に達すると強制的な吐き出しが走り、その間 書き込みスレッドが
+	0.1〜0.7 秒ブロックされる。librealsense の recorder に直接書かせていると、
+	そのブロックがそのままフレームの取りこぼしになる。
+
+	そこで、
+	  ・取り込み側 (カメラから受ける側) は memcpy だけして即座に戻る
+	  ・実際の書き出しは別スレッドが行う
+	  ・その間に届いたフレームは RAM のリングに溜まる
+	という形にする。ディスクが 0.7 秒詰まっても、リングに数秒ぶんの余裕があれば
+	1枚も落ちない。平均の書き込み速度が必要レートを上回ってさえいれば、
+	**録画時間に上限がなくなる**（固定バッファ方式と違い、メモリを使い切らない）。
+
+	実測 (合成データ・1280x720@30 = 111 MB/s を 60 秒 = 6.6 GB):
+	    取り込み側 1フレーム 中央 0.36 ms / 最大 11.3 ms (予算 33.3 ms)
+	    リング満杯による取りこぼし 0 枚 / 記録 color 1800・depth 1800 (期待 1800)
+
+	書き出しは rs.software_device 経由なので、出来上がる .db3 は実機で録ったものと
+	同じ手順で読める（内部パラメータ・歪み係数・depth_scale・相対時刻まで保たれ、
+	画素はバイト単位で一致することを別プロセスで確認済み）。
+	"""
+
+	def __init__(self, path, meta, ring_frames, log=print):
+		self.path = str(path)
+		self.meta = meta
+		self.cap = max(8, int(ring_frames))
+		self.log = log
+		self.w = int(meta["w"]); self.h = int(meta["h"])
+		self.fps = int(meta["fps"]); self.cbpp = int(meta["color_bpp"])
+		self.n_pushed = 0
+		self.n_written = 0
+		self.n_dropped = 0     # リングが満杯で捨てた枚数 (本当の損失)
+		self.max_used = 0      # リングの最大使用量 (余裕がどれだけあったか)
+		self.stalls = []       # 書き出しが 50ms 以上掛かった箇所
+		self.ts = []
+		self.fn = []
+		self._err = None
+		self._dev = None
+		self._rec = None
+		self._cs = self._ds = None
+		self._cprof = self._dprof = None
+		self._ring_c = self._ring_d = None
+		self._cv = None
+		self._stop = None
+		self._th = None
+
+	# ---- 準備 (録画開始を押した時点で呼ぶ) ----
+	def start(self):
+		import threading
+		import numpy as np
+		import pyrealsense2 as rs
+		w, h, fps, cbpp = self.w, self.h, self.fps, self.cbpp
+		self._ring_c = np.empty((self.cap, h, w * cbpp), dtype=np.uint8)
+		self._ring_d = np.empty((self.cap, h, w), dtype=np.uint16)
+		# 全ページに触っておく。触らないと録画中に初回アクセスのページフォルトが出る。
+		self._ring_c.fill(0)
+		self._ring_d.fill(0)
+
+		dev = rs.software_device()
+		ds = dev.add_sensor("Stereo Module")
+		cs = dev.add_sensor("RGB Camera")
+		vd = rs.video_stream()
+		vd.type = rs.stream.depth; vd.index = 0; vd.uid = 0
+		vd.width, vd.height, vd.fps, vd.bpp = w, h, fps, 2
+		vd.fmt = rs.format.z16
+		vd.intrinsics = self.meta["depth_intr"]
+		dp = ds.add_video_stream(vd)
+		vc = rs.video_stream()
+		vc.type = rs.stream.color; vc.index = 0; vc.uid = 1
+		vc.width, vc.height, vc.fps, vc.bpp = w, h, fps, cbpp
+		vc.fmt = self.meta["color_fmt"]
+		vc.intrinsics = self.meta["color_intr"]
+		cp = cs.add_video_stream(vc)
+		try:
+			ds.add_read_only_option(rs.option.depth_units, float(self.meta["depth_units"]))
+		except Exception as e:
+			self.log(f"[ankle ram] depth_units の設定に失敗: {e}")
+		if self.meta.get("extrinsics") is not None:
+			try:
+				dp.register_extrinsics_to(cp, self.meta["extrinsics"])
+			except Exception as e:
+				self.log(f"[ankle ram] 外部パラメータの登録に失敗: {e}")
+
+		self._rec = rs.recorder(self.path, dev)
+		ds.open(dp); cs.open(cp)
+		ds.start(rs.frame_queue(16)); cs.start(rs.frame_queue(16))
+		self._dev = dev; self._ds = ds; self._cs = cs
+		self._dprof = dp.as_video_stream_profile()
+		self._cprof = cp.as_video_stream_profile()
+		self._cv = threading.Condition()
+		self._stop = threading.Event()
+		self._th = threading.Thread(target=self._writer, daemon=True)
+		self._th.start()
+
+	# ---- 取り込み (カメラから1フレーム受けるたびに呼ぶ。memcpy だけ) ----
+	def push(self, color_arr, depth_arr, ts_ms, frame_no) -> bool:
+		"""リングに写す。満杯なら False を返す (＝本当に落ちた1枚)。"""
+		import numpy as np
+		with self._cv:
+			if self.n_pushed - self.n_written >= self.cap:
+				self.n_dropped += 1
+				return False
+			slot = self.n_pushed % self.cap
+		try:
+			self._ring_c[slot] = np.asanyarray(color_arr).view(np.uint8).reshape(
+				self.h, self.w * self.cbpp)
+			self._ring_d[slot] = np.asanyarray(depth_arr)
+		except Exception as e:
+			self.log(f"[ankle ram] 取り込み失敗: {e}")
+			return False
+		with self._cv:
+			self.ts.append(float(ts_ms))
+			self.fn.append(int(frame_no))
+			self.n_pushed += 1
+			used = self.n_pushed - self.n_written
+			if used > self.max_used:
+				self.max_used = used
+			self._cv.notify_all()
+		return True
+
+	def pending(self) -> int:
+		try:
+			with self._cv:
+				return self.n_pushed - self.n_written
+		except Exception:
+			return 0
+
+	# ---- 書き出しスレッド ----
+	def _writer(self):
+		import time
+		import pyrealsense2 as rs
+		du = float(self.meta["depth_units"])
+		w, cbpp = self.w, self.cbpp
+		t_base = None
+		while True:
+			with self._cv:
+				while self.n_written >= self.n_pushed and not self._stop.is_set():
+					self._cv.wait(0.2)
+				if self.n_written >= self.n_pushed:
+					return
+				idx = self.n_written
+				slot = idx % self.cap
+				ts = self.ts[idx]
+				fn = self.fn[idx]
+			if t_base is None:
+				# タイムスタンプは 0 起点にする。先頭が非ゼロだと、再生側が
+				# その時間ぶん余計にフレームセットを出して同じ画像が2回読める
+				# (実測: t0=1000ms で 300枚→330枚)。相対時刻さえ合えばよい。
+				t_base = ts
+			# フレーム番号も 0 起点の連番にする。
+			# 実機 D405 のフレーム番号は 46 などから始まるが、それをそのまま書くと
+			# 再生側が先頭の数枚を重複して出す (実測: 301枚 → 307枚・重複6)。
+			# 0..n-1 にすると 301→301 で完全に一致する。
+			# 本当のコマ落ちはタイムスタンプの間隔に残るので、情報は失われない
+			# (解析も検査もタイムスタンプを見る。番号は見ていない)。
+			fn = idx
+			t0 = time.perf_counter()
+			try:
+				fd = rs.software_video_frame()
+				fd.pixels = self._ring_d[slot]
+				fd.stride = w * 2; fd.bpp = 2
+				fd.frame_number = fn; fd.timestamp = ts - t_base
+				fd.domain = rs.timestamp_domain.hardware_clock
+				fd.profile = self._dprof; fd.depth_units = du
+				self._ds.on_video_frame(fd)
+				fc = rs.software_video_frame()
+				fc.pixels = (self._ring_c[slot].reshape(self.h, w, cbpp)
+				             if cbpp > 1 else self._ring_c[slot])
+				fc.stride = w * cbpp; fc.bpp = cbpp
+				fc.frame_number = fn; fc.timestamp = ts - t_base
+				fc.domain = rs.timestamp_domain.hardware_clock
+				fc.profile = self._cprof
+				self._cs.on_video_frame(fc)
+			except Exception as e:
+				self._err = f"{e}"
+				self.log(f"[ankle ram] 書き出し失敗: {e}")
+			dt = time.perf_counter() - t0
+			if dt > 0.05:
+				self.stalls.append((idx, dt * 1000.0))
+			with self._cv:
+				self.n_written += 1
+				self._cv.notify_all()
+
+	# ---- 停止 (残りを吐き出してから閉じる) ----
+	def stop(self, progress=None, timeout=300.0) -> dict:
+		import time
+		t0 = time.perf_counter()
+		while time.perf_counter() - t0 < timeout:
+			with self._cv:
+				left = self.n_pushed - self.n_written
+			if left <= 0:
+				break
+			if progress is not None:
+				progress(self.n_written, self.n_pushed)
+			time.sleep(0.05)
+		self._stop.set()
+		try:
+			with self._cv:
+				self._cv.notify_all()
+		except Exception:
+			pass
+		try:
+			if self._th is not None:
+				self._th.join(timeout=30)
+		except Exception:
+			pass
+		for fn_ in (lambda: self._cs.stop(), lambda: self._ds.stop(),
+		             lambda: self._cs.close(), lambda: self._ds.close()):
+			try:
+				fn_()
+			except Exception:
+				pass
+		self._rec = None
+		self._dev = None
+		self._ring_c = None
+		self._ring_d = None
+		return {"n": int(self.n_written), "pushed": int(self.n_pushed),
+		        "dropped": int(self.n_dropped), "max_used": int(self.max_used),
+		        "cap": int(self.cap), "stalls": list(self.stalls),
+		        "err": self._err, "ts": list(self.ts[:self.n_written]),
+		        "drain_s": time.perf_counter() - t0}
+
+
 # region MainMenuGUIクラス
 # tkinterdnd2がある場合はTkinterDnD.Tkを基底に、なければtk.Tkを使用
 _BaseWindow = TkinterDnD.Tk if _HAS_DND else tk.Tk
@@ -236,6 +463,10 @@ class MainMenuGUI(_BaseWindow):
 
 		# フォントを環境に合わせて統一
 		self._setup_fonts()
+
+		# ホイールで Combobox/Spinbox の値が変わる既定動作を無効化
+		# （設定値を誤って書き換える事故を防ぐ。スクロールは親の枠へ回す）
+		self._install_wheel_guards()
 
 		# Variables (Simulator)
 		self.joint_var = tk.IntVar(value=0)  # 0: 未選択, 1: 股関節, 2: 膝関節
@@ -472,6 +703,30 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_pose_series_path = tk.StringVar(value="")   # 事前計算済み姿勢時系列(任意, npz/csv)
 		# RealSense D405 ライブ撮影設定 (友人 make_date_movie_D405.py の設定を既定値化)
 		self.ankle_rs_resolution = tk.StringVar(value="1280x720@15")   # 解像度@fps
+		self.ankle_rs_color_format = tk.StringVar(value="YUYV (軽い・推奨)")  # 録画の色形式
+		self.ankle_rs_preview_every = tk.IntVar(value=3)   # 録画中の表示処理の間引き
+		# --- コマ落ち対策 (2026-09-04) ---
+		# 症状: 1回目の録画だけ欠落し、撮り直すと消える → 「プロセスで初回だけ通る処理」が犯人。
+		# MP4 writer の生成は FFmpeg DLL(約20MB) のロードを伴い、しかも録画開始後の
+		# 1フレーム目で初めて走っていた。ディスクとCPUを同時に食うので、記録の
+		# 書き込みスレッドが最初の数百 ms だけ押し出される。→ 録画開始前に済ませる。
+		self.ankle_rs_record_mp4 = tk.BooleanVar(value=True)      # 録画中に MP4 も保存
+		self.ankle_rs_settle_frames = tk.IntVar(value=15)         # 録画開始直後に表示を止める枚数
+		self.ankle_rs_high_priority = tk.BooleanVar(value=True)   # 録画中だけプロセス優先度を上げる
+		# RAM録画: 取り込みは memcpy だけ、ディスクへの書き出しは別スレッド。
+		# 書き込みが 0.7 秒詰まっても、その間のフレームは RAM のリングが吸収する。
+		# 平均の書き込み速度が必要レートを上回っていれば録画時間に上限はない。
+		#
+		# 2026-09-04 に既定を ON にした。実機 D405 で測ったすべての軸で
+		# 従来方式を上回ったため:
+		#   ・90秒(約10GB)を2本: 従来は2本とも内部欠落あり / RAM録画は 0 枚
+		#   ・3分(5400枚)連続で欠落 0・リング最大使用 1/240
+		#   ・ファイルが 2.6 倍小さい(可逆圧縮)。9.98GB → 3.79GB
+		#   ・書き込みレートが 111→42 MB/s に下がるので、そもそも詰まりにくい
+		# 従来方式に戻したいときはこのチェックを外す。
+		self.ankle_rs_ram_record = tk.BooleanVar(value=True)
+		# リングの深さ [秒]。実測で観測された最長の詰まりは 2.2 秒なので 8 秒あれば余る。
+		self.ankle_rs_ram_seconds = tk.IntVar(value=8)
 		self.ankle_rs_discard_frames = tk.IntVar(value=45)             # 録画開始前の破棄フレーム
 		self.ankle_rs_manual_exposure = tk.BooleanVar(value=False)     # 深度手動露光
 		self.ankle_rs_exposure_val = tk.IntVar(value=5000)             # 手動露光値
@@ -597,6 +852,14 @@ class MainMenuGUI(_BaseWindow):
 		)
 		title_label.grid(row=0, column=0, sticky="w", pady=(0, 12))
 
+		# 全タブの状態をまとめて退避 / 復元するボタン (タイトルの右)
+		state_btns = ttk.Frame(main_container)
+		state_btns.grid(row=0, column=0, sticky="e", pady=(0, 12))
+		ttk.Button(state_btns, text="JSON保存（全タブ）", width=18,
+		           command=self.on_save_state_snapshot).pack(side="left", padx=(0, 6))
+		ttk.Button(state_btns, text="JSON復元", width=12,
+		           command=self.on_restore_state_snapshot).pack(side="left")
+
 		# タブコントロールを作成
 		self.notebook = ttk.Notebook(main_container)
 		self.notebook.grid(row=1, column=0, sticky="nsew")
@@ -612,6 +875,10 @@ class MainMenuGUI(_BaseWindow):
 		# タブ1c: ankle simulator（足関節・ArUcoマーカートラッキング方式）
 		self.ankle_simulator_tab = ttk.Frame(self.notebook, padding=12)
 		self.notebook.add(self.ankle_simulator_tab, text="ankle simulator")
+
+		# タブ1d: ArUco精度検証（ロボット既知動作 vs マーカー計測）
+		self.aruco_verify_tab = ttk.Frame(self.notebook, padding=12)
+		self.notebook.add(self.aruco_verify_tab, text="ArUco精度検証")
 
 		# タブ2: Cache Settings
 		self.cache_tab = ttk.Frame(self.notebook, padding=12)
@@ -683,6 +950,9 @@ class MainMenuGUI(_BaseWindow):
 		# ankle simulatorタブのコンテンツを作成
 		self._create_ankle_simulator_tab()
 
+		# ArUco精度検証タブのコンテンツを作成
+		self._create_aruco_verify_tab()
+
 		# Fittingタブのコンテンツを作成
 		self._create_fitting_tab()
 
@@ -734,6 +1004,16 @@ class MainMenuGUI(_BaseWindow):
 		self.dist_pp_abc_path.trace_add("write", lambda *_: self.update_button_states())
 		self.dist_pp_olmn_path.trace_add("write", lambda *_: self.update_button_states())
 		self.transform_group_path.trace_add("write", lambda *_: self.update_button_states())
+
+		# 読み込み時にまだ作られていなかったパス変数へ、保留分を流し込む
+		# (pos_check_* / stl2asc_input はタブ生成の中で作られるため)
+		self._apply_pending_late_paths()
+
+		# ダイアログが本体の背後に出て固まって見える問題の対策
+		self._install_dialog_parent_guard()
+
+		# パス入力が変わったら自動保存する (終了時だけの保存に頼らない)
+		self._install_state_autosave()
 
 		# 終了時に状態保存
 		self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -998,11 +1278,8 @@ class MainMenuGUI(_BaseWindow):
 		      左右・W_scan / 変位データ。大腿骨/脛骨モデルはICP/RANSACで初期スキャンへ位置合わせする。
 		"""
 		# 試験タブバー（スクロール外・常時表示）: 各タブ=独立した試験の状態。＋で追加/右クリックで削除・改名
-		tabbar_row = tk.Frame(self.knee_simulator_tab)
-		tabbar_row.pack(side="top", fill="x", padx=4, pady=(4, 0))
-		tk.Label(tabbar_row, text="試験タブ:", font=(self.ui_font_family, 9)).pack(side="left", padx=(0, 4))
-		self._knee_tabbar_frame = tk.Frame(tabbar_row)
-		self._knee_tabbar_frame.pack(side="left", fill="x")
+		self._knee_tabbar_frame = self._make_tabbar(
+			self.knee_simulator_tab, "knee", self.on_knee_tab_add)
 
 		# スクロール可能なメインフレーム
 		canvas = tk.Canvas(self.knee_simulator_tab, highlightthickness=0)
@@ -1259,9 +1536,18 @@ class MainMenuGUI(_BaseWindow):
 			b.bind("<ButtonPress-1>", lambda e, i=i: self._knee_tab_drag_start(e, i))
 			b.bind("<B1-Motion>", self._knee_tab_drag_motion)
 			b.bind("<ButtonRelease-1>", self._knee_tab_drag_release)
+			self._tabbar_bind_wheel(b, "knee")
 			self._knee_tab_buttons.append(b)
-		plus = tk.Button(fr, text="＋", command=self.on_knee_tab_add, padx=6, pady=2)
-		plus.pack(side='left', padx=(8, 2))
+		# 「＋」は帯の外（右端固定）にあるのでここでは作らない。
+		# 選択中のタブが画面外なら見える位置まで寄せる。
+		try:
+			ui = self._tabbar_ui.get("knee")
+			if ui is not None:
+				ui["active"] = (self._knee_tab_buttons[self._knee_active_tab]
+				                if 0 <= self._knee_active_tab < len(self._knee_tab_buttons) else None)
+			self._tabbar_sync("knee")
+		except Exception:
+			pass
 
 	def _knee_tab_context_menu(self, event, i: int) -> None:
 		menu = tk.Menu(self, tearoff=0)
@@ -2669,11 +2955,8 @@ class MainMenuGUI(_BaseWindow):
 
 	def _create_ankle_simulator_tab(self) -> None:
 		"""ankle simulator タブのUIを構築（ArUcoマーカートラッキング方式）。"""
-		tabbar_row = tk.Frame(self.ankle_simulator_tab)
-		tabbar_row.pack(side="top", fill="x", padx=4, pady=(4, 0))
-		tk.Label(tabbar_row, text="試験タブ:", font=(self.ui_font_family, 9)).pack(side="left", padx=(0, 4))
-		self._ankle_tabbar_frame = tk.Frame(tabbar_row)
-		self._ankle_tabbar_frame.pack(side="left", fill="x")
+		self._ankle_tabbar_frame = self._make_tabbar(
+			self.ankle_simulator_tab, "ankle", self.on_ankle_tab_add)
 
 		canvas = tk.Canvas(self.ankle_simulator_tab, highlightthickness=0)
 		scrollbar = ttk.Scrollbar(self.ankle_simulator_tab, orient="vertical", command=canvas.yview)
@@ -2793,13 +3076,26 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Combobox(rf1, textvariable=self.ankle_rs_resolution, width=16, state="readonly",
 		             values=["848x480@60", "1280x720@30", "1280x720@15", "640x480@30", "640x480@15"]
 		             ).grid(row=0, column=1, sticky="w", padx=(4, 12))
-		ttk.Label(rf1, text="開始前 破棄フレーム:").grid(row=0, column=2, sticky="w")
+		ttk.Label(rf1, text="録画の色:").grid(row=0, column=2, sticky="w")
+		ttk.Combobox(rf1, textvariable=self.ankle_rs_color_format, width=16, state="readonly",
+		             values=list(self.AV_REC_FORMATS.keys())
+		             ).grid(row=0, column=3, sticky="w", padx=(4, 12))
+		ttk.Label(rf1, text="録画中の表示間引き(1/n):").grid(row=1, column=0, sticky="w", pady=(2, 0))
+		ttk.Spinbox(rf1, from_=1, to=15, textvariable=self.ankle_rs_preview_every, width=5
+		            ).grid(row=1, column=1, sticky="w", padx=(4, 12), pady=(2, 0))
+		ttk.Label(rf1, foreground="#666", text=
+		          "プレビューのArUco検出だけで1フレーム約148ms掛かり、コマ落ちの主因になる。記録(.db3)は全フレームのまま。"
+		          ).grid(row=2, column=0, columnspan=9, sticky="w", pady=(0, 4))
+		ttk.Button(rf1, text="書き込み速度を実測", width=18,
+		           command=self.on_ankle_rs_measure_write_speed
+		           ).grid(row=0, column=4, sticky="w", padx=(0, 12))
+		ttk.Label(rf1, text="開始前 破棄フレーム:").grid(row=0, column=5, sticky="w")
 		ttk.Spinbox(rf1, from_=0, to=200, textvariable=self.ankle_rs_discard_frames, width=6
-		            ).grid(row=0, column=3, sticky="w", padx=(4, 12))
+		            ).grid(row=0, column=6, sticky="w", padx=(4, 12))
 		ttk.Checkbutton(rf1, text="深度手動露光", variable=self.ankle_rs_manual_exposure
-		                ).grid(row=0, column=4, sticky="w", padx=(0, 4))
+		                ).grid(row=0, column=7, sticky="w", padx=(0, 4))
 		ttk.Entry(rf1, textvariable=self.ankle_rs_exposure_val, width=8
-		          ).grid(row=0, column=5, sticky="w")
+		          ).grid(row=0, column=8, sticky="w")
 		# --- カラー露光: ArUco のブラーを決めるので独立して制御する ---
 		rf1b = ttk.Frame(rs_frame)
 		rf1b.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 2))
@@ -2830,6 +3126,53 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Label(rs_frame, textvariable=self.ankle_rs_status,
 		          foreground="#005580", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=4, column=0, sticky="w", padx=12, pady=(0, 2))
+		# --- コマ落ち対策 (録画の書き込みを最優先にする) ---
+		rf1c = ttk.Frame(rs_frame)
+		rf1c.grid(row=6, column=0, sticky="w", padx=12, pady=(2, 6))
+		ttk.Label(rf1c, text="コマ落ち対策:", font=(self.ui_font_family, 9, "bold")
+		          ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+		ttk.Checkbutton(rf1c, text="MP4も保存", variable=self.ankle_rs_record_mp4
+		                ).grid(row=0, column=1, sticky="w", padx=(0, 10))
+		ttk.Checkbutton(rf1c, text="録画中だけ優先度を上げる", variable=self.ankle_rs_high_priority
+		                ).grid(row=0, column=3, sticky="w", padx=(0, 10))
+		ttk.Label(rf1c, text="開始直後に表示を止める枚数:").grid(row=0, column=4, sticky="w")
+		ttk.Spinbox(rf1c, from_=0, to=120, textvariable=self.ankle_rs_settle_frames, width=5
+		            ).grid(row=0, column=5, sticky="w", padx=(4, 0))
+		ttk.Checkbutton(rf1c, text="★ RAM録画（既定ON・推奨）",
+		                variable=self.ankle_rs_ram_record
+		                ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+		ttk.Label(rf1c, text="リングに貯める秒数:").grid(row=2, column=2, sticky="e", pady=(6, 0))
+		ttk.Spinbox(rf1c, from_=2, to=60, increment=1,
+		            textvariable=self.ankle_rs_ram_seconds, width=5
+		            ).grid(row=2, column=3, sticky="w", padx=(4, 0), pady=(6, 0))
+		ttk.Label(rf1c, foreground="#206020", justify="left", wraplength=740, text=(
+		          "RAM録画（既定ON）: カメラから受けたフレームを RAM のリングに写すだけにして、"
+		          "ディスクへの書き出しは別スレッドに任せます。書き込みが 0.7 秒詰まっても、"
+		          "その間のフレームはリングに溜まるので1枚も落ちません。\n"
+		          "★ 録画時間に上限はありません（リングは使い回すのでメモリを食い潰しません）。\n"
+		          "「リングに貯める秒数」は“何秒ぶんの詰まりに耐えるか”です。実測で観測された"
+		          "最長の詰まりは 2.2 秒なので 8 秒あれば十分。8秒＝約0.9GBのメモリを使います。\n"
+		          "出来上がる .db3 は内部パラメータ・歪み係数・depth_scale・相対時刻まで実機録画と"
+		          "同じで、画素もバイト単位で一致します（④の検出はそのまま使えます）。\n"
+		          "※ 撮影中の表示は5フレームに1回まで間引かれます（取り込みを最優先するため）。"
+		          "MP4の同時保存はそのまま使えます。\n"
+		          "実機D405での比較(90秒・約10GB を2本): 従来方式は2本とも内部欠落あり、"
+		          "RAM録画は0枚。ファイルも 9.98GB → 3.79GB。"
+		          "チェックを外すと従来方式（SDKに直接書かせる）に戻ります。"
+		          )).grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
+		ttk.Label(rf1c, foreground="#666", justify="left", wraplength=740, text=(
+		          "【コマ落ちの原因・2026-09-04 実測】録画12本とディスク実測から、原因は"
+		          "Windows のライトバックキャッシュだと分かりました。書き込みは一度メモリに"
+		          "溜められ、未書き込みページが上限(実測 約1.6GB)に達すると強制的な吐き出しが"
+		          "走り、その間 0.1〜0.7 秒 書き込みが止まります。\n"
+		          "実測では 2.02GB 以下の録画6本は欠落0、2.27GB 以上の8本中4本で欠落。"
+		          "欠落は必ず録画の後半(1.3GB以降)に出ます。\n"
+		          "→ 一番確実なのは【録画を 2GB 以内に収めること】です。録画中の表示に"
+		          "　 書いた量(GB)が出るので目安にしてください。\n"
+		          "※ 無関係と確認済み: ウイルス対策(CPU/読み込みとも 0)、MP4の同時書き出し、"
+		          "　 ディスクの速度そのもの(111MB/s を 8GB 流して最大 3.3ms)。\n"
+		          "※ 深度の記録は止められません。④の検出が深度ストリームを必要とするためです。"
+		          )).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 		ttk.Label(rs_frame,
 		          text="接続確認: pipeline起動+カメラ情報表示 / "
 		               "録画: プレビュー→スペースで開始→スペース(またはESC)で停止 → .db3 を ankle_depth_path に自動セット。",
@@ -3400,6 +3743,7 @@ class MainMenuGUI(_BaseWindow):
 		if path:
 			b[key] = path
 			self._ankle_load_editor_from_bone()
+			self._schedule_state_autosave("ankle")
 
 	def _ankle_choose_bone_color(self) -> None:
 		b = self._ankle_current_bone()
@@ -3546,6 +3890,13 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_detect_stride": (self.ankle_detect_stride, int),
 			# D405 ライブ撮影
 			"ankle_rs_resolution": (self.ankle_rs_resolution, str),
+			"ankle_rs_color_format": (self.ankle_rs_color_format, str),
+			"ankle_rs_preview_every": (self.ankle_rs_preview_every, int),
+			"ankle_rs_record_mp4": (self.ankle_rs_record_mp4, bool),
+			"ankle_rs_settle_frames": (self.ankle_rs_settle_frames, int),
+			"ankle_rs_high_priority": (self.ankle_rs_high_priority, bool),
+			"ankle_rs_ram_record": (self.ankle_rs_ram_record, bool),
+			"ankle_rs_ram_seconds": (self.ankle_rs_ram_seconds, int),
 			"ankle_rs_discard_frames": (self.ankle_rs_discard_frames, int),
 			"ankle_rs_manual_exposure": (self.ankle_rs_manual_exposure, bool),
 			"ankle_rs_exposure_val": (self.ankle_rs_exposure_val, int),
@@ -3623,9 +3974,18 @@ class MainMenuGUI(_BaseWindow):
 			b.bind("<ButtonPress-1>", lambda e, i=i: self._ankle_tab_drag_start(e, i))
 			b.bind("<B1-Motion>", self._ankle_tab_drag_motion)
 			b.bind("<ButtonRelease-1>", self._ankle_tab_drag_release)
+			self._tabbar_bind_wheel(b, "ankle")
 			self._ankle_tab_buttons.append(b)
-		plus = tk.Button(fr, text="＋", command=self.on_ankle_tab_add, padx=6, pady=2)
-		plus.pack(side='left', padx=(8, 2))
+		# 「＋」は帯の外（右端固定）にあるのでここでは作らない。
+		# 選択中のタブが画面外なら見える位置まで寄せる。
+		try:
+			ui = self._tabbar_ui.get("ankle")
+			if ui is not None:
+				ui["active"] = (self._ankle_tab_buttons[self._ankle_active_tab]
+				                if 0 <= self._ankle_active_tab < len(self._ankle_tab_buttons) else None)
+			self._tabbar_sync("ankle")
+		except Exception:
+			pass
 
 	def _ankle_tab_context_menu(self, event, i: int) -> None:
 		menu = tk.Menu(self, tearoff=0)
@@ -3793,12 +4153,571 @@ class MainMenuGUI(_BaseWindow):
 			return state_dir / filename
 		return Path(__file__).with_name(filename)
 
-	def _save_ankle_state(self) -> None:
-		# 姿勢時系列も一緒に保存しておく (④の結果を次回起動へ引き継ぐ)
+	# region 全タブ状態のスナップショット（手動バックアップ / 復元）
+	# hip / knee / ankle / ArUco精度検証 の状態ファイルと、姿勢キャッシュ・解析結果を
+	# まとめて backup/state_json/<日時>/ に保存する。何かの拍子にタブが消えても
+	# ここから丸ごと戻せるようにするのが目的。
+	# （自動の世代バックアップは cache/state_backup/ に別途たまる。こちらは1ファイル単位）
+	def _state_snapshot_dir(self) -> Path:
+		d = Path(__file__).parent / "backup" / "state_json"
 		try:
-			self._ankle_autosave_all_pose_caches()
+			d.mkdir(parents=True, exist_ok=True)
 		except Exception:
 			pass
+		return d
+
+	def _state_snapshot_items(self):
+		"""スナップショット対象: [(保存名, 実体のPath)] 。存在するものだけ返す。"""
+		items = []
+		try:
+			for p in (self._state_file_path(1), self._state_file_path(2),
+			           self._knee_state_file_path(), self._ankle_state_file_path(),
+			           self._av_state_file_path()):
+				p = Path(p)
+				if p.exists() and (p.name, p) not in items:
+					items.append((p.name, p))
+		except Exception as e:
+			print(f"[スナップショット] 状態ファイルの列挙に失敗: {e}")
+		base = Path(__file__).parent
+		# 精度検証の結果は試験タブごとにサブフォルダへ入るので再帰で拾う。
+		# 保存名の区切りには '%' を使う。ファイル名自体に '__' が入ることがあり
+		# (例: pose_260903_ArUco精度検証_Z軸_正_遠くへ__f1a03b83.npz)、
+		# '__' を区切りにすると復元時にパスが壊れるため。
+		for sub in ("cache/ankle_pose", "cache/av_result"):
+			d = base / sub
+			if d.is_dir():
+				for p in sorted(d.rglob("*.npz")):
+					if "_trash" in p.parts:
+						continue
+					rel = p.relative_to(base).as_posix()
+					items.append((rel.replace("/", "%"), p))
+		# 重複除去 (保存名で一意に)
+		seen, out = set(), []
+		for name, p in items:
+			if name in seen:
+				continue
+			seen.add(name)
+			out.append((name, p))
+		return out
+
+	def on_save_state_snapshot(self) -> None:
+		"""すべてのタブの状態と解析結果を backup/state_json/<日時>/ へ丸ごと保存する。"""
+		import datetime
+		import shutil
+		# 1. まず現在の内容をそれぞれのファイルへ書き出す
+		for label, fn in (("hip", self._save_state), ("knee", self._save_knee_state),
+		                   ("ankle", self._save_ankle_state), ("精度検証", self._save_av_state),
+		                   ("精度検証の結果", self._av_save_all_results)):
+			try:
+				fn()
+			except Exception as e:
+				print(f"[スナップショット] {label} の保存に失敗: {e}")
+		# 2. まとめてコピー
+		ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+		dst = self._state_snapshot_dir() / ts
+		items = self._state_snapshot_items()
+		if not items:
+			messagebox.showwarning("JSON保存", "保存対象のファイルが見つかりませんでした。")
+			return
+		try:
+			dst.mkdir(parents=True, exist_ok=True)
+			n_bytes = 0
+			for name, p in items:
+				shutil.copy2(str(p), str(dst / name))
+				n_bytes += p.stat().st_size
+		except Exception as e:
+			messagebox.showerror("JSON保存", f"保存に失敗しました: {e}")
+			return
+		lines = [f"{len(items)} 個のファイルを保存しました（{n_bytes / 1024:.0f} KB）。", "",
+		         f"保存先: {dst}", ""]
+		for name, _p in items:
+			lines.append(f"  {name}")
+		lines += ["", "「JSON復元」でこのフォルダを選べば、丸ごと元に戻せます。"]
+		messagebox.showinfo("JSON保存 完了", "\n".join(lines))
+
+	def on_restore_state_snapshot(self) -> None:
+		"""スナップショットのフォルダを選んで、状態ファイルを丸ごと戻す。"""
+		import shutil
+		base = self._state_snapshot_dir()
+		snaps = sorted([d for d in base.iterdir() if d.is_dir()], reverse=True) if base.is_dir() else []
+		if not snaps:
+			messagebox.showinfo("JSON復元",
+				f"スナップショットがまだありません。\n\n"
+				f"先に「JSON保存」で作成してください。\n保存先: {base}")
+			return
+		d = filedialog.askdirectory(title="復元するスナップショット（日時フォルダ）を選択",
+		                            initialdir=str(base))
+		if not d:
+			return
+		src = Path(d)
+		files = sorted(src.iterdir()) if src.is_dir() else []
+		files = [f for f in files if f.is_file()]
+		if not files:
+			messagebox.showwarning("JSON復元", "選んだフォルダにファイルがありません。")
+			return
+		# 中身を見せて確認
+		preview = []
+		for f in files:
+			if f.suffix == ".json" and "state" in f.name:
+				try:
+					data = json.load(f.open("r", encoding="utf-8"))
+					if isinstance(data, dict) and isinstance(data.get("tabs"), list):
+						names = [t.get("name", "?") for t in data["tabs"]]
+						preview.append(f"  {f.name}: タブ {', '.join(names)}")
+						continue
+				except Exception:
+					pass
+			preview.append(f"  {f.name}")
+		if not messagebox.askyesno(
+				"JSON復元",
+				f"以下を現在の状態に上書きします。よろしいですか？\n\n"
+				+ "\n".join(preview)
+				+ "\n\n※ 復元前の状態は自動でもう1つスナップショットに残します。"):
+			return
+		# 復元前の状態も念のため退避
+		try:
+			self.on_save_state_snapshot_silent()
+		except Exception:
+			pass
+		base_dir = Path(__file__).parent
+		restored, failed = [], []
+		for f in files:
+			try:
+				if "%" in f.name:
+					# 新形式: '%' がフォルダ区切り
+					target = base_dir / f.name.replace("%", "/")
+					target.parent.mkdir(parents=True, exist_ok=True)
+				elif f.name.startswith("cache__"):
+					# 旧形式: 先頭2つの '__' だけがフォルダ区切り
+					rel = f.name.replace("__", "/", 1).replace("__", "/", 1)
+					target = base_dir / rel
+					target.parent.mkdir(parents=True, exist_ok=True)
+				else:
+					target = base_dir / f.name
+					if f.name == "frs2015_gui_state_ankle_sim.json":
+						target = Path(self._ankle_state_file_path())
+					elif f.name == "frs2015_gui_state_aruco_verify.json":
+						target = Path(self._av_state_file_path())
+					elif f.name == "frs2015_gui_state_knee_sim.json":
+						target = Path(self._knee_state_file_path())
+				shutil.copy2(str(f), str(target))
+				restored.append(f.name)
+			except Exception as e:
+				failed.append(f"{f.name}: {e}")
+		msg = f"{len(restored)} 個のファイルを復元しました。"
+		if failed:
+			msg += "\n\n失敗:\n  " + "\n  ".join(failed)
+		msg += ("\n\n反映するにはプログラムの再起動が必要です。\n"
+		        "「はい」を押すと、**現在の状態を保存せずに**終了します\n"
+		        "（保存してしまうと、いま復元した内容が上書きされてしまうためです）。\n\n"
+		        "今すぐ終了しますか？")
+		if messagebox.askyesno("JSON復元 完了", msg):
+			try:
+				self.destroy()      # _on_close を通さない = 保存しないで終了
+			except Exception:
+				pass
+
+	def on_save_state_snapshot_silent(self) -> None:
+		"""確認ダイアログを出さずにスナップショットを取る (復元前の保険用)。"""
+		import datetime
+		import shutil
+		for fn in (self._save_state, self._save_knee_state, self._save_ankle_state,
+		            self._save_av_state, self._av_save_all_results):
+			try:
+				fn()
+			except Exception:
+				pass
+		ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "_復元前"
+		dst = self._state_snapshot_dir() / ts
+		dst.mkdir(parents=True, exist_ok=True)
+		for name, p in self._state_snapshot_items():
+			try:
+				shutil.copy2(str(p), str(dst / name))
+			except Exception:
+				pass
+		print(f"[スナップショット] 復元前の状態を退避: {dst}")
+
+	# endregion 全タブ状態のスナップショット
+
+	# region ダイアログの親指定（フリーズ対策）
+	# 【なぜ要るのか】(2026-09-08 実測)
+	# ダイアログの呼び出しは全部で 443 箇所あり、そのうち parent= を渡していたのは
+	# わずか 2 箇所だった。Windows の Tk では、親を指定しないダイアログが
+	# 本体ウィンドウの背後に出ることがある。ダイアログはモーダルなので
+	# 本体は入力を一切受け付けず、しかも本人は背後にいて見えないため、
+	# 「フリーズした」ようにしか見えない (実際は生きている)。
+	# ユーザーは毎回 Python を強制終了していた。
+	#
+	# 443 箇所を書き換えるのは危険なので、tkinter 側の関数を起動時に1度だけ
+	# 包んで parent を注入する。呼び出し側のコードには一切触らない。
+	# 既に parent= を渡している呼び出しはそのまま尊重する。
+
+	# 包む対象。すべて parent= を受け付ける関数。
+	_DIALOG_PATCH_TARGETS = (
+		("filedialog", ("askopenfilename", "asksaveasfilename", "askdirectory",
+		                 "askopenfilenames")),
+		("messagebox", ("showinfo", "showwarning", "showerror", "askyesno",
+		                 "askyesnocancel", "askokcancel", "askquestion",
+		                 "askretrycancel")),
+		("simpledialog", ("askstring", "askinteger", "askfloat")),
+		("colorchooser", ("askcolor",)),
+	)
+
+	def _dialog_parent(self):
+		"""ダイアログの親にすべきウィンドウを返す。
+
+		モーダルな Toplevel (grab を持っているもの) があればそれを優先する。
+		grab 中に本体を親にすると、ダイアログが grab に阻まれて
+		かえって操作できなくなるため。
+		"""
+		try:
+			g = self.grab_current()
+			if g is not None:
+				w = g.winfo_toplevel()
+				if w.winfo_exists():
+					return w
+		except Exception:
+			pass
+		try:
+			if self.winfo_exists():
+				return self
+		except Exception:
+			pass
+		return None
+
+	def _dialog_ready(self, parent=None) -> None:
+		"""ダイアログを出す直前に親を前面へ出す (parent= の保険)。
+
+		focus_force は使わない。実験中に他のアプリ (ロボット制御) から
+		フォーカスを奪ってしまうため。parent= があれば背面には回らない。
+		"""
+		try:
+			w = parent if parent is not None else self
+			w.lift()
+			w.update_idletasks()
+		except Exception:
+			pass
+
+	def _make_dialog_wrapper(self, orig):
+		"""parent= を自動で足すラッパを作る。失敗しても元の呼び出しに戻す。"""
+		def wrapper(*args, **kwargs):
+			if "parent" not in kwargs:
+				p = self._dialog_parent()
+				if p is not None:
+					kwargs["parent"] = p
+			self._dialog_ready(kwargs.get("parent"))
+			try:
+				return orig(*args, **kwargs)
+			except TypeError as e:
+				# parent を受け付けない実装だった場合だけ、元の呼び方に戻す。
+				# それ以外の TypeError は握りつぶさずそのまま投げる。
+				if "parent" not in str(e):
+					raise
+				kwargs.pop("parent", None)
+				return orig(*args, **kwargs)
+		wrapper._frs_wrapped = True
+		wrapper._frs_orig = orig
+		return wrapper
+
+	def _install_dialog_parent_guard(self) -> None:
+		"""すべてのダイアログに parent= を自動で付けるようにする (起動時に1回)。"""
+		mods = {"filedialog": filedialog, "messagebox": messagebox,
+		         "simpledialog": simpledialog, "colorchooser": colorchooser}
+		n = 0
+		for mod_name, fn_names in self._DIALOG_PATCH_TARGETS:
+			mod = mods.get(mod_name)
+			if mod is None:
+				continue
+			for name in fn_names:
+				try:
+					orig = getattr(mod, name, None)
+					if orig is None or getattr(orig, "_frs_wrapped", False):
+						continue
+					setattr(mod, name, self._make_dialog_wrapper(orig))
+					n += 1
+				except Exception as e:
+					print(f"[ダイアログ] {mod_name}.{name} の設定に失敗: {e}")
+		print(f"[ダイアログ] {n} 個の関数に親ウィンドウを自動指定します"
+		      f"（背面に隠れてフリーズしたように見える問題の対策）")
+
+	# endregion ダイアログの親指定
+
+	# region 単体タブのパス（生成が遅い変数）
+	# pos_check_* と stl2asc_input は _create_pos_checker_tab /
+	# _create_stl2asc_tab の中で作られるため、_load_state が走る時点では
+	# まだ self に無い。変数そのものではなく「名前」で扱い、
+	# 読み込み時に無ければ保留 → タブが揃ってから流し込む。
+	_LATE_PATH_SPECS = (
+		("fitting_child_heatmap_model", "fitting_child_heatmap_model_path"),
+		("pos_check_model", "pos_check_model_path"),
+		("pos_check_pp_pv", "pos_check_pp_pv_path"),
+		("pos_check_pp_fm", "pos_check_pp_fm_path"),
+		("pos_check_mat1", "pos_check_mat1_path"),
+		("pos_check_mat2", "pos_check_mat2_path"),
+		("randomizer_input", "randomizer_input_path"),
+		("stl2asc_input", "stl2asc_input_path"),
+	)
+
+	def _late_path_state(self) -> dict:
+		"""保存用: {JSONキー: 現在値}。まだ作られていない変数は空文字。"""
+		out = {}
+		for key, attr in self._LATE_PATH_SPECS:
+			v = getattr(self, attr, None)
+			try:
+				out[key] = v.get() if v is not None else ""
+			except Exception:
+				out[key] = ""
+		return out
+
+	def _restore_late_paths(self, data: dict) -> None:
+		"""復元用: 変数があれば入れる。無ければ保留しておく。"""
+		pend = getattr(self, "_pending_late_paths", None)
+		if pend is None:
+			pend = self._pending_late_paths = {}
+		for key, attr in self._LATE_PATH_SPECS:
+			if key not in (data or {}):
+				continue
+			val = str((data or {}).get(key, ""))
+			v = getattr(self, attr, None)
+			if v is None:
+				pend[attr] = val      # タブがまだ無い → あとで入れる
+				continue
+			try:
+				v.set(val)
+			except Exception:
+				pass
+
+	def _apply_pending_late_paths(self) -> None:
+		"""保留していたパスを流し込む (すべてのタブを作り終えてから呼ぶ)。"""
+		pend = getattr(self, "_pending_late_paths", None) or {}
+		for attr, val in list(pend.items()):
+			v = getattr(self, attr, None)
+			if v is None:
+				continue
+			try:
+				v.set(val)
+				pend.pop(attr, None)
+			except Exception:
+				pass
+
+	# endregion 単体タブのパス
+
+	# region 状態の自動保存（終了を待たずに保存する）
+	# 【なぜ要るのか】(2026-09-07)
+	# 状態の保存はもともと _on_close (ウィンドウの×) からしか走っていなかった。
+	# そのため強制終了・クラッシュ・PCの再起動・_on_close 途中の例外の
+	# いずれでも、その日に入れたパスが丸ごと消えていた。解析結果 (.npz) の方は
+	# 解析直後に保存されるので、「結果はあるのにパスだけ空 → 要再解析」という
+	# 分かりにくい症状になっていた。
+	#
+	# パス入力の変更を tk の trace で拾い、少し待ってから (連打をまとめて)
+	# 該当する状態ファイルだけを保存する。中身が変わっていなければ
+	# _write_json_state が何も書かないので、ディスクへの負担は無い。
+	_AUTOSAVE_DELAY_MS = 1500
+
+	def _autosave_savers(self) -> dict:
+		"""自動保存の対象 {種別: 保存関数}。"""
+		return {
+			"hip": self._save_state,
+			"knee": self._save_knee_state,
+			# 自動保存では姿勢キャッシュ (.npz) は書かない (重いため)
+			"ankle": lambda: self._save_ankle_state(save_pose_caches=False),
+			"av": self._save_av_state,
+		}
+
+	def _schedule_state_autosave(self, kind: str) -> None:
+		"""kind の状態保存を少し先に予約する (直前の予約は取り消す)。"""
+		if not getattr(self, "_autosave_ready", False):
+			return
+		jobs = getattr(self, "_autosave_jobs", None)
+		if jobs is None:
+			return
+		try:
+			if jobs.get(kind) is not None:
+				self.after_cancel(jobs[kind])
+		except Exception:
+			pass
+		try:
+			jobs[kind] = self.after(self._AUTOSAVE_DELAY_MS,
+			                         lambda k=kind: self._run_state_autosave(k))
+		except Exception:
+			jobs[kind] = None
+
+	def _run_state_autosave(self, kind: str) -> None:
+		try:
+			self._autosave_jobs[kind] = None
+		except Exception:
+			pass
+		fn = self._autosave_savers().get(kind)
+		if fn is None:
+			return
+		try:
+			fn()
+		except Exception as e:
+			print(f"[自動保存] {kind} の保存に失敗: {e}")
+
+	def _autosave_watch_vars(self) -> dict:
+		"""変更を見張る変数 {種別: [tk変数, ...]}。
+
+		対象はパスを持つ入力に絞る。スライダやチェックボックスまで見張ると
+		操作のたびに保存が走ってしまうので入れない (それらは従来どおり
+		タブ切替と終了時に保存される)。
+		"""
+		out = {"hip": [], "knee": [], "ankle": [], "av": []}
+		# __dict__ を見る (dir() だとプロパティを踏む恐れがある)。
+		# 命名規約: *_path / *_dir が パス入力、接頭辞でタブが決まる。
+		for name, v in list(self.__dict__.items()):
+			if not isinstance(v, tk.Variable):
+				continue
+			if not (name.endswith("_path") or name.endswith("_dir")):
+				continue
+			if name.startswith("knee_"):
+				out["knee"].append(v)
+			elif name.startswith("ankle_"):
+				out["ankle"].append(v)
+			elif name.startswith("av_"):
+				out["av"].append(v)
+			else:
+				out["hip"].append(v)
+		# ArUco精度検証 ②の表 (録画データのパスと Translation/Speed/Accel)。
+		# ここが今回いちばん問題になっていた箇所。
+		for _ax, rw in (getattr(self, "av_rows", None) or {}).items():
+			for key in ("bag", "commanded", "feed", "accel"):
+				v = rw.get(key)
+				if isinstance(v, tk.Variable):
+					out["av"].append(v)
+		# ankle 骨リストの editor 側 (骨モデル / キャリブ用 / 初期スキャン領域)。
+		# 実体は self.ankle_bones の dict なので、表示用の変数を見張る。
+		for key in ("model_var", "calib_model_var", "post_var"):
+			v = (getattr(self, "_ankle_bone_editor_widgets", None) or {}).get(key)
+			if isinstance(v, tk.Variable):
+				out["ankle"].append(v)
+		return out
+
+	def _install_state_autosave(self) -> None:
+		"""パス入力の変更を見張って自動保存するようにする (起動時に1回)。"""
+		self._autosave_jobs = {}
+		self._autosave_ready = False
+		n = 0
+		try:
+			for kind, varlist in self._autosave_watch_vars().items():
+				for v in varlist:
+					try:
+						v.trace_add("write",
+						             lambda *_a, k=kind: self._schedule_state_autosave(k))
+						n += 1
+					except Exception:
+						pass
+		except Exception as e:
+			print(f"[自動保存] 監視の設定に失敗: {e}")
+		self._autosave_ready = True
+		print(f"[自動保存] パス入力 {n} 項目を監視します "
+		      f"(変更から {self._AUTOSAVE_DELAY_MS / 1000:.1f} 秒後に保存)")
+
+	def _flush_state_autosave(self) -> None:
+		"""予約中の自動保存を取り消す (終了時に呼ぶ)。
+
+		この直後に _on_close が全部を保存するので、二重に書かないようにする。
+		ウィンドウを destroy した後で after が発火するのも防ぐ。
+		"""
+		for kind in list((getattr(self, "_autosave_jobs", None) or {}).keys()):
+			try:
+				job = self._autosave_jobs.get(kind)
+				if job is not None:
+					self.after_cancel(job)
+					self._autosave_jobs[kind] = None
+			except Exception:
+				pass
+
+	# endregion 状態の自動保存
+
+	# 世代バックアップを取った時刻 (ファイルごと)。自動保存で履歴が数分で
+	# 流れてしまわないよう、同じファイルへの連続保存では間引く。
+	_state_backup_last = {}
+	_STATE_BACKUP_MIN_INTERVAL_S = 120.0
+
+	@staticmethod
+	def _write_json_state(path, data, label: str = "状態") -> bool:
+		"""状態JSONを安全に書き出す (世代バックアップ + 一時ファイル + 原子的差し替え)。
+
+		従来は open("w") で保存先を直接開いていたため、書き込み中に落ちたり
+		読み込みに失敗した状態で終了したりすると中身が失われ、次回起動で
+		既定値に戻ってしまった (2026-09-03 に ankle の試験タブが実際に消失)。
+
+		  1. 既存ファイルを cache/state_backup/ へ世代コピー (最新15件を保持)
+		  2. 一時ファイルへ書き、読み戻せることを確認
+		  3. os.replace で差し替え
+
+		失敗しても直前の保存は必ず残る。
+		"""
+		import os
+		import shutil
+		import datetime
+		import time
+		p = Path(path)
+		# --- 0. 中身が変わっていなければ何もしない ---
+		# 自動保存 (パスを触るたびに走る) で、同じ内容を書き直して世代バックアップを
+		# 使い切ってしまわないようにする。書かなければファイルは一切変化しない。
+		try:
+			new_text = json.dumps(data, ensure_ascii=False, indent=2)
+		except Exception:
+			new_text = None
+		if new_text is not None and p.exists():
+			try:
+				if p.read_text(encoding="utf-8") == new_text:
+					return True
+			except Exception:
+				pass
+		# --- 1. 世代バックアップ ---
+		try:
+			bdir = Path(__file__).parent / "cache" / "state_backup"
+			bdir.mkdir(parents=True, exist_ok=True)
+			if p.exists() and p.stat().st_size > 0:
+				# 直前のバックアップから十分に間が空いているときだけ取る。
+				# 毎回取ると、15世代がパス入力の数回分 (=数分) で埋まってしまい、
+				# 「昨日の状態に戻す」ができなくなる。
+				_now = time.time()
+				_prev = MainMenuGUI._state_backup_last.get(str(p), 0.0)
+				if _now - _prev >= MainMenuGUI._STATE_BACKUP_MIN_INTERVAL_S:
+					MainMenuGUI._state_backup_last[str(p)] = _now
+					ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+					shutil.copy2(str(p), str(bdir / f"{p.stem}.{ts}{p.suffix}"))
+					olds = sorted(bdir.glob(f"{p.stem}.*{p.suffix}"))
+					for old in olds[:-15]:
+						try:
+							old.unlink()
+						except Exception:
+							pass
+		except Exception as e:
+			print(f"[{label}] バックアップ作成に失敗 (保存は続行します): {e}")
+		# --- 2〜3. 一時ファイルへ書いて検証 → 差し替え ---
+		tmp = f"{p}.tmp{os.getpid()}"
+		try:
+			with open(tmp, "w", encoding="utf-8") as f:
+				json.dump(data, f, ensure_ascii=False, indent=2)
+			with open(tmp, "r", encoding="utf-8") as f:
+				json.load(f)          # 読み戻せることを確認してから差し替える
+			os.replace(tmp, str(p))
+			return True
+		except Exception as e:
+			print(f"[{label}] 保存に失敗しました (直前の保存は保持されています): {e}")
+			return False
+		finally:
+			try:
+				if os.path.exists(tmp):
+					os.remove(tmp)
+			except Exception:
+				pass
+
+	def _save_ankle_state(self, save_pose_caches: bool = True) -> None:
+		# 姿勢時系列も一緒に保存しておく (④の結果を次回起動へ引き継ぐ)。
+		# 自動保存 (パスを触るたび) では .npz の書き直しが重いので省く。
+		# 姿勢キャッシュは検出直後と終了時に保存されるので、これで欠けない。
+		if save_pose_caches:
+			try:
+				self._ankle_autosave_all_pose_caches()
+			except Exception:
+				pass
 		try:
 			if getattr(self, "_ankle_tabs", None):
 				self._ankle_tabs[self._ankle_active_tab]['snapshot'] = self._ankle_snapshot_current()
@@ -3810,9 +4729,8 @@ class MainMenuGUI(_BaseWindow):
 		}
 		try:
 			p = self._ankle_state_file_path()
-			with p.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[ankle状態保存] {p}（{len(data['tabs'])}タブ）")
+			if self._write_json_state(p, data, "ankle状態保存"):
+				print(f"[ankle状態保存] {p}（{len(data['tabs'])}タブ）")
 		except Exception as e:
 			print(f"[ankle状態保存] 失敗: {e}")
 
@@ -4815,6 +5733,26 @@ class MainMenuGUI(_BaseWindow):
 			info["reason"] = f"例外: {e}"
 			return np.eye(4), False, info
 
+	def _ankle_make_preview_detector(self, aruco_dict_name: str):
+		"""プレビュー表示専用の、軽い ArUco 検出器を返す。
+
+		録画用の検出器は精度優先で CORNER_REFINE_APRILTAG と
+		adaptiveThreshWinSize 3〜23 (6段階のしきい値処理) を使っており、
+		1280x720 の1フレームに 120.8 ms かかる (実機実測)。
+		30fps の予算 33.3 ms を大きく超え、これが録画中のコマ落ちの主因だった。
+		プレビューは「マーカーが見えているか」を確認するだけなので、
+		既定パラメータで十分。実測 6.1 ms と 20倍速く、同じIDを検出できる。
+		（記録される .db3 は無関係。あとで④が高精度設定で解析し直す）
+		"""
+		import cv2
+		dictionary = self._ankle_resolve_aruco_dict(aruco_dict_name)
+		params = cv2.aruco.DetectorParameters()
+		try:
+			detector = cv2.aruco.ArucoDetector(dictionary, params)
+			return detector, dictionary, params, True
+		except Exception:
+			return None, dictionary, params, False
+
 	def _ankle_make_detector(self, aruco_dict_name: str):
 		"""ArUco Detectorインスタンスを返す (新旧API対応)。
 
@@ -5423,7 +6361,8 @@ class MainMenuGUI(_BaseWindow):
 				rgb = np.asanyarray(color.get_data())
 				depth_arr = np.asanyarray(depth.get_data())
 				timestamps.append(color.get_timestamp() / 1000.0)
-				gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if rgb.ndim == 3 else rgb
+				# 録画フォーマット (RGB8 / YUYV / Y8) の違いを吸収する
+				gray, _bgr_unused = self._ankle_color_to_gray_bgr(rgb)
 
 				# --- 【最初のフレームで詳細診断】depth アライメントと scale を検証 ---
 				if processed == 0:
@@ -5463,7 +6402,7 @@ class MainMenuGUI(_BaseWindow):
 							debug_dir.mkdir(parents=True, exist_ok=True)
 							saved = []
 							# color
-							color_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if rgb.ndim == 3 else rgb
+							_g_unused, color_bgr = self._ankle_color_to_gray_bgr(rgb)
 							if self._ankle_imwrite(debug_dir / "color.png", color_bgr):
 								saved.append("color.png")
 							# depth colormap (mm 単位で正規化 → JET)
@@ -6156,8 +7095,17 @@ class MainMenuGUI(_BaseWindow):
 			pass
 
 	def _ankle_save_pose_cache_npz(self, path: str, cache: dict) -> None:
-		"""キャッシュを .npz に保存。"""
+		"""キャッシュを .npz に保存 (一時ファイル → 原子的差し替え)。
+
+		np.savez_compressed は書き込む前に対象ファイルを truncate するので、
+		途中で例外が出たりアプリが落ちたりすると 0 バイトのファイルだけが残り、
+		それまでの検出結果が完全に失われる。
+		2026-09-03 に実際にこれが起き、3タブぶん (1126/734/789フレーム) が消えた。
+		一時ファイルに書き切り、サイズを確認してから os.replace で差し替えることで、
+		失敗しても直前の保存が必ず残るようにする。
+		"""
 		import numpy as np
+		import os
 		payload = {}
 		payload["timestamps"] = cache["timestamps"]
 		meta = {k: v for k, v in cache.items() if k not in ("timestamps", "bones")}
@@ -6167,7 +7115,19 @@ class MainMenuGUI(_BaseWindow):
 			payload[prefix + "poses"] = b["poses"]
 			payload[prefix + "detected"] = b["detected"]
 			payload[prefix + "reproj_err"] = b["reproj_err"]
-		np.savez_compressed(path, **payload)
+		# 一時ファイル名は .npz で終わらせる (numpy が勝手に .npz を足すのを防ぐ)
+		tmp = f"{path}.tmp{os.getpid()}.npz"
+		try:
+			np.savez_compressed(tmp, **payload)
+			if (not os.path.exists(tmp)) or os.path.getsize(tmp) == 0:
+				raise IOError("npz の書き出しに失敗しました (サイズ0)")
+			os.replace(tmp, path)
+		finally:
+			try:
+				if os.path.exists(tmp):
+					os.remove(tmp)
+			except Exception:
+				pass
 
 	def _ankle_load_pose_cache_npz(self, path: str) -> dict:
 		"""'.npz' から姿勢キャッシュを読み込む。"""
@@ -6603,13 +7563,36 @@ class MainMenuGUI(_BaseWindow):
 		                 font_size=10, color="black")
 		plotter.show()
 
-	def on_ankle_save_marker_pdf(self) -> None:
-		"""骨リストのマーカーを A4 PDF (物理実寸で印刷可能) にまとめて保存する。
+	def _ankle_marker_bit_matrix(self, dictionary, aid: int, dict_name: str, cache: dict):
+		"""ArUcoマーカーを (セル数, 白セルbool行列) として返す。
 
-		PDFはページに物理サイズが埋め込まれるので、PDFビューアで「実際のサイズ / 100%」
-		で印刷すれば必ず指定mmになる。PNGの「ページに合わせる」自動拡大バグを回避。
+		PDFへベクタ描画するために、ピクセル画像ではなく「セルの白黒」そのものを取り出す。
+		セル数 = データ部(4/5/6/7) + 外枠(borderBits=1)×2。
 		"""
+		import re as _re
 		import numpy as np
+		import cv2
+		if "cells_n" not in cache:
+			n_data = None
+			try:
+				n_data = int(dictionary.markerSize)
+			except Exception:
+				m = _re.search(r"DICT_(\d+)X\d+", str(dict_name))
+				if m:
+					n_data = int(m.group(1))
+			if not n_data or n_data <= 0:
+				n_data = 4
+			cache["cells_n"] = n_data + 2   # borderBits=1 の外枠を左右上下に
+		cells_n = int(cache["cells_n"])
+		key = int(aid)
+		if key not in cache:
+			sub = 10   # 1セルを 10px で生成し、その中心画素を読む (境界の丸め誤差を避ける)
+			img = np.asarray(cv2.aruco.generateImageMarker(dictionary, int(aid), cells_n * sub))
+			cache[key] = (img[sub // 2::sub, sub // 2::sub][:cells_n, :cells_n] > 127)
+		return cells_n, cache[key]
+
+	def on_ankle_save_marker_pdf(self) -> None:
+		"""骨リストのマーカーを A4 PDF (物理実寸で印刷可能) にまとめて保存する。"""
 		if not self._ankle_check_cv2():
 			return
 		if not self.ankle_bones:
@@ -6627,11 +7610,26 @@ class MainMenuGUI(_BaseWindow):
 		if not items:
 			messagebox.showinfo("マーカーPDF", "有効なArUco IDがありません。")
 			return
-		aruco_dict_name = self.ankle_aruco_dict_var.get()
 		try:
 			marker_size_mm = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			marker_size_mm = 20.0
+		self._ankle_marker_pdf_dialog(items, self.ankle_aruco_dict_var.get(), marker_size_mm)
+
+	def _ankle_marker_pdf_dialog(self, items, aruco_dict_name: str,
+	                             marker_size_mm: float) -> None:
+		"""(ID, ラベル) のリストを A4 PDF (物理実寸で印刷可能) に書き出す。
+
+		PDFはページに物理サイズが埋め込まれるので、PDFビューアで「実際のサイズ / 100%」
+		で印刷すれば必ず指定mmになる。PNGの「ページに合わせる」自動拡大バグを回避。
+		ankle simulator の骨リストからも、ArUco精度検証タブからも呼ばれる。
+		"""
+		import numpy as np
+		if not self._ankle_check_cv2():
+			return
+		if not items:
+			messagebox.showinfo("マーカーPDF", "出力するマーカーがありません。")
+			return
 		if marker_size_mm <= 0 or marker_size_mm > 200:
 			messagebox.showwarning("マーカーPDF", "マーカー実寸は0〜200mmの範囲で指定してください。")
 			return
@@ -6640,10 +7638,25 @@ class MainMenuGUI(_BaseWindow):
 			matplotlib.use('Agg')
 			import matplotlib.pyplot as plt
 			from matplotlib.backends.backend_pdf import PdfPages
+			from matplotlib.patches import Rectangle, PathPatch
+			from matplotlib.path import Path
 		except ImportError:
 			messagebox.showerror("マーカーPDF",
 				"matplotlibが必要です。venvで pip install matplotlib を実行してください。")
 			return
+		# matplotlib の既定フォント (DejaVu Sans) には日本語グリフが無く、
+		# ラベルや印刷手順の説明が全部 □ になってしまう。日本語フォントを探して使う。
+		jp_font = None
+		try:
+			from matplotlib import font_manager as _fm
+			_avail = {f.name for f in _fm.fontManager.ttflist}
+			for _c in ("Meiryo", "Yu Gothic", "MS Gothic", "BIZ UDGothic",
+				           "Noto Sans CJK JP", "IPAGothic", "TakaoGothic"):
+				if _c in _avail:
+					jp_font = _c
+					break
+		except Exception:
+			pass
 		import cv2
 		try:
 			dictionary = self._ankle_resolve_aruco_dict(aruco_dict_name)
@@ -6662,7 +7675,7 @@ class MainMenuGUI(_BaseWindow):
 		# 各マーカー領域: quiet zone(マーカー20%相当) + ラベル
 		quiet_zone_mm = max(marker_size_mm * 0.2, 3.0)
 		cell_mm = marker_size_mm + 2 * quiet_zone_mm
-		label_h_mm = 6.0
+		label_h_mm = 8.0   # ラベルは2行 (ID/骨名 + 実寸)
 		unit_w_mm = cell_mm
 		unit_h_mm = cell_mm + label_h_mm
 		margin_mm = 12.0
@@ -6671,8 +7684,13 @@ class MainMenuGUI(_BaseWindow):
 		n_col = max(1, int(usable_w // unit_w_mm))
 		n_row = max(1, int(usable_h // unit_h_mm))
 		per_page = n_col * n_row
-		# マーカー描画解像度 (高いほうがエッジきれい)
-		render_px = 600
+		# マーカーはベクタ図形 (矩形) で描く。
+		# 旧実装は 600px の画像を imshow していたが、PDFバックエンドが figure DPI (既定100dpi)
+		# に合わせて 79x79px へ再標本化していた。6セル(4x4+外枠)を 79px に割ると 13.17px/セル
+		# となりセル幅が不揃いになり、さらにクリップ矩形と 0.03mm ずれていた。
+		# 矩形で直接描けば再標本化が起きず、外形は厳密に marker_size_mm になる。
+		cells_cache: dict = {}
+		_fkw = {"fontname": jp_font} if jp_font else {}
 		n_pages = 0
 		try:
 			with PdfPages(path) as pdf:
@@ -6684,12 +7702,13 @@ class MainMenuGUI(_BaseWindow):
 					fig.text(0.5, 0.98,
 					         f"ArUco {aruco_dict_name} — 実寸 {marker_size_mm:.1f}mm — "
 					         f"「実際のサイズ / 100%」で印刷 ({n_pages}ページ)",
-					         ha='center', va='top', fontsize=9)
+					         ha='center', va='top', fontsize=9, **_fkw)
 					for pos in range(per_page):
 						if idx >= len(items):
 							break
 						aid, name = items[idx]
-						mimg = cv2.aruco.generateImageMarker(dictionary, aid, render_px)
+						cells_n, white = self._ankle_marker_bit_matrix(
+							dictionary, aid, aruco_dict_name, cells_cache)
 						row = pos // n_col
 						col = pos % n_col
 						# A4座標系 (左下原点, mm)
@@ -6705,24 +7724,42 @@ class MainMenuGUI(_BaseWindow):
 							marker_size_mm / A4_MM[0],
 							marker_size_mm / A4_MM[1],
 						])
-						ax.imshow(mimg, cmap='gray', vmin=0, vmax=255, interpolation='nearest')
-						ax.axis('off')
-						# 外枠 (切り取り目安)
-						cut_ax = fig.add_axes([
-							x_mm / A4_MM[0],
-							y_mm / A4_MM[1],
-							cell_mm / A4_MM[0],
-							cell_mm / A4_MM[1] + label_h_mm / A4_MM[1] * 0.3,
-						])
-						cut_ax.axis('off')
-						cut_ax.set_xlim(0, 1); cut_ax.set_ylim(0, 1)
-						cut_ax.plot([0, 1, 1, 0, 0], [0, 0, 1, 1, 0],
-						            color='#cccccc', linewidth=0.5, linestyle=(0, (2, 2)))
-						# ラベル
+						ax.set_xlim(0, cells_n); ax.set_ylim(0, cells_n)
+						ax.set_axis_off()
+						# (1) 外形ぴったりの黒正方形。この外縁が「マーカー実寸」の定義そのもの。
+						#     1枚の矩形なので継ぎ目が無く、外縁は厳密に marker_size_mm になる。
+						ax.add_patch(Rectangle((0, 0), cells_n, cells_n,
+						                       facecolor='black', edgecolor='none'))
+						# (2) 白セルは「1本の複合パス」として一度に塗る。
+						#     矩形を1枚ずつ描くと隣接辺にアンチエイリアスの継ぎ目(薄いグレー線)が残るので、
+						#     行方向に連結した矩形群をまとめて Path 化し、単一の塗りとして描く。
+						#     ArUco の外枠は常に黒なので、白セルが外縁に触れることはない。
+						_verts = []
+						_codes = []
+						for _r in range(cells_n):
+							_c = 0
+							while _c < cells_n:
+								if not white[_r, _c]:
+									_c += 1
+									continue
+								_c2 = _c
+								while _c2 + 1 < cells_n and white[_r, _c2 + 1]:
+									_c2 += 1
+								_x0, _x1 = float(_c), float(_c2 + 1)
+								_y0 = float(cells_n - 1 - _r); _y1 = _y0 + 1.0
+								_verts += [(_x0, _y0), (_x1, _y0), (_x1, _y1), (_x0, _y1), (_x0, _y0)]
+								_codes += [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY]
+								_c = _c2 + 1
+						if _verts:
+							ax.add_patch(PathPatch(Path(_verts, _codes),
+							               facecolor='white', edgecolor='none', linewidth=0))
+						# ラベル (マーカーの下。破線の切り取り枠は廃止した —
+						#         旧版では破線がマーカー上辺の黒枠に 0.2mm 食い込んでいた)
+						disp_name = name if len(name) <= 14 else (name[:13] + "…")
 						label = f"ID={aid}"
-						if name:
-							label += f"  ({name})"
-						label += f"  {marker_size_mm:.1f}mm"
+						if disp_name:
+							label += f" ({disp_name})"
+						label += "\n" + f"{marker_size_mm:.1f}mm"
 						label_ax = fig.add_axes([
 							x_mm / A4_MM[0],
 							y_mm / A4_MM[1],
@@ -6730,7 +7767,8 @@ class MainMenuGUI(_BaseWindow):
 							label_h_mm / A4_MM[1],
 						])
 						label_ax.axis('off')
-						label_ax.text(0.5, 0.5, label, ha='center', va='center', fontsize=7)
+						label_ax.text(0.5, 0.5, label, ha='center', va='center',
+						              fontsize=6, linespacing=1.15, **_fkw)
 						idx += 1
 					pdf.savefig(fig)
 					plt.close(fig)
@@ -6749,7 +7787,8 @@ class MainMenuGUI(_BaseWindow):
 			f"   ・「ページに合わせる」「フィット」は絶対にOFF\n"
 			f"3. レーザープリンタ + マット紙 で印刷\n"
 			f"4. 印刷後、ノギスでマーカー実寸を確認 → ②の値に反映\n"
-			f"5. quiet zone (外枠内の白余白) は切らずに残す")
+			f"5. マーカー周囲の白余白 (quiet zone {quiet_zone_mm:.1f}mm) は切らずに残す\n"
+			f"   ※ 破線の切り取り枠は廃止しました (マーカーの黒枠に重なり検出精度を下げるため)")
 
 	def on_ankle_save_marker_images(self) -> None:
 		"""骨リストのArUco IDに対応する印刷用マーカー画像(PNG)をまとめて保存する。"""
@@ -6800,7 +7839,8 @@ class MainMenuGUI(_BaseWindow):
 				name_safe = ("_" + "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name)) if name else ""
 				fname = f"aruco_{aruco_dict_name}_id{aid:03d}{name_safe}.png"
 				fpath = Path(out_dir) / fname
-				cv2.imwrite(str(fpath), canvas)
+				if not self._ankle_imwrite(fpath, canvas):
+					raise IOError("画像の書き出しに失敗しました")
 				saved.append((aid, name, fname))
 			except Exception as e:
 				errs.append((aid, str(e)))
@@ -9075,6 +10115,328 @@ class MainMenuGUI(_BaseWindow):
 
 
 	# ---- RealSense D405 ライブ撮影 (友人スクリプトのUXを踏襲、出力は .bag) ----
+	# ---- 録画のコマ落ち対策 ----
+	# 【原因】1280x720@30 を RGB8 + Z16 の非圧縮で録ると 138 MB/s になる。
+	#   Color RGB8 : 2.76 MB/枚 × 30 = 82.9 MB/s
+	#   Depth Z16  : 1.84 MB/枚 × 30 = 55.3 MB/s
+	# 実測した書き込み先の持続スループットは約 115 MB/s しかなく、これを超えている。
+	# 短い録画は OS のライトキャッシュ(RAM)が吸収するが、長くなると飽和して
+	# librealsense の recorder がフレームを捨てる。実データでも
+	#   Y軸 1.64GB/11.8s=139MB/s → 末尾4秒が丸ごと欠落
+	#   X軸 134MB/s → 19枚落ち、Z軸 119MB/s → 86枚落ち (最大2.2秒の空白)
+	# と、レートが上限に張り付いた分だけ落ちていた。
+	#
+	# 【対策】色を Y8 (グレースケール) で録る。ArUco は検出時にどのみち
+	# グレースケール化しているので情報は1ビットも失わず、
+	#   Color Y8 : 0.92 MB/枚 × 30 = 27.6 MB/s
+	# となり合計 82.9 MB/s。実測スループットに十分収まる。
+	# 実機(D405 FW 5.17)で確認した color の対応フォーマット:
+	#   bgr8 / bgra8 / rgb8 / rgba8 / yuyv   ※ y8 は非対応 (y8 は infrared のみ)
+	# YUYV は輝度を間引かないので ArUco の精度は RGB8 と同じまま、
+	# 書き込み量が 2/3 (138→111 MB/s、ファイル 3.5GB→2.5GB) になる。
+	AV_REC_FORMATS = {
+		"YUYV (軽い・推奨)": ("yuyv", 2),
+		"RGB8 (カラー)": ("rgb8", 3),
+	}
+
+	def _ankle_rs_color_format_candidates(self):
+		"""録画に使う color フォーマットを、優先順に (rs.format, バイト/画素, 名前) で返す。
+
+		指定がカメラで使えない場合に備えて、必ず RGB8 へフォールバックできるようにする。
+		"""
+		import pyrealsense2 as rs
+		want = str(self.ankle_rs_color_format.get())
+		key, _bpp = self.AV_REC_FORMATS.get(want, ("yuyv", 2))
+		order = [key] + [k for k, _ in (v for v in self.AV_REC_FORMATS.values()) if k != key]
+		seen, out = set(), []
+		for k in order + ["yuyv", "rgb8"]:
+			if k in seen:
+				continue
+			seen.add(k)
+			f = getattr(rs.format, k, None)
+			if f is not None:
+				out.append((f, {"yuyv": 2, "rgb8": 3}.get(k, 3), k))
+		return out
+
+	# ==================================================================
+	# RAM録画: 撮影中はディスクに一切書かず、止まってから .db3 を書き出す
+	# ==================================================================
+	# コマ落ちの原因は Windows のライトバックキャッシュだった (2026-09-04 実測)。
+	# 未書き込みページが上限 (実測 約1.6GB) に達すると強制的な吐き出しが走り、
+	# その間 0.1〜0.7 秒 書き込みがブロックされ、そこでフレームが捨てられる。
+	# ＝ ロボットが動いている最中にディスクへ書いている限り、原理的に避けられない。
+	#
+	# ならば「動いている間は書かない」。フレームを RAM に貯めておき、停止後に
+	# rs.software_device 経由で .db3 を書き出せば、既存の解析はそのまま使える。
+	# (実証済み: 内部パラメータ・歪み係数・depth_scale・フレーム数がすべて保たれる)
+	#
+	# 代償はメモリ。1フレーム = w*h*(color_bpp + 2) バイト。
+	# 1280x720 YUYV+Z16 なら 3.69 MB/フレーム = 111 MB/秒。
+	@staticmethod
+	def _ankle_available_ram_gb() -> float:
+		"""空き物理メモリ [GB]。取れなければ 0。"""
+		try:
+			import ctypes
+
+			class _MS(ctypes.Structure):
+				_fields_ = [("dwLength", ctypes.c_ulong),
+				             ("dwMemoryLoad", ctypes.c_ulong),
+				             ("ullTotalPhys", ctypes.c_ulonglong),
+				             ("ullAvailPhys", ctypes.c_ulonglong),
+				             ("ullTotalPageFile", ctypes.c_ulonglong),
+				             ("ullAvailPageFile", ctypes.c_ulonglong),
+				             ("ullTotalVirtual", ctypes.c_ulonglong),
+				             ("ullAvailVirtual", ctypes.c_ulonglong),
+				             ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+			st = _MS()
+			st.dwLength = ctypes.sizeof(_MS)
+			if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+				return float(st.ullAvailPhys) / 1e9
+		except Exception:
+			pass
+		return 0.0
+
+	def _ankle_ram_capacity(self, w: int, h: int, fps: int, color_bpp: int):
+		"""リングバッファを何フレームぶん取るかを決める。
+
+		これは「録画できる長さ」ではなく「ディスクが詰まったときに耐えられる長さ」。
+		実測で観測された最長の詰まりは 2.2 秒なので、既定の 8 秒あれば十分に余る。
+		平均の書き込み速度が必要レートを上回っていれば録画時間に上限はない。
+		Returns: (フレーム数, 1フレームのバイト数, 説明文)
+		"""
+		per = int(w) * int(h) * (int(color_bpp) + 2)
+		try:
+			want_sec = max(2, int(self.ankle_rs_ram_seconds.get()))
+		except Exception:
+			want_sec = 8
+		want = int(want_sec * max(fps, 1))
+		avail = self._ankle_available_ram_gb()
+		limit = int((avail * 1e9 * 0.50) / max(per, 1)) if avail > 0 else want
+		cap = max(8, min(want, limit))
+		note = (f"リング {cap} フレーム = {cap / max(fps, 1):.0f} 秒ぶん "
+		        f"= {cap * per / 1e9:.2f} GB（1フレーム {per / 1e6:.2f} MB / "
+		        f"空きメモリ {avail:.1f} GB）")
+		return cap, per, note
+
+	@staticmethod
+	def _ankle_capture_sidecar_path(bag_path):
+		return Path(str(bag_path) + ".capture.json")
+
+	def _ankle_write_capture_sidecar(self, bag_path, tstamps, n: int, fps: int,
+	                                  extra: dict = None) -> None:
+		"""撮影時の本当の時刻から、枚数・秒数・欠落を出して .capture.json に残す。
+
+		RAM録画の .db3 は「書き出した時刻」で rosbag に記録されるので、
+		ファイルの messages.timestamp を数えても実効fpsもコマ落ちも分からない
+		(数百fpsに見えてしまう)。撮影時の時刻はここに残しておく。
+		"""
+		import numpy as np
+		try:
+			a = np.asarray(tstamps[:n], dtype=float) / 1000.0   # ms → s
+			info = {"source": "ram", "n": int(n),
+			         "dur": float(a[-1] - a[0]) if n > 1 else 0.0,
+			         "gaps": 0, "nominal_fps": float(fps), "events": []}
+			if n > 2:
+				d = np.diff(a)
+				nom = float(np.median(d))
+				if nom > 0:
+					info["nominal_fps"] = 1.0 / nom
+					miss = np.round(d / nom) - 1
+					info["gaps"] = int(max(0, np.sum(miss[miss > 0])))
+					for j in np.where(miss > 0)[0]:
+						info["events"].append({"t": float(a[int(j)] - a[0]),
+						                        "frames": int(miss[int(j)]),
+						                        "sec": float(d[int(j)])})
+					info["events"].sort(key=lambda e: -e["frames"])
+			if extra:
+				info.update(extra)
+			p = self._ankle_capture_sidecar_path(bag_path)
+			p.write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+			self._ankle_safe_print(
+				f"[ankle rs] 撮影時刻の記録: {info['n']} 枚 / {info['dur']:.2f} s / "
+				f"欠落 {info['gaps']} 枚 → {p.name}")
+		except Exception as e:
+			self._ankle_safe_print(f"[ankle rs] 撮影時刻の記録に失敗: {e}")
+
+	@staticmethod
+	def _ankle_bag_frame_stats(bag_path, detail: bool = False):
+		"""録画された .db3 を SQLite で直接数える → (枚数, 秒, 内部欠落枚数)。
+
+		アプリ側のフレーム番号の飛びは「プレビューに届かなかった数」であって
+		記録の欠落ではない (実測: アプリ受信 97枚でも .db3 には 439枚・欠落0 が入っていた)。
+		本当に確かめるべきは、書き出されたファイルそのもの。
+		"""
+		import sqlite3
+		import numpy as np
+		# RAM録画で作った .db3 は「書き出した時刻」で記録されているので、
+		# ファイルからは撮影時の実効fpsもコマ落ちも読めない。
+		# 撮影時の時刻を残したサイドカーがあればそちらを使う。
+		try:
+			_sc = Path(str(bag_path) + ".capture.json")
+			if _sc.exists():
+				_i = json.loads(_sc.read_text(encoding="utf-8"))
+				_n = int(_i.get("n", 0)); _d = float(_i.get("dur", 0.0))
+				_g = int(_i.get("gaps", 0))
+				return (_n, _d, _g, _i) if detail else (_n, _d, _g)
+		except Exception:
+			pass
+		con = sqlite3.connect(str(bag_path))
+		try:
+			cur = con.cursor()
+			ts = [r[0] for r in cur.execute(
+				"SELECT m.timestamp FROM messages m JOIN topics t ON m.topic_id=t.id "
+				"WHERE t.name LIKE '%Color%image/data' ORDER BY m.timestamp")]
+		finally:
+			con.close()
+		n = len(ts)
+		if n < 3:
+			return (n, 0.0, 0, {}) if detail else (n, 0.0, 0)
+		a = np.asarray(ts, dtype=float) / 1e9
+		d = np.diff(a)
+		nom = float(np.median(d))
+		gaps = int(np.sum(np.round(d / nom) - 1)) if nom > 0 else 0
+		gaps = max(0, gaps)
+		if not detail:
+			return n, float(a[-1] - a[0]), gaps
+		# どこで欠けたかまで返す。録画開始直後の欠落は、まだロボットを
+		# 動かしていない時間帯なので解析には影響しない。同じ「N枚欠落」でも
+		# 意味が全く違うので、時刻を出して区別できるようにする。
+		info = {"n": n, "dur": float(a[-1] - a[0]), "gaps": gaps,
+		         "nominal_fps": (1.0 / nom) if nom > 0 else float("nan"), "events": []}
+		try:
+			if nom > 0:
+				miss = np.round(d / nom) - 1
+				for j in np.where(miss > 0)[0]:
+					info["events"].append({"t": float(a[int(j)] - a[0]),
+					                        "frames": int(miss[int(j)]),
+					                        "sec": float(d[int(j)])})
+				info["events"].sort(key=lambda e: -e["frames"])
+		except Exception:
+			pass
+		return n, info["dur"], gaps, info
+
+	@staticmethod
+	def _ankle_color_to_gray_bgr(arr):
+		"""カラーフレームの配列を (グレースケール, BGR) にする。
+
+		録画フォーマットで形が変わる:
+		  RGB8 → (H,W,3) / YUYV → (H,W,2) / Y8 → (H,W) / RGBA8 → (H,W,4)
+		ArUco はグレースケールしか使わないので、YUYV でも精度は変わらない。
+		"""
+		import cv2
+		import numpy as np
+		a = np.asanyarray(arr)
+		# pyrealsense2 は YUYV を (H, W) の uint16 で返す (1画素2バイトが1要素)。
+		# OpenCV は (H, W, 2) の uint8 を要求するので、ビューを張り替える。
+		# 実機で確認: yuyv → shape=(720,1280) dtype=uint16 / rgb8 → (720,1280,3) uint8
+		if a.ndim == 2 and a.dtype == np.uint16:
+			a = a.view(np.uint8).reshape(a.shape[0], a.shape[1], 2)
+			return (cv2.cvtColor(a, cv2.COLOR_YUV2GRAY_YUY2),
+			        cv2.cvtColor(a, cv2.COLOR_YUV2BGR_YUY2))
+		if a.ndim == 2:    # Y8
+			return a, cv2.cvtColor(a, cv2.COLOR_GRAY2BGR)
+		ch = a.shape[2] if a.ndim == 3 else 0
+		if ch == 2:        # YUYV を (H, W, 2) で受け取った場合
+			return (cv2.cvtColor(a, cv2.COLOR_YUV2GRAY_YUY2),
+			        cv2.cvtColor(a, cv2.COLOR_YUV2BGR_YUY2))
+		if ch == 4:        # RGBA8
+			return (cv2.cvtColor(a, cv2.COLOR_RGBA2GRAY),
+			        cv2.cvtColor(a, cv2.COLOR_RGBA2BGR))
+		return (cv2.cvtColor(a, cv2.COLOR_RGB2GRAY),
+		        cv2.cvtColor(a, cv2.COLOR_RGB2BGR))
+
+	@staticmethod
+	def _ankle_measure_write_speed(folder, mb: int = 1024) -> float:
+		"""保存先ドライブの持続書き込み速度を実測する [MB/s]。
+
+		小さいサイズだと OS のライトキャッシュ(RAM)に丸ごと乗ってしまい、実力の
+		10倍以上の値が出る。実測では 64MB→142 / 256MB→196 / 512MB→163 / 1GB→109 MB/s
+		とサイズを増やすほど下がり、1GB でようやく持続値に近づいた。
+		そのため既定は 1GB で、数秒かかる。録画のたびには走らせない。
+		測れなければ 0.0 を返す。
+		"""
+		import os
+		import time
+		import tempfile
+		try:
+			folder = str(folder)
+			os.makedirs(folder, exist_ok=True)
+			fd, tmp = tempfile.mkstemp(suffix=".spdtest", dir=folder)
+			os.close(fd)
+			buf = b"\0" * (8 * 1024 * 1024)
+			t0 = time.perf_counter()
+			with open(tmp, "wb") as f:
+				for _ in range(max(1, mb // 8)):
+					f.write(buf)
+				f.flush()
+				os.fsync(f.fileno())
+			dt = time.perf_counter() - t0
+			try:
+				os.remove(tmp)
+			except Exception:
+				pass
+			return (mb / dt) if dt > 0 else 0.0
+		except Exception:
+			return 0.0
+
+	def on_ankle_rs_measure_write_speed(self) -> None:
+		"""保存先の書き込み速度を実測して覚えておく（録画前の判定に使う）。"""
+		d = filedialog.askdirectory(
+			title="録画の保存先フォルダを選択（そのドライブの速度を測ります）",
+			initialdir=str(Path(__file__).parent / "cache"))
+		if not d:
+			return
+		self.ankle_rs_status.set("書き込み速度を測定中… (1GB 書きます)")
+		self.update_idletasks()
+		sp = self._ankle_measure_write_speed(d)
+		self._ankle_write_speed_mbs = sp
+		self._ankle_write_speed_dir = d
+		self.ankle_rs_status.set(f"書き込み速度 {sp:.0f} MB/s")
+		lines = [f"実測: {sp:.0f} MB/s", f"（{d}）", ""]
+		w, h, fps = self._ankle_rs_parse_resolution()
+		lines.append("この設定で必要なレート:")
+		for name, bpp in (("Y8 (グレー)", 1), ("RGB8 (カラー)", 3)):
+			need = (w * h * (bpp + 2) * fps) / 1e6
+			ok = "○ 足りる" if sp >= need * 1.15 else "× 不足（コマ落ちします）"
+			lines.append(f"  {name:14s}: {need:6.1f} MB/s   {ok}")
+		lines += ["", f"※ {w}x{h}@{fps}、深度 Z16 込みの非圧縮レートです。"]
+		messagebox.showinfo("書き込み速度の実測", "\n".join(lines))
+
+	def _ankle_rs_check_record_bandwidth(self, bag_path, w, h, fps, bytes_per_px,
+	                                      with_depth: bool = True) -> bool:
+		"""必要レートと書き込み先の実力を比べ、足りなければ確認を出す。
+
+		実測は 1GB 書くので録画のたびには走らせない。
+		⓪の「書き込み速度を実測」で測った値があればそれを使い、
+		無ければ一般的な外付け/HDDが頭打ちになる 100 MB/s を目安にする。
+		Returns: 続行してよければ True
+		"""
+		need = (w * h * (bytes_per_px + (2 if with_depth else 0)) * fps) / 1e6   # color + depth(Z16=2B)
+		speed = float(getattr(self, "_ankle_write_speed_mbs", 0.0) or 0.0)
+		ref = speed if speed > 0 else 100.0
+		self._ankle_safe_print(
+			f"[ankle rs] 録画レート {need:.0f} MB/s "
+			f"(color {w}x{h}x{bytes_per_px}B + depth 2B @ {fps}fps) / "
+			f"保存先 {'実測' if speed > 0 else '目安'} {ref:.0f} MB/s")
+		if need <= ref * 1.15:
+			return True
+		y8_need = (w * h * (1 + (2 if with_depth else 0)) * fps) / 1e6
+		return messagebox.askyesno(
+			"書き込み速度が足りない可能性があります",
+			f"録画に必要な速度: {need:.0f} MB/s\n"
+			+ (f"保存先の実測速度: {speed:.0f} MB/s\n\n" if speed > 0
+			   else f"保存先の目安速度: {ref:.0f} MB/s（未実測）\n\n")
+			+ f"このままだとコマ落ちします。実際に、この設定の録画で\n"
+			f"最大 2.2 秒ぶん（86枚）が欠けたことがあります。\n\n"
+			f"対策:\n"
+			f"  ・⓪の「録画の色」を YUYV にする\n"
+			f"    → {y8_need:.0f} MB/s まで下がります。ArUco検出はどのみち\n"
+			f"      グレースケールで行うので、精度は一切変わりません\n"
+			f"  ・⓪の「MP4も保存」を外す\n"
+			f"  ・解像度か fps を下げる（ただし精度が落ちます）\n\n"
+			f"このまま録画しますか？")
+
 	def _ankle_rs_parse_resolution(self):
 		"""'1280x720@15' → (W, H, fps) を返す。"""
 		s = str(self.ankle_rs_resolution.get()).strip()
@@ -9405,38 +10767,135 @@ class MainMenuGUI(_BaseWindow):
 			pass
 		self.update_idletasks()
 
-		pipeline = rs.pipeline()
-		config = rs.config()
+		# 色フォーマットは Y8 優先。非圧縮の書き込みレートが 138→83 MB/s に下がり、
+		# コマ落ちが止まる。カメラが対応していなければ RGB8 へ自動で落ちる。
+		cands = self._ankle_rs_color_format_candidates()
+		# 深度は必ず記録する。書き込み量は約半分になるので「深度を切る」のは
+		# 帯域対策として魅力的だが、④の検出 (_ankle_detect_from_bag) が
+		# 深度ストリームを前提にしていて、深度の無い .db3 は解析できない。
+		# 解析できないデータを作る設定は用意しない (分岐だけ残してある)。
+		has_depth = True
+		# RAM録画: 撮影中はディスクに書かず、停止後に software_device 経由で書き出す。
+		# 原因 (ライトバックキャッシュの強制フラッシュ) に巻き込まれなくなる。
 		try:
-			config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-			config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
-			config.enable_record_to_file(bag_path)
-			profile = pipeline.start(config)
-		except Exception as e:
+			ram_mode = bool(self.ankle_rs_ram_record.get())
+		except Exception:
+			ram_mode = False
+		# RAM録画では書き込みが別スレッド＋可逆圧縮 (実測 111→42 MB/s) になるので、
+		# 生レートでの帯域判定は意味がない。確認も出さない。
+		if not ram_mode:
+			if not self._ankle_rs_check_record_bandwidth(bag_path, w, h, fps, cands[0][1],
+			                                              with_depth=has_depth):
+				_cleanup_panel()
+				return False, 0, None
+		pipeline = None
+		profile = None
+		frame_q = None
+		last_err = None
+		color_bpp = 3
+		for cfmt, bpp, fname in cands:
+			try:
+				pipeline = rs.pipeline()
+				config = rs.config()
+				if has_depth:
+					config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+				config.enable_stream(rs.stream.color, w, h, cfmt, fps)
+				if not ram_mode:
+					config.enable_record_to_file(bag_path)
+				# pipeline.wait_for_frames の内部キューは容量1しかない。
+				# 表示処理(imshow×3 + Tk update)で1回でも 33ms を超えると、
+				# その間に届いたフレームがそこで捨てられてしまう。
+				# 実測(実機 D405): 30フレームごとに150ms止めると 750枚中 67枚欠落。
+				# 深いキューを自分で挟むと同じ条件で 0 枚になる。
+				frame_q = rs.frame_queue(int(max(60, 2 * fps)), keep_frames=True)
+				profile = pipeline.start(config, frame_q)
+				color_bpp = bpp
+				self._ankle_safe_print(
+					f"[ankle rs] 録画フォーマット: color={fname} "
+					f"depth={'z16' if has_depth else '(記録しない)'} "
+					f"{w}x{h}@{fps} → {(w * h * (bpp + (2 if has_depth else 0)) * fps) / 1e6:.0f} MB/s")
+				break
+			except Exception as e:
+				last_err = e
+				try:
+					if pipeline is not None:
+						pipeline.stop()
+				except Exception:
+					pass
+				pipeline = None; profile = None
+		if profile is None:
 			_cleanup_panel()
-			return False, 0, f"パイプライン起動失敗: {e}"
+			return False, 0, f"パイプライン起動失敗: {last_err}"
 
 		# recorder を取得して直ちに pause (書き込ませない=preview 状態)
+		# RAM録画では recorder そのものが存在しない。
 		recorder = None
+		if not ram_mode:
+			try:
+				recorder = profile.get_device().as_recorder()
+				recorder.pause()
+			except Exception as e:
+				print(f"[ankle rs] recorder取得/pause失敗: {e}")
+
+		# RAM録画で書き出すときに必要な、実機と同じプロファイル情報を控えておく
+		ram_meta = None
+		if ram_mode:
+			try:
+				_cvp = profile.get_stream(rs.stream.color).as_video_stream_profile()
+				_dvp = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+				ram_meta = {
+					"w": w, "h": h, "fps": fps,
+					"color_bpp": color_bpp,
+					"color_fmt": _cvp.format(),
+					"color_intr": _cvp.get_intrinsics(),
+					"depth_intr": _dvp.get_intrinsics(),
+					"extrinsics": _dvp.get_extrinsics_to(_cvp),
+					"depth_units": float(
+						profile.get_device().first_depth_sensor().get_depth_scale()),
+				}
+			except Exception as e:
+				ram_mode = False
+				ram_meta = None
+				messagebox.showwarning(
+					"RAM録画",
+					f"カメラのプロファイル情報を取れなかったので RAM録画を使えません。\n"
+					f"通常の録画に切り替えます。\n\n{e}")
+
+		# センサ側のフレームキューを深くする。
+		# 記録の欠落は「書き込みが一瞬詰まったときに、置き場所が無くて捨てられる」
+		# 形で起きる。既定 (16) より深くしておくと、数百 ms のディスクの息継ぎを
+		# メモリ側で吸収できる。1フレーム 1.8MB なので 32 枚でも 60MB 程度。
 		try:
-			recorder = profile.get_device().as_recorder()
-			recorder.pause()
+			for _sens in profile.get_device().query_sensors():
+				try:
+					if _sens.supports(rs.option.frames_queue_size):
+						_rng = _sens.get_option_range(rs.option.frames_queue_size)
+						_sens.set_option(rs.option.frames_queue_size, float(_rng.max))
+				except Exception:
+					pass
 		except Exception as e:
-			print(f"[ankle rs] recorder取得/pause失敗: {e}")
+			print(f"[ankle rs] frames_queue_size 設定失敗: {e}")
 
 		# ウィンドウ
 		try:
 			cv2.namedWindow(WIN_COLOR, cv2.WINDOW_NORMAL)
-			cv2.namedWindow(WIN_DEPTH, cv2.WINDOW_NORMAL)
+			if has_depth:
+				cv2.namedWindow(WIN_DEPTH, cv2.WINDOW_NORMAL)
 		except Exception:
 			pass
 
+		# 1フレームあたりの記録バイト数 (color + depth z16)。
+		# 「何 GB 書いたか」を出すのに使う。実測で、欠落はどの録画でも
+		# 1.3 GB 以降にしか出ておらず、2.0 GB 以下の録画では一度も出ていない。
+		_bytes_per_frame = w * h * (color_bpp + (2 if has_depth else 0))
 		colorizer = rs.colorizer()
 		align = rs.align(rs.stream.color)
 		start_record = False
 		cancelled = False
 		frame_count = 0
 		recording = False   # True になったら書き込み中
+		prev_fn = None      # 直前のフレーム番号 (コマ落ち検出用)
+		dropped = 0         # 録画中に落ちたフレーム数
 
 		# ---- 録画中に表示映像 (オーバーレイ込み) を MP4 でも自動保存 ----
 		# .db3 と同じフォルダ・同じベース名に _color.mp4 / _depth.mp4 / _aruco.mp4 を出す
@@ -9449,9 +10908,21 @@ class MainMenuGUI(_BaseWindow):
 		video_writer_aruco = None
 		_MP4_FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
 
+		try:
+			want_mp4 = bool(self.ankle_rs_record_mp4.get())
+		except Exception:
+			want_mp4 = True
+
 		def _ensure_video_writers(w_px: int, h_px: int, fps_hint: float):
-			"""録画開始直後の1フレーム目でwriterを初期化する (フレームサイズが確定してから)。"""
+			"""MP4 writer を作る。録画開始『前』に呼ぶこと。
+
+			以前は録画開始後の1フレーム目で呼んでいたが、cv2.VideoWriter の生成は
+			FFmpeg の DLL (約20MB) をロードするので、プロセスで最初の1回だけ
+			数百 ms 止まる。それが録画の先頭に重なり「1回目だけコマ落ちする」
+			症状になっていた。"""
 			nonlocal video_writer_color, video_writer_depth
+			if not want_mp4:
+				return
 			if video_writer_color is None:
 				try:
 					video_writer_color = cv2.VideoWriter(
@@ -9462,7 +10933,7 @@ class MainMenuGUI(_BaseWindow):
 				except Exception as e:
 					print(f"[ankle rs] color mp4 writer例外: {e}")
 					video_writer_color = None
-			if video_writer_depth is None:
+			if video_writer_depth is None and has_depth:
 				try:
 					video_writer_depth = cv2.VideoWriter(
 						mp4_depth_path, _MP4_FOURCC, float(fps_hint), (int(w_px), int(h_px)))
@@ -9475,6 +10946,8 @@ class MainMenuGUI(_BaseWindow):
 
 		def _ensure_aruco_video_writer(w_px: int, h_px: int, fps_hint: float):
 			nonlocal video_writer_aruco
+			if not want_mp4:
+				return
 			if video_writer_aruco is None:
 				try:
 					video_writer_aruco = cv2.VideoWriter(
@@ -9501,7 +10974,7 @@ class MainMenuGUI(_BaseWindow):
 			if _marker_size <= 0:
 				raise ValueError("marker size must be > 0")
 			_obj_pts = np.asarray(self._ankle_marker_obj_points(_marker_size), dtype=np.float64)
-			_det, _dic, _prm, _new = self._ankle_make_detector(_dict_name)
+			_det, _dic, _prm, _new = self._ankle_make_preview_detector(_dict_name)
 			_cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
 			_intr = _cprof.get_intrinsics()
 			_K = np.array([[_intr.fx, 0, _intr.ppx],
@@ -9599,13 +11072,157 @@ class MainMenuGUI(_BaseWindow):
 		try: panel.focus_force()
 		except Exception: pass
 
+		try:
+			settle_n = max(0, int(self.ankle_rs_settle_frames.get()))
+		except Exception:
+			settle_n = 15
+		_last_preview_shape = [int(h), int(w)]   # ウォームアップ用に実サイズを覚えておく
+		try:
+			_every_hint = [max(1, int(self.ankle_rs_preview_every.get()))]
+		except Exception:
+			_every_hint = [3]
+		_prio_state = {"on": False, "old": None, "gc": False}
+		# RAM録画器 (録画開始を押した時点で作る)。
+		# 取り込みは memcpy だけ、実際の書き出しは別スレッド。
+		ram_rec = None
+		ram_cap = 0
+		ram_per = 0
+
+		def _boost_priority(on: bool) -> None:
+			"""録画中だけ、このプロセスの優先度を上げて GC を止める。
+
+			自分のプロセスの優先度クラスを変えるだけで、OS の設定には触らない。
+			終了時 (finally) に必ず元へ戻す。第12世代 Core のような P/E コア混在機
+			では、優先度が低いスレッドが E コアへ回されて書き込みが遅れることがある。
+			"""
+			import gc as _gc
+			try:
+				want = bool(self.ankle_rs_high_priority.get())
+			except Exception:
+				want = True
+			if on:
+				if not want or _prio_state["on"]:
+					return
+				try:
+					if _gc.isenabled():
+						_gc.disable()
+						_prio_state["gc"] = True
+				except Exception:
+					pass
+				if IS_WINDOWS:
+					try:
+						import ctypes
+						k32 = ctypes.windll.kernel32
+						h = k32.GetCurrentProcess()
+						_prio_state["old"] = int(k32.GetPriorityClass(h))
+						k32.SetPriorityClass(h, 0x00000080)   # HIGH_PRIORITY_CLASS
+					except Exception as e:
+						print(f"[ankle rs] 優先度の変更に失敗 (無視して続行): {e}")
+				_prio_state["on"] = True
+				return
+			if not _prio_state["on"]:
+				return
+			_prio_state["on"] = False
+			if IS_WINDOWS and _prio_state["old"]:
+				try:
+					import ctypes
+					k32 = ctypes.windll.kernel32
+					k32.SetPriorityClass(k32.GetCurrentProcess(), _prio_state["old"])
+				except Exception:
+					pass
+			if _prio_state["gc"]:
+				try:
+					_gc.enable()
+				except Exception:
+					pass
+				_prio_state["gc"] = False
+
+		def _warmup_before_record() -> None:
+			"""「プロセスで初回だけ走る重い処理」を録画開始前に全部通しておく。
+
+			対象:
+			  1. FFmpeg DLL のロード (捨て用の小さな mp4 を1枚書いて即消す)
+			  2. 本番の MP4 writer 3本の生成
+			  3. numpy / OpenCV の作業バッファ確保 (ArUco 検出を1回空回し)
+			  4. 保存先ディレクトリのファイル作成 (NTFS のメタデータ更新)
+			"""
+			import time as _time
+			t0 = _time.perf_counter()
+			h_px, w_px = int(_last_preview_shape[0]), int(_last_preview_shape[1])
+			mp4_fps = max(1.0, float(fps) / max(1, int(_every_hint[0])))
+			if want_mp4:
+				# 1. 捨て書き込みで FFmpeg を起こす (本番ファイルは汚さない)
+				try:
+					_wp = str(bag_p.with_name(bag_p.stem + "_warmup.mp4"))
+					_vw = cv2.VideoWriter(_wp, _MP4_FOURCC, 30.0, (64, 64))
+					if _vw is not None and _vw.isOpened():
+						_vw.write(np.zeros((64, 64, 3), dtype=np.uint8))
+						_vw.release()
+					try:
+						Path(_wp).unlink()
+					except Exception:
+						pass
+				except Exception as e:
+					print(f"[ankle rs] mp4 ウォームアップ失敗 (無視): {e}")
+				# 2. 本番 writer をここで作る (これが本来の目的)
+				try:
+					_ensure_video_writers(w_px, h_px, mp4_fps)
+					if aruco_ok:
+						_ensure_aruco_video_writer(w_px, h_px, mp4_fps)
+				except Exception as e:
+					print(f"[ankle rs] mp4 writer 事前生成に失敗 (無視): {e}")
+			# 3. ArUco 検出とグレー変換を1回空回し (作業バッファの確保・分岐の初回実行)
+			try:
+				_dummy = np.zeros((h_px, w_px), dtype=np.uint8)
+				if aruco_state.get("use_new_api") and aruco_state.get("detector") is not None:
+					aruco_state["detector"].detectMarkers(_dummy)
+				elif aruco_state.get("dictionary") is not None:
+					cv2.aruco.detectMarkers(_dummy, aruco_state["dictionary"],
+					                        parameters=aruco_state["params"])
+			except Exception:
+				pass
+			self._ankle_safe_print(
+				f"[ankle rs] 録画前ウォームアップ {1000.0 * (_time.perf_counter() - t0):.0f} ms 完了 "
+				f"(MP4={'ON' if want_mp4 else 'OFF'} 深度={'ON' if has_depth else 'OFF'})")
+
+		def _rs_progress(nf: int, ndrop: int) -> None:
+			"""録画中の進捗表示。書いた量 (GB) も出す。
+
+			欠落は実測でどれも 1.3 GB 以降にしか出ておらず、2.0 GB 以下の録画では
+			一度も出ていない。撮影者がその線を越えたことに気付けるようにする。
+			"""
+			sec = nf / max(fps, 1)
+			gb = nf * _bytes_per_frame / 1e9
+			if ram_mode and ram_rec is not None:
+				# RAM録画では時間の上限はない。見るべきは「リングにどれだけ溜まって
+				# いるか」＝書き出しが追いついているか。0 に近ければ余裕。
+				pend = ram_rec.pending()
+				drop = ram_rec.n_dropped
+				self.ankle_rs_status.set(
+					f"RAM録画中… {nf}枚 (t≈{sec:.1f}s / {gb:.2f} GB) "
+					f"書き出し待ち {pend}/{ram_cap}"
+					+ (f"  ⚠取りこぼし {drop}枚" if drop else ""))
+				state_var.set(f"RAM録画中 ({nf}枚 / {sec:.1f}s)\n"
+				              f"{gb:.2f} GB  書き出し待ち {pend}/{ram_cap}"
+				              + (f"\n⚠ 取りこぼし {drop} 枚" if drop else ""))
+				self.update_idletasks()
+				return
+			warn = "  ⚠2GB超" if gb > 2.0 else ""
+			self.ankle_rs_status.set(
+				f"録画中… {nf}f (t≈{sec:.1f}s / {gb:.2f} GB){warn}")
+			state_var.set(f"録画中 ({nf}フレーム / {sec:.1f}s)\n{gb:.2f} GB"
+			              + ("  ⚠2GB超" if gb > 2.0 else "")
+			              + (f"\n(表示に届かず {ndrop} 枚 ※記録には影響なし)"
+			                 if ndrop else ""))
+			self.update_idletasks()
+
 		self.ankle_rs_status.set(f"プレビュー中… ({w}x{h}@{fps})")
 		state_var.set(f"プレビュー中\n({w}x{h}@{fps})")
 
 		try:
 			while True:
 				# --- 停止/開始条件 ---
-				if _window_closed(WIN_COLOR) or _window_closed(WIN_DEPTH):
+				if _window_closed(WIN_COLOR) or (has_depth and _window_closed(WIN_DEPTH)):
 					if recording:
 						break   # 録画中は停止として扱う
 					cancelled = True; break
@@ -9622,12 +11239,43 @@ class MainMenuGUI(_BaseWindow):
 						self.update_idletasks()
 						for i in range(n_discard):
 							try:
-								pipeline.wait_for_frames(timeout_ms=2000)
+								frame_q.wait_for_frame(2000)
 							except Exception:
 								break
 							if i % max(fps // 2, 1) == 0:
 								state_var.set(f"露光安定待ち…\n({i+1}/{n_discard}フレーム)")
 								self.update_idletasks()
+						# ---- ここで「初回だけ重い処理」を全部先に済ませる ----
+						# 実測で分かった原因: cv2.VideoWriter の生成は FFmpeg の DLL を
+						# ロードするので、プロセスで最初の1回だけ数百 ms 掛かる。それが
+						# 従来は「録画開始後の1フレーム目」で走っていたため、記録の先頭に
+						# ぶつかって 1回目の録画だけ欠落していた (撮り直すと DLL は
+						# ロード済みなので消える)。resume の前に全部やっておく。
+						state_var.set("書き出しの準備中…")
+						self.update_idletasks()
+						_warmup_before_record()
+						if ram_mode:
+							try:
+								ram_cap, ram_per, _note = self._ankle_ram_capacity(
+									w, h, fps, color_bpp)
+								state_var.set(f"メモリを確保中…\n{ram_cap * ram_per / 1e9:.2f} GB")
+								self.update_idletasks()
+								ram_rec = _AnkleRamRecorder(
+									bag_path, ram_meta, ram_cap, log=self._ankle_safe_print)
+								ram_rec.start()
+								self._ankle_safe_print(f"[ankle rs] RAM録画: {_note}")
+							except Exception as _e:
+								ram_rec = None
+								ram_mode = False
+								messagebox.showwarning(
+									"RAM録画",
+									f"RAM録画を開始できませんでした。この回は録画できません。\n\n{_e}")
+								cancelled = True
+								break
+						# 録画中はプロセス優先度を上げ、GC も止める。
+						# 記録の書き込みは librealsense のワーカースレッドが行うので、
+						# アプリ側の都合で数十 ms 止まると、そのぶん取りこぼす。
+						_boost_priority(True)
 						# 録画開始
 						try:
 							if recorder is not None:
@@ -9653,40 +11301,119 @@ class MainMenuGUI(_BaseWindow):
 						break
 
 				# --- 通常フレーム処理 ---
+				# 深いキューから1枚取り出す。溜まっていれば即座に返るので、
+				# 表示処理で遅れても次のループで一気に取り戻せる。
+				frames = None
 				try:
-					success, frames = pipeline.try_wait_for_frames(timeout_ms=100)
+					_qf = frame_q.poll_for_frame()
+					if not _qf:
+						try:
+							_qf = frame_q.wait_for_frame(100)
+						except Exception:
+							_qf = None
+					if _qf:
+						frames = _qf.as_frameset()
 				except Exception as e:
 					print(f"[ankle rs] frame取得エラー: {e}")
 					if recording:
 						break
 					cancelled = True; break
-				if not success:
+				if not frames:
 					self.update()
 					continue
 
 				# ---- 表示 (色+深度両方、プレビュー/録画で内容切替) ----
-				aligned = align.process(frames)
-				color = aligned.get_color_frame()
-				depth = aligned.get_depth_frame()
-				if not color or not depth:
+				# --- 表示処理の間引き ---
+				# 30fps の予算は 1フレーム 33.3 ms。実測(実機)では
+				#   最小       :   0.0 ms  コマ落ち  0%
+				#   +align等   :  15.3 ms  コマ落ち 31%
+				#   +ArUco検出 : 147.8 ms  コマ落ち 85%   ← 主因
+				#   +MP4x3     : 158.5 ms  コマ落ち 84%
+				#   +imshow x3 : 242.8 ms  コマ落ち 89%
+				# と、プレビューの ArUco 検出だけで予算の4倍を使っていた。
+				# .db3 への記録は SDK 側で全フレーム行われるので、
+				# 表示まわりだけ間引けば記録は完全なまま負荷が下がる。
+				c_raw = frames.get_color_frame()
+				if not c_raw:
 					self.update(); continue
 				if recording:
 					frame_count += 1
+					# コマ落ちの実測: フレーム番号の飛びを数える
+					try:
+						_fn = int(c_raw.get_frame_number())
+						if prev_fn is not None and _fn > prev_fn + 1:
+							dropped += (_fn - prev_fn - 1)
+						prev_fn = _fn
+					except Exception:
+						pass
+					# --- RAM録画: 何よりも先にフレームをリングへ写す ---
+					# ここでやるのは memcpy 2回 (合計 3.7MB、実測 中央 0.36ms) だけ。
+					# ディスクへの書き出しは別スレッドがやるので、書き込みが
+					# 0.7秒詰まってもここは止まらない (リングが吸収する)。
+					if ram_rec is not None:
+						try:
+							_d_raw = frames.get_depth_frame()
+							if _d_raw:
+								ram_rec.push(c_raw.get_data(), _d_raw.get_data(),
+								              c_raw.get_timestamp(),
+								              c_raw.get_frame_number())
+						except Exception as _e:
+							print(f"[ankle rs] RAM取り込み失敗: {_e}")
+				try:
+					_every = max(1, int(self.ankle_rs_preview_every.get()))
+				except Exception:
+					_every = 3
+				_every_hint[0] = _every
+				if ram_mode and recording:
+					# RAM録画中はアプリ自身が唯一の受け手なので、表示は通常より
+					# 更に間引く (最低でも5フレームに1回まで)。取り込み自体は
+					# 0.36ms しか使わないので、これで十分な余裕がある。
+					_every = max(_every, 5)
+					_every_hint[0] = _every
+				# 録画開始直後の数フレームは表示処理を丸ごと止める。
+				# recorder.resume() の直後は librealsense 側もファイル書き込みを
+				# 立ち上げているところなので、そこにアプリの重い処理を重ねない。
+				if recording and frame_count <= settle_n:
+					if frame_count == settle_n:
+						state_var.set("録画中")
+						self.update_idletasks()
+					self.update()
+					continue
+				if recording and (frame_count % _every) != 0:
+					# 表示・ArUco・MP4 を丸ごと飛ばす (記録は続いている)
+					if frame_count % max(fps, 1) == 0:
+						_rs_progress(frame_count, dropped)
+					self.update()
+					continue
+				if has_depth:
+					aligned = align.process(frames)
+					color = aligned.get_color_frame()
+					depth = aligned.get_depth_frame()
+					if not color or not depth:
+						self.update(); continue
+				else:
+					color = c_raw
+					depth = None
 				rgb = np.asanyarray(color.get_data())
-				bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+				# 録画フォーマット (RGB8 / YUYV / Y8) の違いをここで吸収する
+				gray_full, bgr = self._ankle_color_to_gray_bgr(rgb)
+				_last_preview_shape[0] = int(bgr.shape[0])
+				_last_preview_shape[1] = int(bgr.shape[1])
 				# ArUcoウィンドウ用のクリーンな色画像 (十字/RECオーバーレイなし)
 				bgr_clean_for_aruco = bgr.copy() if aruco_ok else None
-				gray_for_aruco = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if aruco_ok else None
-				colored_depth = colorizer.colorize(depth)
-				depth_bgr = cv2.cvtColor(np.asanyarray(colored_depth.get_data()), cv2.COLOR_RGB2BGR)
+				gray_for_aruco = gray_full if aruco_ok else None
+				depth_bgr = None
+				if has_depth:
+					colored_depth = colorizer.colorize(depth)
+					depth_bgr = cv2.cvtColor(np.asanyarray(colored_depth.get_data()), cv2.COLOR_RGB2BGR)
 				ch, cw, _ = bgr.shape
 				cx, cy = cw // 2, ch // 2
 				try:
-					dist = depth.get_distance(cx, cy)
+					dist = depth.get_distance(cx, cy) if depth is not None else 0.0
 				except Exception:
 					dist = 0.0
 				# 中心距離十字は色/深度両方に描画
-				for img in (bgr, depth_bgr):
+				for img in ((bgr, depth_bgr) if depth_bgr is not None else (bgr,)):
 					cv2.line(img, (cx - 10, cy), (cx + 10, cy), (255, 255, 255), 1)
 					cv2.line(img, (cx, cy - 10), (cx, cy + 10), (255, 255, 255), 1)
 					cv2.putText(img, f"{dist:.3f} m", (cx + 15, cy - 15),
@@ -9702,21 +11429,25 @@ class MainMenuGUI(_BaseWindow):
 					cv2.putText(bgr, "PREVIEW  Use panel or SPACE/ESC", (10, 30),
 					            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 				# ウィンドウ閉じ判定 (imshow前に)
-				if _window_closed(WIN_COLOR) or _window_closed(WIN_DEPTH):
+				if _window_closed(WIN_COLOR) or (has_depth and _window_closed(WIN_DEPTH)):
 					if recording:
 						break
 					cancelled = True; break
 				# MP4 に書き出し (録画中のみ、オーバーレイ込み映像)
 				if recording:
-					_ensure_video_writers(bgr.shape[1], bgr.shape[0], fps)
+					# writer は録画開始前に作ってある (初回ロードで先頭が潰れるのを防ぐため)。
+					# 何かの理由で作られていなければここで作る (保険)。
+					_ensure_video_writers(bgr.shape[1], bgr.shape[0],
+					                      max(1.0, float(fps) / max(1, _every)))
 					if video_writer_color is not None:
 						try: video_writer_color.write(bgr)
 						except Exception as e: print(f"[ankle rs] color mp4 write失敗: {e}")
-					if video_writer_depth is not None:
+					if video_writer_depth is not None and depth_bgr is not None:
 						try: video_writer_depth.write(depth_bgr)
 						except Exception as e: print(f"[ankle rs] depth mp4 write失敗: {e}")
 				cv2.imshow(WIN_COLOR, bgr)
-				cv2.imshow(WIN_DEPTH, depth_bgr)
+				if depth_bgr is not None:
+					cv2.imshow(WIN_DEPTH, depth_bgr)
 				# ---- ArUco追跡ウィンドウ (プレビュー+録画中の両方で表示) ----
 				if aruco_ok:
 					if _window_closed(WIN_ARUCO):
@@ -9728,21 +11459,23 @@ class MainMenuGUI(_BaseWindow):
 							cv2.imshow(WIN_ARUCO, overlay)
 							# 録画中はMP4にも保存
 							if recording:
-								_ensure_aruco_video_writer(overlay.shape[1], overlay.shape[0], fps)
+								_ensure_aruco_video_writer(overlay.shape[1], overlay.shape[0],
+								                           max(1.0, float(fps) / max(1, _every)))
 								if video_writer_aruco is not None:
 									try: video_writer_aruco.write(overlay)
 									except Exception as e: print(f"[ankle rs] aruco mp4 write失敗: {e}")
 				# 進捗表示更新 (fpsごと)
 				if recording and frame_count % max(fps, 1) == 0:
-					sec = frame_count / max(fps, 1)
-					self.ankle_rs_status.set(f"録画中… {frame_count}f (t≈{sec:.1f}s)")
-					state_var.set(f"録画中 ({frame_count}フレーム / {sec:.1f}s)")
-					self.update_idletasks()
+					_rs_progress(frame_count, dropped)
 				self.update()
 		finally:
 			try:
 				if recorder is not None and recording:
 					recorder.pause()
+			except Exception:
+				pass
+			try:
+				_boost_priority(False)   # 優先度とGCを必ず元に戻す
 			except Exception:
 				pass
 			try: pipeline.stop()
@@ -9781,6 +11514,151 @@ class MainMenuGUI(_BaseWindow):
 			# 想定外
 			self.ankle_rs_status.set("(録画されませんでした)")
 			return False, 0, None
+		# --- RAM録画: 残りを吐き出して閉じる ---
+		# 書き出しは録画中ずっと別スレッドが進めているので、ここで残っているのは
+		# 高々リング数フレームぶん。実測では 0.1 秒で終わった。
+		if ram_mode and ram_rec is not None:
+			_pw = tk.Toplevel(self)
+			_pw.title("録画データを書き出しています")
+			_pw.transient(self)
+			try:
+				_pw.attributes("-topmost", True)
+			except Exception:
+				pass
+			_pv = tk.StringVar(value="残りを書き出しています…")
+			tk.Label(_pw, text="録画データの残りを書き出しています",
+			         font=(self.ui_font_family, 10, "bold")).pack(padx=20, pady=(14, 4))
+			tk.Label(_pw, textvariable=_pv, font=(self.ui_font_family, 10)
+			         ).pack(padx=20, pady=(0, 4))
+			tk.Label(_pw, text="ロボットは既に停止しているので、ここで時間が掛かっても\n"
+			                    "記録の中身には影響しません。",
+			         fg="gray", justify="left").pack(padx=20, pady=(0, 14))
+			_pw.update_idletasks()
+
+			def _prog(done, tot):
+				try:
+					_pv.set(f"{done} / {tot} フレーム")
+					_pw.update()
+				except Exception:
+					pass
+
+			self.ankle_rs_status.set("書き出しの残りを処理中…")
+			_st = ram_rec.stop(progress=_prog)
+			ram_rec = None
+			try:
+				_pw.destroy()
+			except Exception:
+				pass
+			try:
+				import gc as _gc2
+				_gc2.collect()
+			except Exception:
+				pass
+			self._ankle_safe_print(
+				f"[ankle rs] RAM録画: 記録 {_st['n']} 枚 / 取りこぼし {_st['dropped']} 枚 / "
+				f"リング最大使用 {_st['max_used']}/{_st['cap']} / "
+				f"書き出しの詰まり {len(_st['stalls'])} 回 / 残り処理 {_st['drain_s']:.2f} s")
+			if _st.get("err"):
+				self.ankle_rs_status.set("(書き出しに失敗)")
+				messagebox.showerror(
+					"RAM録画 書き出し失敗",
+					f".db3 の書き出しでエラーが出ました。\n\n{_st['err']}\n\n"
+					f"⓪の「RAM録画」を外して通常の録画に戻してください。")
+				return False, 0, f"RAM録画の書き出しに失敗: {_st['err']}"
+			if _st["n"] <= 0:
+				self.ankle_rs_status.set("(RAMに1枚も取り込めませんでした)")
+				return False, 0, "RAM録画で1枚も取り込めませんでした"
+			frame_count = int(_st["n"])
+			# 撮影時の時刻からコマ落ちを出してサイドカーに残す。
+			# .db3 の rosbag 時刻は「書き出した時刻」なので、そのままでは使えない。
+			self._ankle_write_capture_sidecar(
+				bag_path, _st["ts"], _st["n"], fps,
+				extra={"ring_dropped": int(_st["dropped"]),
+				        "ring_max_used": int(_st["max_used"]),
+				        "ring_cap": int(_st["cap"]),
+				        "ring_stalls": len(_st["stalls"]),
+				        "app_frame_gaps": int(dropped)})
+			if _st["dropped"] > 0:
+				messagebox.showwarning(
+					"RAM録画",
+					f"リングが一杯になり {_st['dropped']} 枚を取りこぼしました。\n\n"
+					f"⓪の「リングに貯める秒数」を増やしてください"
+					f"（現在 {_st['cap'] / max(fps, 1):.0f} 秒 / "
+					f"最大使用 {_st['max_used'] / max(fps, 1):.1f} 秒）。")
+
+		# 記録の実態は .db3 を数えて確かめる。
+		# 記録の実態は .db3 を数えて確かめる。
+		# アプリ側の飛び (dropped) は「プレビューに届かなかった数」であって記録の欠落ではない。
+		# 本当に問題なのは (a) 内部の欠落 と (b) 末尾の切れ の2つ。
+		try:
+			_n, _dur, _gaps, _ginfo = self._ankle_bag_frame_stats(bag_path, detail=True)
+			if _n > 0:
+				_fe = _n / max(_dur, 1e-9)
+				self._ankle_safe_print(
+					f"[ankle rs] 記録: {_n} 枚 / {_dur:.2f} s = {_fe:.1f} fps  内部欠落 {_gaps} 枚")
+				if _gaps > 0:
+					self.ankle_rs_status.set(f"録画完了 {_n}枚 ({_fe:.1f}fps) ※内部欠落 {_gaps}枚")
+					_ev = (_ginfo or {}).get("events") or []
+					_where = ""
+					if _ev:
+						_where = "欠けた場所:\n" + "\n".join(
+							f"  ・録画開始から {e['t']:.2f} 秒の所で {e['frames']} 枚"
+							f"（{e['sec'] * 1000:.0f} ms の空白）" for e in _ev[:5])
+						if all(e["t"] < 1.5 for e in _ev):
+							_where += ("\n  → すべて録画開始直後です。まだロボットを"
+							           "動かしていない時間帯なので、解析には影響しません。")
+						_where += "\n\n"
+					if ram_mode:
+						# RAM録画では書き出しは別スレッドなので、欠落は「取り込み側」で
+						# 起きている。書き込み量やキャッシュの話は的外れになる。
+						_rd = int((_ginfo or {}).get("ring_dropped", -1))
+						_rm = int((_ginfo or {}).get("ring_max_used", -1))
+						_rc = int((_ginfo or {}).get("ring_cap", -1))
+						if _rd > 0:
+							_cause = (f"【原因】書き出しが追いつかず、リングが一杯になりました"
+							          f"（取りこぼし {_rd} 枚 / 最大使用 {_rm}/{_rc}）。\n"
+							          f"  ⓪の「リングに貯める秒数」を増やしてください。\n")
+						else:
+							_cause = (f"【原因】カメラから受け取る側で落ちています"
+							          f"（リングの取りこぼしは {_rd} 枚＝書き出しは間に合っています）。\n"
+							          f"  ・⓪の「録画中の表示間引き(1/n)」を大きくする\n"
+							          f"  ・USBハブを介さず PC 本体の USB3 ポートに直接挿す\n"
+							          f"  ・他の重いアプリを閉じる\n")
+						messagebox.showwarning(
+							"録画に欠落があります（RAM録画）",
+							f"記録できたのは {_n} 枚 / {_dur:.2f} 秒 = {_fe:.1f} fps です。\n"
+							f"途中に {_gaps} 枚ぶんの空白があります。\n\n"
+							+ _where + _cause
+							+ f"\n※ {_gaps} 枚程度なら解析への影響はほぼありません。\n"
+							f"　 等速区間の切り出しは 2 秒（60枚）の欠落があっても\n"
+							f"　 誤差 0.01% 以下であることを合成データで確認しています。")
+					else:
+						# 通常録画の欠落は書き込み側。実測に基づく助言だけを出す。
+						#   ・ウイルス対策 → 無関係 (3GB 書いても MsMpEng の CPU/読み込みは 0)
+						#   ・MP4 の同時書き出し → 無関係 (最大 2.3 ms)
+						#   ・別スレッドから小刻みに掃き出す → 逆効果 (最大 3.5 秒ブロック)
+						_gb_now = _n * _bytes_per_frame / 1e9
+						_adv = ["⓪の「★ RAM録画」を入れる（取り込みと書き出しを切り離すので、"
+						        "書き込みの詰まりに巻き込まれません。実機で3分/5400枚を欠落0で確認済み）"]
+						if _gb_now > 2.0:
+							_adv.append(f"録画を 2 GB 以内に収める（今回は {_gb_now:.1f} GB）")
+						if str(self.ankle_rs_color_format.get()).startswith("RGB"):
+							_adv.append("⓪の「録画の色」を YUYV にする（138→111 MB/s・精度は不変）")
+						_adv.append("それでも直らなければ 解像度か fps を下げる（精度は落ちます）")
+						messagebox.showwarning(
+							"録画に欠落があります",
+							f"記録できたのは {_n} 枚 / {_dur:.2f} 秒 = {_fe:.1f} fps です。\n"
+							f"途中に {_gaps} 枚ぶんの空白があります。\n\n"
+							+ _where
+							+ f"【原因】(2026-09-04 実測)\n"
+							f"  Windows は書き込みをいったんメモリに溜めてから順にディスクへ流します。\n"
+							f"  この未書き込みページが上限(実測 約1.6GB)まで溜まると強制的な吐き出しが\n"
+							f"  走り、その間 書き込みスレッドが 0.1〜0.7 秒止まります。\n\n"
+							f"対策（効きそうな順）:\n" + "\n".join(f"  ・{t}" for t in _adv))
+				else:
+					self.ankle_rs_status.set(f"録画完了 {_n}枚 ({_fe:.1f}fps) 欠落なし")
+		except Exception as _e:
+			self._ankle_safe_print(f"[ankle rs] 記録の検査に失敗: {_e}")
 		# 保存された MP4 のパスを self に貯めておく (on_ankle_rs_capture が拾える)
 		self._ankle_rs_last_mp4 = {
 			"color": mp4_color_path if Path(mp4_color_path).exists() else None,
@@ -9860,6 +11738,4108 @@ class MainMenuGUI(_BaseWindow):
 		messagebox.showinfo("D405 録画完了", "\n".join(lines))
 
 	# endregion ankle simulator
+
+	# region ArUco精度検証（ロボット既知動作 vs マーカー計測）
+	# ------------------------------------------------------------------
+	# FRS-2015 の直動3軸 (X/Y/Z, mm) と回転3軸 (U/V/W, deg) を既知量だけ動かし、
+	# ArUco マーカーの計測変位と突き合わせて検出精度を検証する。
+	#
+	# 【なぜ相対変位なのか】
+	#   T_C←Mk はカメラ座標系での「絶対」姿勢だが、カメラ系とロボット系の関係
+	#   (hand-eye 変換) は未知なので、絶対位置同士は比較できない。そこで
+	#   座標系に依存しないスカラー量だけを使う:
+	#       並進: |Δp| = |p(t) − p(t0)|     [mm]
+	#       回転: Δθ  = ∠(R(t0)^T R(t))     [deg]
+	#   この2つはカメラをどこにどう置いても値が変わらないので、hand-eye 較正
+	#   なしでロボット指令値と直接 y=x 比較できる。
+	#
+	# 【スケールの効き方が直動と回転で違う】
+	#   ・直動 |Δp| は マーカー実寸に比例して効く
+	#       → 逆に s_true = s_assumed × (指令値 / 実測span) でマーカー実寸を
+	#         決定できる。ロボットが「既知の絶対長」の役割を果たす
+	#         (単眼RGBはスケール不定なので、外から絶対長を入れるしかない)
+	#   ・回転 Δθ は マーカー実寸に一切依存しない
+	#       → 純粋な角度精度の検証になる。骨先端でてこ比15:1に増幅される
+	#         のはこちらなので、本命は回転側
+	#
+	# 【動かしていない側のマーカー = タダのノイズフロア基準】
+	#   FRS-2015 は直動側と回転側がアームで分かれているので、片方を動かして
+	#   いる間もう片方は静止している。その「見かけの変位」が同一条件での
+	#   測定ノイズそのものになる。
+	# ------------------------------------------------------------------
+	AV_AXES = (("X", "lin"), ("Y", "lin"), ("Z", "lin"),
+	           ("U", "rot"), ("V", "rot"), ("W", "rot"))
+	# CSV/レポートに出す3手法: (表示名, _ankle_method_compare のキー)
+	AV_METHODS = (("rgb", "pnp"), ("depth_corners", "corners"), ("fusion", "fusion"))
+
+	# ------------------------------------------------------------------
+	# 試験タブ（1タブ = 1回ぶんの検証。設定も解析結果も独立）
+	# ------------------------------------------------------------------
+	# ankle / knee と同じ操作感にする: ＋で追加、右クリックで改名・削除・並べ替え。
+	# 解析結果 (.npz) はタブごとに別フォルダへ入れるので、タブを増やしても
+	# 前の試験の結果が上書きされない。最初のタブだけは従来と同じ
+	# cache/av_result/ 直下を使う (既存の結果をそのまま引き継ぐため)。
+	def _av_current_tab_id(self) -> str:
+		try:
+			tabs = getattr(self, "_av_tabs", None) or []
+			return str(tabs[self._av_active_tab].get("id") or "default")
+		except Exception:
+			return "default"
+
+	def _av_snapshot_current(self) -> dict:
+		"""いま画面に入っている設定を dict にする (解析結果は含めない)。"""
+		return {
+			"aruco_dict": self.av_aruco_dict.get(),
+			"marker_size_mm": self._av_getf(self.av_marker_size_mm, 20.0),
+			"id_lin": int(self._av_getf(self.av_id_lin, 10)),
+			"id_rot": int(self._av_getf(self.av_id_rot, 11)),
+			"stride": int(self._av_getf(self.av_stride, 1)),
+			"axis_auto": bool(self.av_axis_auto.get()),
+			"chart_size_cm": self._av_getf(self.av_chart_size_cm, 24.0),
+			"plot_size_cm": self._av_getf(self.av_plot_size_cm, 21.0),
+			"rows": {ax: {"commanded": self._av_getf(rw["commanded"], 0.0),
+			               "feed": self._av_getf(rw["feed"], 0.0),
+			               "accel": self._av_getf(rw["accel"], 0.0),
+			               "bag": rw["bag"].get()}
+			          for ax, rw in self.av_rows.items()},
+		}
+
+	def _av_apply_settings(self, snap: dict) -> None:
+		"""設定 dict を画面へ反映する (無いキーは既定値へ戻す)。"""
+		snap = snap or {}
+		try:
+			self.av_aruco_dict.set(str(snap.get("aruco_dict") or "DICT_4X4_100"))
+			self.av_marker_size_mm.set(float(snap.get("marker_size_mm", 20.0)))
+			self.av_id_lin.set(int(snap.get("id_lin", 10)))
+			self.av_id_rot.set(int(snap.get("id_rot", 11)))
+			self.av_stride.set(int(snap.get("stride", 1)))
+			self.av_axis_auto.set(bool(snap.get("axis_auto", True)))
+			self.av_chart_size_cm.set(float(snap.get("chart_size_cm", 24.0)))
+			self.av_plot_size_cm.set(float(snap.get("plot_size_cm", 21.0)))
+		except Exception as e:
+			print(f"[精度検証] 設定の反映に失敗: {e}")
+		rows = snap.get("rows") or {}
+		for ax, kind in self.AV_AXES:
+			rw = self.av_rows.get(ax)
+			if not rw:
+				continue
+			v = rows.get(ax) or {}
+			try:
+				rw["commanded"].set(float(v.get("commanded",
+				                                  70.0 if kind == "lin" else 50.0)))
+				rw["feed"].set(float(v.get("feed", 0.0)))
+				rw["accel"].set(float(v.get("accel", 0.0)))
+				rw["bag"].set(str(v.get("bag", "")))
+			except Exception:
+				pass
+
+	def _av_clear_results_in_memory(self) -> None:
+		for ax, _k in self.AV_AXES:
+			rw = self.av_rows.get(ax)
+			if not rw:
+				continue
+			rw["result"] = None
+			rw["state"].set("未解析")
+			rw["summary"].set("—")
+			rw.pop("_sig", None)
+			rw.pop("_report", None)
+
+	def _av_restore_snapshot(self, snap: dict) -> None:
+		"""タブを切り替えたときに、設定を入れ直して結果を読み直す。"""
+		self._av_apply_settings(snap)
+		self._av_clear_results_in_memory()
+		self._av_load_all_results()
+
+	def _av_unique_tab_name(self, base: str = "試験") -> str:
+		names = {t.get("name", "") for t in self._av_tabs}
+		n = len(self._av_tabs) + 1
+		while f"{base}{n}" in names:
+			n += 1
+		return f"{base}{n}"
+
+	@staticmethod
+	def _av_new_tab_id() -> str:
+		import uuid
+		return "t" + uuid.uuid4().hex[:10]
+
+	def _av_init_tabs(self) -> None:
+		if not getattr(self, "_av_tabs", None):
+			self._av_tabs = [{"name": "試験1", "id": "default",
+			                   "settings": self._av_snapshot_current()}]
+			self._av_active_tab = 0
+		if self._av_active_tab >= len(self._av_tabs):
+			self._av_active_tab = 0
+		self._av_apply_settings(self._av_tabs[self._av_active_tab].get("settings"))
+		self._av_rebuild_tabbar()
+
+	def _av_rebuild_tabbar(self) -> None:
+		fr = getattr(self, "_av_tabbar_frame", None)
+		if fr is None:
+			return
+		for w in fr.winfo_children():
+			w.destroy()
+		self._av_tab_buttons = []
+		for i, tab in enumerate(self._av_tabs):
+			active = (i == self._av_active_tab)
+			b = tk.Button(
+				fr, text=tab.get("name", f"試験{i + 1}"),
+				relief=("sunken" if active else "raised"),
+				bg=("#cfe3ff" if active else "#f0f0f0"),
+				font=(self.ui_font_family, 9, "bold" if active else "normal"),
+				command=lambda i=i: self.on_av_tab_select(i), padx=8, pady=2)
+			b.pack(side="left", padx=2)
+			b.bind("<Button-3>", lambda e, i=i: self._av_tab_context_menu(e, i))
+			self._tabbar_bind_wheel(b, "av")
+			self._av_tab_buttons.append(b)
+		try:
+			ui = self._tabbar_ui.get("av")
+			if ui is not None:
+				ui["active"] = (self._av_tab_buttons[self._av_active_tab]
+				                if 0 <= self._av_active_tab < len(self._av_tab_buttons) else None)
+			self._tabbar_sync("av")
+		except Exception:
+			pass
+
+	def _av_tab_context_menu(self, event, i: int) -> None:
+		menu = tk.Menu(self, tearoff=0)
+		menu.add_command(label="名前変更", command=lambda: self.on_av_tab_rename(i))
+		menu.add_command(label="削除", command=lambda: self.on_av_tab_delete(i))
+		menu.add_separator()
+		menu.add_command(label="← 左へ移動", command=lambda: self._av_tab_move(i, i - 1),
+		                 state=("normal" if i > 0 else "disabled"))
+		menu.add_command(label="→ 右へ移動", command=lambda: self._av_tab_move(i, i + 1),
+		                 state=("normal" if i < len(self._av_tabs) - 1 else "disabled"))
+		try:
+			menu.tk_popup(event.x_root, event.y_root)
+		finally:
+			menu.grab_release()
+
+	def _av_tab_move(self, i: int, j: int) -> None:
+		n = len(self._av_tabs)
+		if not (0 <= i < n and 0 <= j < n) or i == j:
+			return
+		tab = self._av_tabs.pop(i)
+		self._av_tabs.insert(j, tab)
+		a = self._av_active_tab
+		if a == i:
+			a = j
+		else:
+			if a > i:
+				a -= 1
+			if a >= j:
+				a += 1
+		self._av_active_tab = a
+		self._av_rebuild_tabbar()
+
+	def on_av_tab_select(self, i: int) -> None:
+		if i < 0 or i >= len(self._av_tabs) or i == self._av_active_tab:
+			return
+		self._av_tabs[self._av_active_tab]["settings"] = self._av_snapshot_current()
+		self._av_active_tab = i
+		self._av_restore_snapshot(self._av_tabs[i].get("settings"))
+		self._av_rebuild_tabbar()
+		self._av_refresh_status()
+
+	def on_av_tab_add(self) -> None:
+		"""末尾のタブの設定を引き継いで新しい試験タブを作る (録画ファイルと結果は空)。"""
+		import copy as _copy
+		if self._av_tabs:
+			self._av_tabs[self._av_active_tab]["settings"] = self._av_snapshot_current()
+			snap = _copy.deepcopy(self._av_tabs[-1].get("settings") or {})
+			for ax in (snap.get("rows") or {}):
+				snap["rows"][ax]["bag"] = ""
+		else:
+			snap = self._av_snapshot_current()
+		self._av_tabs.append({"name": self._av_unique_tab_name(),
+		                       "id": self._av_new_tab_id(), "settings": snap})
+		self._av_active_tab = len(self._av_tabs) - 1
+		self._av_restore_snapshot(snap)
+		self._av_rebuild_tabbar()
+		self._av_refresh_status()
+
+	def on_av_tab_rename(self, i: int) -> None:
+		cur = self._av_tabs[i].get("name", "")
+		new = simpledialog.askstring("タブ名変更", "タブ名:", initialvalue=cur, parent=self)
+		if not (new and new.strip()):
+			return
+		new = new.strip()
+		if new in {t.get("name", "") for k, t in enumerate(self._av_tabs) if k != i}:
+			messagebox.showwarning("タブ名変更", f"「{new}」は既に存在します。")
+			return
+		self._av_tabs[i]["name"] = new
+		self._av_rebuild_tabbar()
+
+	def on_av_tab_delete(self, i: int) -> None:
+		if len(self._av_tabs) <= 1:
+			messagebox.showinfo("タブ削除", "最後のタブは削除できません。")
+			return
+		name = self._av_tabs[i].get("name", "")
+		if not messagebox.askyesno(
+				"タブ削除",
+				f"タブ「{name}」を削除しますか？\n\n"
+				f"このタブの解析結果 (.npz) は cache/av_result/_trash/ へ移動します"
+				f"（消さないので後から戻せます）。録画ファイル自体はそのままです。"):
+			return
+		self._av_trash_tab_results(self._av_tabs[i].get("id"), name)
+		self._av_tabs[self._av_active_tab]["settings"] = self._av_snapshot_current()
+		del self._av_tabs[i]
+		if self._av_active_tab == i:
+			self._av_active_tab = min(i, len(self._av_tabs) - 1)
+		elif self._av_active_tab > i:
+			self._av_active_tab -= 1
+		self._av_restore_snapshot(self._av_tabs[self._av_active_tab].get("settings"))
+		self._av_rebuild_tabbar()
+		self._av_refresh_status()
+
+	def _av_trash_tab_results(self, tab_id, name: str) -> None:
+		"""削除したタブの結果を消さずに退避する (取り違えても取り戻せるように)。"""
+		import datetime as _dt
+		import shutil
+		try:
+			base = Path(__file__).parent / "cache" / "av_result" / "_trash"
+			dst = base / f"{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}"
+			moved = 0
+			for ax, _k in self.AV_AXES:
+				p = self._av_result_path(ax, tab_id)
+				if p.exists():
+					dst.mkdir(parents=True, exist_ok=True)
+					shutil.move(str(p), str(dst / p.name))
+					moved += 1
+			if moved:
+				print(f"[精度検証] タブ「{name}」の結果 {moved} 件を {dst} へ退避しました")
+			d = self._av_result_dir(tab_id)
+			if tab_id and tab_id != "default" and d.is_dir() and not any(d.iterdir()):
+				d.rmdir()
+		except Exception as e:
+			print(f"[精度検証] 結果の退避に失敗: {e}")
+
+	def _av_init_vars(self) -> None:
+		"""精度検証タブの tk 変数を作る (タブ構築の冒頭で呼ぶ)。"""
+		self._av_tabs = []            # [{name, id, settings}]
+		self._av_active_tab = 0
+		self._av_tab_buttons = []
+		self._av_tabbar_frame = None
+		self.av_aruco_dict = tk.StringVar(value="DICT_4X4_100")
+		self.av_marker_size_mm = tk.DoubleVar(value=20.0)
+		self.av_id_lin = tk.IntVar(value=10)
+		self.av_id_rot = tk.IntVar(value=11)
+		self.av_stride = tk.IntVar(value=1)
+		# グラフの軸を 0 起点・データに合わせて自動調整するか。
+		# テンプレには作成時の軸範囲が焼き付いているので、試験ごとに移動量が
+		# 変わるとグラフが途中で切れる (実測: 等速19°なのに軸が0〜10だった)。
+		self.av_axis_auto = tk.BooleanVar(value=True)
+		# グラフの大きさ [cm]。枠も作図エリアも正方形にする。
+		# 真値×計測値のグラフは、作図エリアが正方形でないと y=x が 45° に見えない
+		# (テンプレは w=0.887 / h=0.855 で 43.9° になっていた)。
+		self.av_chart_size_cm = tk.DoubleVar(value=24.0)   # 枠の一辺
+		self.av_plot_size_cm = tk.DoubleVar(value=21.0)    # 作図エリアの一辺
+		# グラフ用の平滑化カットオフは ankle simulator ⑤ の
+		# 「時系列平滑化 カットオフ周波数」(self.ankle_smooth_cutoff_hz) を共用する。
+		# 設定を2か所に持つと必ず食い違うため、ここには持たない。
+		# 解析(k)には影響しない。グラフ用の列を1組増やすだけ。
+		self.av_status = tk.StringVar(value="")
+		self.av_rows = {}
+		for ax, kind in self.AV_AXES:
+			self.av_rows[ax] = {
+				"axis": ax,
+				"kind": kind,
+				# 既定は「指令値より多めに動かして中央を切り出す」運用を想定した値
+				"commanded": tk.DoubleVar(value=(70.0 if kind == "lin" else 50.0)),
+				"feed": tk.DoubleVar(value=0.0),      # 送り速度 Speed (mm/s or deg/s)。0=未入力
+				# ロボットに実際に入力する加速度 Accel。送り速度と移動量と合わせて
+				# 台形速度が決まるので、等速区間を「計算で」出せる (推定に頼らない)。
+				"accel": tk.DoubleVar(value=0.0),     # 加速度 (mm/s² or deg/s²)。0=未入力
+				"bag": tk.StringVar(value=""),
+				"state": tk.StringVar(value="未解析"),
+				"summary": tk.StringVar(value="—"),
+				"result": None,                        # 解析結果 dict (runtime のみ)
+			}
+
+	@staticmethod
+	def _av_getf(var, default: float = 0.0) -> float:
+		"""tk 変数から float を取る。Entry が空/不正なら default を返す。
+		
+		DoubleVar.get() は Entry を空にしただけで TclError を投げるので、
+		任意入力の欄では必ずこちらを通す。
+		"""
+		try:
+			return float(var.get())
+		except Exception:
+			return float(default)
+
+	def _av_kind_label(self, kind: str) -> str:
+		return "直動 [mm]" if kind == "lin" else "回転 [°]"
+
+	@staticmethod
+	def _av_unit(kind: str) -> str:
+		return "mm" if kind == "lin" else "°"
+
+	# ------------------------------------------------------------------
+	# ロボットの運動指令 (送り速度 v / 加速度 a / 移動量 D) から等速区間を割り出す
+	# ------------------------------------------------------------------
+	# 従来は「移動量の中央50%」で等速区間を切り出していた。これは指令値を要らない
+	# 代わりに、データそのものに依存する:
+	#   ・トラッキングが一時的に外れて値が飛ぶと、その飛びが max/min を作ってしまい
+	#     帯 (25〜75%) の位置がまるごとずれる (実測: V軸で -2.5° の飛びが入り、
+	#     span が 19.97° ではなく 22.47° になっていた)
+	#   ・往復や中断があると最長連続区間の取り方で結果が変わる
+	# ロボットは台形速度で動くので、指令が分かれば等速区間は「計算で」出せる。
+	#
+	# 【台形速度の関係式】 送り v・加速度 a・移動量 D のとき
+	#     加速時間      t_ramp  = v / a          (減速も同じだけ掛かる)
+	#     加速中の距離  d_ramp  = v²/(2a) = v·t_ramp/2
+	#     等速の距離    D − 2·d_ramp
+	#     等速の時間    t_cruise = D/v − v/a      ← ここが本命
+	#     全体の時間    t_total  = D/v + v/a
+	#   例: v=1 mm/s, a=1 mm/s², D=10 mm
+	#       → 加速 1.0 s / 等速 9.0 s / 減速 1.0 s、全体 11.0 s
+	#     「10 s から加速1s と減速1s を引いて 8 s」ではない。全体が 10 s ではなく
+	#     11 s になるからで、ランプ1本が失う時間は t_ramp ではなく t_ramp/2 (=0.5s)。
+	#     実測 (X/Y軸, D=50mm, v=5mm/s) でも、加速の中点と減速の中点の間隔が
+	#     ちょうど D/v = 10.00 s になっていて、この式どおりだった。
+	#   D < 2·d_ramp のときは最高速に届かない三角形速度になり、等速区間は存在しない。
+	@staticmethod
+	def _av_profile_times(v: float, acc: float, D: float):
+		"""台形速度の (加速終わり, 等速終わり, 全体終わり, 種別) を返す [秒]。"""
+		import numpy as np
+		v = abs(float(v)); acc = abs(float(acc)); D = abs(float(D))
+		if v <= 0 or acc <= 0 or D <= 0:
+			return None
+		t_ramp = v / acc
+		d_ramp = 0.5 * v * t_ramp
+		if D >= 2.0 * d_ramp:
+			t1 = t_ramp
+			t2 = t1 + (D - 2.0 * d_ramp) / v
+			t3 = t2 + t_ramp
+			return {"t1": t1, "t2": t2, "t3": t3, "kind": "trapezoid",
+			        "v_peak": v, "t_ramp": t_ramp, "t_cruise": t2 - t1}
+		# 三角形速度: 指令の送り速度に届かない → 等速区間なし
+		v_peak = float(np.sqrt(acc * D))
+		t1 = v_peak / acc
+		return {"t1": t1, "t2": t1, "t3": 2.0 * t1, "kind": "triangle",
+		        "v_peak": v_peak, "t_ramp": t1, "t_cruise": 0.0}
+
+	@staticmethod
+	def _av_profile_position(t_rel, v: float, acc: float, D: float, prof=None):
+		"""台形速度の理想位置 [同じ単位] を時刻配列に対して返す (t<0 は 0、終了後は D)。"""
+		import numpy as np
+		if prof is None:
+			prof = MainMenuGUI._av_profile_times(v, acc, D)
+		if prof is None:
+			return None
+		t = np.asarray(t_rel, dtype=float)
+		t1 = prof["t1"]; t2 = prof["t2"]; t3 = prof["t3"]
+		vp = prof["v_peak"]
+		a = abs(float(acc))
+		D = abs(float(D))
+		p = np.empty_like(t)
+		p[:] = 0.0
+		m1 = (t > 0) & (t < t1)
+		p[m1] = 0.5 * a * t[m1] ** 2
+		d1 = 0.5 * a * t1 ** 2
+		m2 = (t >= t1) & (t < t2)
+		p[m2] = d1 + vp * (t[m2] - t1)
+		d2 = d1 + vp * max(t2 - t1, 0.0)
+		m3 = (t >= t2) & (t < t3)
+		tt = t[m3] - t2
+		p[m3] = d2 + vp * tt - 0.5 * a * tt ** 2
+		p[t >= t3] = D
+		return p
+
+	@staticmethod
+	def _av_fit_robot_window(t_ok, a_ok, dt: float, feed: float, accel: float,
+	                          translation: float) -> dict:
+		"""ロボットの指令運動を実データに当てはめ、等速区間の時刻を返す。
+
+		やり方:
+		  1. 理想の位置プロファイル P(t − t0) を作り、a ≈ k·P(t − t0) + c を
+		     最小二乗で当てはめる。未知数は開始時刻 t0 と (k, c) の3つだけ。
+		     **全区間のデータを使う**ので、一部でトラッキングが外れても
+		     窓の位置はほとんど動かない (ここが従来方式との一番の違い)。
+		  2. 加速度が未入力/実際とずれている場合に備えて、加速時間 t_ramp も
+		     対数グリッドで探索する (実測の加速度が分かる副産物つき)。
+		  3. 決まった等速区間の内側だけで 位置 vs 時刻 を直線回帰し、
+		     その傾きを k の推定に使う (これは従来と同じ不偏推定量)。
+
+		Returns: dict (失敗時は {"ok": False, "reason": ...})
+		"""
+		import numpy as np
+		out = {"ok": False}
+		v = abs(float(feed or 0.0))
+		D = abs(float(translation or 0.0))
+		acc_cmd = abs(float(accel or 0.0))
+		if v <= 0 or D <= 0:
+			out["reason"] = "送り速度と移動量の両方が要ります"
+			return out
+		t_ok = np.asarray(t_ok, dtype=float)
+		a_ok = np.asarray(a_ok, dtype=float)
+		n = len(t_ok)
+		if n < 20 or dt <= 0:
+			out["reason"] = "点が少なすぎます"
+			return out
+		t_span = float(t_ok[-1] - t_ok[0])
+
+		def _best_t0(t_ramp_try):
+			"""この加速時間のもとで、最も当てはまる開始時刻 t0 と残差を返す。"""
+			acc_try = v / max(t_ramp_try, 1e-9)
+			prof = MainMenuGUI._av_profile_times(v, acc_try, D)
+			if prof is None:
+				return None
+			best = None
+			# t0 の候補: 記録の先頭より少し前から、動作が収まる範囲まで
+			lo = float(t_ok[0]) - prof["t3"] * 0.5
+			hi = float(t_ok[-1]) - prof["t3"] * 0.5
+			if hi < lo:
+				hi = lo
+			step = max(dt, (hi - lo) / 400.0)
+			cands = np.arange(lo, hi + step * 0.5, step)
+			for t0 in cands:
+				P = MainMenuGUI._av_profile_position(t_ok - t0, v, acc_try, D, prof)
+				if P is None:
+					continue
+				# a ≈ k·P + c の最小二乗 (2変数の閉形式)
+				Sp = float(P.sum()); Spp = float((P * P).sum())
+				Sa = float(a_ok.sum()); Spa = float((P * a_ok).sum())
+				det = n * Spp - Sp * Sp
+				if abs(det) < 1e-12:
+					continue
+				k = (n * Spa - Sp * Sa) / det
+				c = (Spp * Sa - Sp * Spa) / det
+				r = a_ok - (k * P + c)
+				sse = float((r * r).sum())
+				if best is None or sse < best[0]:
+					best = (sse, float(t0), float(k), float(c), prof, acc_try)
+			return best
+
+		# --- 加速時間の探索 ---
+		# 台形が成立する範囲は t_ramp < D/v。下限はフレーム間隔の数倍。
+		t_ramp_max = 0.95 * (D / v)
+		t_ramp_min = max(3.0 * dt, 0.02)
+		if t_ramp_min >= t_ramp_max:
+			out["reason"] = "移動量に対して送り速度が速すぎます (等速区間が作れません)"
+			return out
+		tries = []
+		if acc_cmd > 0:
+			tries.append(min(max(v / acc_cmd, t_ramp_min), t_ramp_max))
+		tries += list(np.geomspace(t_ramp_min, t_ramp_max, 24))
+		best = None
+		best_tr = None
+		for tr in tries:
+			b = _best_t0(float(tr))
+			if b is not None and (best is None or b[0] < best[0]):
+				best = b; best_tr = float(tr)
+		# 対数グリッドは粗い (刻み約1.2倍) ので、勝った所の周りを線形に詰め直す。
+		# 加速時間はレポートに「実測の加速時間」として出すので、桁だけでなく
+		# 値そのものを合わせておきたい。
+		if best_tr is not None:
+			for tr in np.linspace(max(best_tr / 1.35, t_ramp_min),
+			                      min(best_tr * 1.35, t_ramp_max), 15):
+				b = _best_t0(float(tr))
+				if b is not None and b[0] < best[0]:
+					best = b
+		if best is None:
+			out["reason"] = "プロファイルを当てはめられませんでした"
+			return out
+		sse, t0, k_prof, c_prof, prof, acc_fit = best
+		# 指令どおりの加速度でのプロファイル (比較用に残す)
+		prof_cmd = MainMenuGUI._av_profile_times(v, acc_cmd, D) if acc_cmd > 0 else None
+
+		# --- 等速区間 ---
+		if prof["t_cruise"] <= max(4.0 * dt, 0.1):
+			out["reason"] = ("等速区間がほぼありません "
+			                 f"(推定の加速時間 {prof['t_ramp']:.2f}s に対し等速 {prof['t_cruise']:.2f}s)")
+			out.update({"t0": t0, "prof": prof, "acc_fit": acc_fit, "prof_cmd": prof_cmd})
+			return out
+		margin = max(2.0 * dt, 0.03 * prof["t_cruise"])
+		w_lo = t0 + prof["t1"] + margin
+		w_hi = t0 + prof["t2"] - margin
+		mask = (t_ok >= w_lo) & (t_ok <= w_hi)
+		n_in = int(mask.sum())
+		if n_in < 8:
+			out["reason"] = (f"等速区間に入るフレームが {n_in} 点しかありません "
+			                 f"(t={w_lo:.2f}〜{w_hi:.2f}s / 記録は {t_ok[0]:.2f}〜{t_ok[-1]:.2f}s)")
+			out.update({"t0": t0, "prof": prof, "acc_fit": acc_fit, "prof_cmd": prof_cmd,
+			            "win": (w_lo, w_hi)})
+			return out
+		tt = t_ok[mask]; aa = a_ok[mask]
+		n0 = int(len(tt))
+		A = np.vstack([tt, np.ones_like(tt)]).T
+		sol, _r, _rk, _sv = np.linalg.lstsq(A, aa, rcond=None)
+		resid = aa - A @ sol
+		# 外れ値 (姿勢の飛び) を落として引き直す。1回では、飛んだあと数フレーム
+		# 尾を引くような崩れ方 (実測: V軸 t=20s の +41°/s のスパイクと、その後の逆走) を
+		# 取り切れないので最大3回まわす。ただし全体の10%までしか捨てない
+		# (捨てすぎると「都合の良い所だけ残す」ことになるため)。
+		# 落とした数はレポートに出すので、黙って捨てたことにはならない。
+		n_rej = 0
+		for _it in range(3):
+			sigma = 1.4826 * float(np.median(np.abs(resid - np.median(resid))))
+			if sigma <= 0:
+				break
+			keep = np.abs(resid) <= 4.0 * sigma
+			drop = int((~keep).sum())
+			if drop == 0 or n_rej + drop > 0.10 * n0 or int(keep.sum()) < 8:
+				break
+			n_rej += drop
+			tt = tt[keep]; aa = aa[keep]
+			A = np.vstack([tt, np.ones_like(tt)]).T
+			sol, _r, _rk, _sv = np.linalg.lstsq(A, aa, rcond=None)
+			resid = aa - A @ sol
+		# 等速区間を5等分し、各小区間の傾きを比べる。
+		# ばらつきが小さければ「その軸のスケールが一様にずれている」ことになり、
+		# 大きければ「平均値としての k はあてにならない」ことが分かる。
+		# 実測: W軸は5区間すべて -0.65〜-1.07% と揃っていたが、U軸は -5.5〜+5.0% と
+		# 散らばっていて、平均の +0.95% には意味が無かった。
+		parts = []
+		try:
+			edges = np.linspace(float(tt[0]), float(tt[-1]), 6)
+			for _i in range(5):
+				mm2 = (tt >= edges[_i]) & (tt <= edges[_i + 1])
+				if int(mm2.sum()) < 8:
+					continue
+				A2 = np.vstack([tt[mm2], np.ones(int(mm2.sum()))]).T
+				s2, _a, _b, _c = np.linalg.lstsq(A2, aa[mm2], rcond=None)
+				parts.append(float(s2[0]))
+		except Exception:
+			parts = []
+		out.update({
+			"parts": parts,
+			"part_spread": (float(np.std(parts) / abs(float(sol[0])))
+			                if len(parts) >= 3 and abs(float(sol[0])) > 1e-12 else float("nan")),
+			"ok": True, "t0": float(t0), "prof": prof, "prof_cmd": prof_cmd,
+			"acc_fit": float(acc_fit), "acc_cmd": float(acc_cmd),
+			"k_profile": float(k_prof), "profile_resid": float(np.sqrt(sse / n)),
+			"win": (float(w_lo), float(w_hi)), "mask": mask,
+			"v_const": float(sol[0]), "intercept": float(sol[1]),
+			"n_used": int(len(tt)), "n_rejected": n_rej,
+			"fit_resid": float(np.std(resid)),
+			"cut_head": bool(w_lo < t_ok[0] + 1e-9),
+			"cut_tail": bool(w_hi > t_ok[-1] - 1e-9),
+		})
+		return out
+
+	# ---- UI ----
+	def _create_aruco_verify_tab(self) -> None:
+		"""ArUco精度検証タブのUIを構築する。"""
+		self._av_init_vars()
+
+		# 試験タブバー（スクロール枠の外・常時表示）。
+		# 「ArUco検出精度の検証（…）」の見出しより上に置く。
+		self._av_tabbar_frame = self._make_tabbar(
+			self.aruco_verify_tab, "av", self.on_av_tab_add)
+
+		canvas = tk.Canvas(self.aruco_verify_tab, highlightthickness=0)
+		scrollbar = ttk.Scrollbar(self.aruco_verify_tab, orient="vertical", command=canvas.yview)
+		scrollable_frame = ttk.Frame(canvas)
+		scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+		canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+		canvas.configure(yscrollcommand=scrollbar.set)
+		canvas.pack(side="left", fill="both", expand=True)
+		scrollbar.pack(side="right", fill="y")
+
+		def _on_mousewheel(event):
+			step = _mousewheel_units(event)
+			if step:
+				canvas.yview_scroll(step, "units")
+		canvas.bind("<Enter>", lambda e: (canvas.bind_all("<MouseWheel>", _on_mousewheel),
+		                                   canvas.bind_all("<Button-4>", _on_mousewheel),
+		                                   canvas.bind_all("<Button-5>", _on_mousewheel)))
+		canvas.bind("<Leave>", lambda e: (canvas.unbind_all("<MouseWheel>"),
+		                                   canvas.unbind_all("<Button-4>"),
+		                                   canvas.unbind_all("<Button-5>")))
+
+		container = scrollable_frame
+		container.columnconfigure(0, weight=1)
+		r = 0
+
+		# ---- 概要 ----
+		head = ttk.LabelFrame(container, text="ArUco検出精度の検証（ロボット既知動作との突き合わせ）",
+		                       style="Bold.TLabelframe")
+		head.grid(row=r, column=0, sticky="ew", padx=8, pady=(8, 4))
+		r += 1
+		ttk.Label(head, justify="left", text=(
+			"FRS-2015 で1軸ずつ既知量だけ動かし、マーカーの相対変位と比較します。\n"
+			"  ・直動 X/Y/Z → |Δp| [mm] を比較。マーカー実寸に比例して効くので、"
+			"ズレはそのまま「実寸の較正値」になります\n"
+			"  ・回転 U/V/W → Δθ [°] を比較。マーカー実寸に一切依存しない、純粋な角度精度です\n"
+			"  ・どちらもカメラの置き方に依存しないので hand-eye 較正は不要です\n"
+			"  ・動かしていない側のマーカーは静止しているはずなので、その見かけの変位＝ノイズフロアです\n"
+			"※ 等速区間の切り出しは自動です。②の表に、ロボットへ実際に入力する"
+			"Translation(移動量) / Speed(送り速度) / Accel(加速度) を入れてください。\n"
+			"　 台形速度から等速区間が計算で決まるので、途中でトラッキングが乱れても"
+			"区間がずれません（合成データでの検証: 姿勢が飛ぶケースで誤差 −0.79% → −0.01%）。"
+		)).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+		# ---- ① 共通設定 ----
+		cfg = ttk.LabelFrame(container, text="① 共通設定（ArUco / マーカーID）", style="Bold.TLabelframe")
+		cfg.grid(row=r, column=0, sticky="ew", padx=8, pady=4)
+		r += 1
+		ttk.Label(cfg, text="ArUco辞書:").grid(row=0, column=0, sticky="w", padx=(8, 4), pady=4)
+		ttk.Combobox(cfg, textvariable=self.av_aruco_dict, width=18, state="readonly",
+		             values=["DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250",
+		                     "DICT_5X5_100", "DICT_5X5_250", "DICT_6X6_250",
+		                     "DICT_APRILTAG_36h11"]).grid(row=0, column=1, sticky="w", padx=(0, 12))
+		ttk.Label(cfg, text="マーカー実寸 [mm]:").grid(row=0, column=2, sticky="w", padx=(0, 4))
+		ttk.Entry(cfg, textvariable=self.av_marker_size_mm, width=8).grid(
+			row=0, column=3, sticky="w", padx=(0, 12))
+		ttk.Label(cfg, text="直動側 ID:").grid(row=0, column=4, sticky="w", padx=(0, 4))
+		ttk.Entry(cfg, textvariable=self.av_id_lin, width=6).grid(row=0, column=5, sticky="w", padx=(0, 12))
+		ttk.Label(cfg, text="回転側 ID:").grid(row=0, column=6, sticky="w", padx=(0, 4))
+		ttk.Entry(cfg, textvariable=self.av_id_rot, width=6).grid(row=0, column=7, sticky="w", padx=(0, 12))
+		ttk.Label(cfg, text="stride:").grid(row=0, column=8, sticky="w", padx=(0, 4))
+		ttk.Entry(cfg, textvariable=self.av_stride, width=5).grid(row=0, column=9, sticky="w", padx=(0, 8))
+		ttk.Label(cfg, text="グラフの平滑化 [Hz]:").grid(
+			row=0, column=11, sticky="w", padx=(8, 4))
+		ttk.Label(cfg, textvariable=self.ankle_smooth_cutoff_hz,
+		          font=(self.ui_font_family, 9, "bold"), foreground="#204080").grid(
+			row=0, column=12, sticky="w", padx=(0, 2))
+		ttk.Label(cfg, foreground="#666",
+		          text="← ankle simulator ⑤ の設定を共用（変更はそちらで）").grid(
+			row=0, column=13, sticky="w", padx=(0, 8))
+		ttk.Checkbutton(cfg, text="グラフの軸を自動調整（0起点）",
+		                variable=self.av_axis_auto).grid(
+			row=0, column=14, sticky="w", padx=(8, 8))
+		ttk.Label(cfg, text="グラフ [cm] 枠:").grid(
+			row=0, column=15, sticky="w", padx=(8, 2))
+		ttk.Entry(cfg, textvariable=self.av_chart_size_cm, width=5).grid(
+			row=0, column=16, sticky="w", padx=(0, 4))
+		ttk.Label(cfg, text="作図エリア:").grid(row=0, column=17, sticky="w", padx=(0, 2))
+		ttk.Entry(cfg, textvariable=self.av_plot_size_cm, width=5).grid(
+			row=0, column=18, sticky="w", padx=(0, 8))
+		ttk.Button(cfg, text="この2枚を印刷用PDFに",
+		           command=self.on_av_print_markers).grid(row=0, column=10, padx=(8, 8))
+		ttk.Label(cfg, foreground="#555", justify="left", text=(
+			"直動側アームと回転側アームの両方にマーカーを貼り、両方を同時に記録します"
+			"（静止側がノイズフロア基準になります）。\n"
+			"マーカー実寸は おおよその値（±20%程度以内）で構いません。姿勢(回転)は実寸に一切依存せず、\n"
+			"距離だけが実寸に正比例するので、直動軸の結果から正しい実寸が一意に逆算できます。\n"
+			"ただし深度による表裏(IPPE)判定は実寸に依存するので、桁違いの値は入れないでください。\n"
+			"stride はフレームの間引きです。1=全フレーム。間引くと傾き推定が悪くなるので 1 のままにしてください。"
+		)).grid(row=1, column=0, columnspan=10, sticky="w", padx=8, pady=(0, 6))
+
+		# ---- ② 6軸テーブル ----
+		tbl = ttk.LabelFrame(container, text="② 6軸の試験（1軸ずつ録画 → 解析）", style="Bold.TLabelframe")
+		tbl.grid(row=r, column=0, sticky="ew", padx=8, pady=4)
+		r += 1
+		heads = {0: "軸", 1: "種別", 2: "Translation\n移動量", 3: "Speed\n送り速度",
+		         4: "Accel\n加速度", 5: "録画データ (.db3)",
+		         10: "状態",
+		         11: "結果（実測span / 誤差 / 残差 / カメラ距離・幾何角）"}
+		for c, h in heads.items():
+			ttk.Label(tbl, text=h, font=(self.ui_font_family, 9, "bold")).grid(
+				row=0, column=c, sticky="w", padx=4, pady=(6, 2))
+		for i, (ax, kind) in enumerate(self.AV_AXES):
+			row = self.av_rows[ax]
+			rr = i + 1
+			ttk.Label(tbl, text=ax, font=(self.ui_font_family, 11, "bold")).grid(
+				row=rr, column=0, sticky="w", padx=(8, 4), pady=2)
+			ttk.Label(tbl, text=self._av_kind_label(kind)).grid(row=rr, column=1, sticky="w", padx=4)
+			ttk.Entry(tbl, textvariable=row["commanded"], width=8).grid(row=rr, column=2, sticky="w", padx=4)
+			ttk.Entry(tbl, textvariable=row["feed"], width=8).grid(row=rr, column=3, sticky="w", padx=4)
+			ttk.Entry(tbl, textvariable=row["accel"], width=8).grid(row=rr, column=4, sticky="w", padx=4)
+			ttk.Entry(tbl, textvariable=row["bag"], width=30).grid(row=rr, column=5, sticky="w", padx=4)
+			ttk.Button(tbl, text="参照", width=5,
+			           command=lambda a=ax: self.on_av_browse_bag(a)).grid(row=rr, column=6, padx=2)
+			ttk.Button(tbl, text="録画", width=5,
+			           command=lambda a=ax: self.on_av_record(a)).grid(row=rr, column=7, padx=2)
+			ttk.Button(tbl, text="解析", width=5,
+			           command=lambda a=ax: self.on_av_analyze(a)).grid(row=rr, column=8, padx=2)
+			ttk.Button(tbl, text="詳細", width=5,
+			           command=lambda a=ax: self.on_av_show_detail(a)).grid(row=rr, column=9, padx=2)
+			ttk.Label(tbl, textvariable=row["state"], width=8).grid(row=rr, column=10, sticky="w", padx=4)
+			ttk.Label(tbl, textvariable=row["summary"], foreground="#204080").grid(
+				row=rr, column=11, sticky="w", padx=4)
+		# 台形速度の内訳をその場で出す (指令の妥当性をここで確認できるように)
+		row_prof = len(self.AV_AXES) + 1
+		self.av_profile_note = tk.StringVar(value="")
+		ttk.Label(tbl, textvariable=self.av_profile_note, foreground="#205020",
+		          justify="left", font=(self.ui_font_family, 8)).grid(
+			row=row_prof, column=0, columnspan=12, sticky="w", padx=8, pady=(4, 2))
+		ttk.Button(tbl, text="等速区間を計算して確認", command=self.on_av_show_profiles).grid(
+			row=row_prof + 1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+		ttk.Label(tbl, foreground="#555", justify="left", wraplength=880, text=(
+			"Translation / Speed / Accel は、ロボットに実際に入力する値をそのまま入れてください。"
+			"台形速度なので 加速時間 = Speed/Accel、等速時間 = Translation/Speed − Speed/Accel で"
+			"等速区間が一意に決まります（例: 1mm/s・1mm/s²・10mm → 加速1.0s / 等速9.0s / 減速1.0s、"
+			"全体11.0s）。3つとも入れると、区間の切り出しを『データの見た目』ではなく"
+			"『指令の当てはめ』で決めるので、途中でトラッキングが乱れても区間が動きません。"
+			"Accel が分からなければ空欄(0)でも構いません。その場合はデータから加速時間を推定します。"
+			)).grid(row=row_prof + 1, column=4, columnspan=8, sticky="w", padx=8, pady=(0, 6))
+
+		# ---- ③ 実行 ----
+		act = ttk.LabelFrame(container, text="③ まとめ実行 / 出力", style="Bold.TLabelframe")
+		act.grid(row=r, column=0, sticky="ew", padx=8, pady=4)
+		r += 1
+		ttk.Button(act, text="未解析の軸をまとめて解析",
+		           command=self.on_av_analyze_all).grid(row=0, column=0, padx=8, pady=6)
+		ttk.Button(act, text="Excel出力（軸ごとシート）",
+		           command=self.on_av_export_sheets).grid(row=0, column=1, padx=8, pady=6)
+		ttk.Button(act, text="サマリーレポート表示",
+		           command=self.on_av_show_report).grid(row=0, column=2, padx=8, pady=6)
+		ttk.Button(act, text="結果クリア",
+		           command=self.on_av_clear_results).grid(row=0, column=3, padx=8, pady=6)
+		ttk.Label(act, textvariable=self.av_status, foreground="#444").grid(
+			row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+
+		# ---- ④ グラフのテンプレート ----
+		tpl = ttk.LabelFrame(container, text="④ Excel出力に使うグラフのテンプレート",
+		                      style="Bold.TLabelframe")
+		tpl.grid(row=r, column=0, sticky="ew", padx=8, pady=4)
+		r += 1
+		self.av_template_status = tk.StringVar(value="")
+		ttk.Button(tpl, text="見本のExcelからグラフを取り込む",
+		           command=self.on_av_import_chart_template).grid(
+			row=0, column=0, padx=8, pady=6, sticky="w")
+		ttk.Button(tpl, text="既定に戻す",
+		           command=self.on_av_reset_chart_template).grid(
+			row=0, column=1, padx=8, pady=6, sticky="w")
+		ttk.Label(tpl, textvariable=self.av_template_status, foreground="#204080",
+		          wraplength=880, justify="left").grid(
+			row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+		ttk.Label(tpl, foreground="#555", justify="left", wraplength=880, text=(
+			"使い方: このタブの「Excel出力」で出したファイルを Excel で開き、好きな体裁で"
+			"グラフを1つ作って保存 → そのファイルをここで取り込みます。以降の出力では、"
+			"その体裁のまま rgb / depth_corners / fusion の3つに増やして、1シートにつき"
+			"3つのグラフを入れます（縦軸の「計測」だけを差し替え、グラフのタイトルを手法名にします）。\n"
+			"横軸が「経過時間」でも「理想」でも構いません。列の見出しに含まれる"
+			"『経過時間 / 理想 / 計測』から役割を判定するので、"
+			"理想 × 計測 の散布図と、理想 × 理想 の y=x 線を同じグラフに入れてある見本も"
+			"そのまま扱えます。判定できない列があれば取り込み時に聞きます。\n"
+			"※ グラフの体裁（線幅・マーカー・軸の最大最小）はテンプレートのまま複製します。"
+			"openpyxl で組み直すと見た目が変わってしまうため、XMLを丸ごとコピーしています。"
+			)).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+		# ---- ⑤ Excelでの使い方 ----
+		howto = ttk.LabelFrame(container, text="⑤ Excel での使い方", style="Bold.TLabelframe")
+		howto.grid(row=r, column=0, sticky="ew", padx=8, pady=(4, 12))
+		r += 1
+		ttk.Label(howto, justify="left", text=(
+			"Excelは軸ごとに別シート (X / Y / Z / U / V / W)、1フレーム1行、3手法を横に並べて出力します。\n"
+			"  1. speed_rgb 列（直動）または omega_rgb 列（回転）を見て、値が一定の区間を選ぶ\n"
+			"  2. その区間だけを残す（＝加速・減速のカット）\n"
+			"  3. 横軸に「ロボット動作」を作る:\n"
+			"       Speed を入れてある場合 … グラフ用_理想_ロボット 列が使えます（区間先頭で0にシフト）\n"
+			"       入れていない場合     … v × (t_sec − 区間先頭の t_sec) を Excel 側で計算\n"
+			"  4. 縦軸に along_rgb（符号付きの主軸投影）を取り、散布図 → y=x と比較\n"
+			"     ※ disp_rgb は |Δp| なので常に正。往復させた場合は along を使ってください\n"
+			"  5. 3手法を重ねれば、ジッター（ばらつき）ではなく確度（真値からのズレ）で比較できます"
+		)).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+
+		self._av_refresh_template_label()
+		self._load_av_state()
+		self._av_load_all_results()
+
+	# ---- 状態永続化 ----
+	def _av_state_file_path(self) -> Path:
+		import platform
+		filename = "frs2015_gui_state_aruco_verify.json"
+		if platform.system() == "Darwin":
+			state_dir = Path.home() / ".frs_simulator"
+			state_dir.mkdir(parents=True, exist_ok=True)
+			return state_dir / filename
+		return Path(__file__).with_name(filename)
+
+	def _save_av_state(self) -> None:
+		"""試験タブごとの設定をまとめて保存する。
+
+		旧バージョンでも読めるよう、アクティブなタブの内容は従来のキー
+		(aruco_dict / rows / …) でも同じファイルに書いておく。
+		解析結果 (.npz) はタブごとのフォルダに別途保存されている。
+		"""
+		if not hasattr(self, "av_rows"):
+			return
+		try:
+			cur = self._av_snapshot_current()
+			tabs = getattr(self, "_av_tabs", None) or []
+			if tabs:
+				tabs[self._av_active_tab]["settings"] = cur
+			else:
+				tabs = [{"name": "試験1", "id": "default", "settings": cur}]
+			data = dict(cur)
+			data["tabs"] = [{"name": t.get("name", ""), "id": t.get("id", "default"),
+			                  "settings": t.get("settings") or {}} for t in tabs]
+			data["active"] = int(getattr(self, "_av_active_tab", 0))
+			p = self._av_state_file_path()
+			self._write_json_state(p, data, "精度検証 状態保存")
+		except Exception as e:
+			print(f"[精度検証 状態保存] 失敗: {e}")
+
+	def _load_av_state(self) -> None:
+		"""保存された試験タブを読み込み、アクティブなタブの設定を画面へ入れる。"""
+		data = {}
+		try:
+			p = self._av_state_file_path()
+			if p.exists():
+				data = json.load(p.open("r", encoding="utf-8")) or {}
+		except Exception as e:
+			print(f"[精度検証 状態復元] 失敗: {e}")
+			data = {}
+		try:
+			raw = data.get("tabs")
+			if isinstance(raw, list) and raw:
+				self._av_tabs = []
+				for i, t in enumerate(raw):
+					tid = str((t or {}).get("id") or ("default" if i == 0 else self._av_new_tab_id()))
+					self._av_tabs.append({
+						"name": str((t or {}).get("name") or f"試験{i + 1}"),
+						"id": tid,
+						"settings": (t or {}).get("settings") or {}})
+				try:
+					self._av_active_tab = min(max(int(data.get("active", 0)), 0),
+					                            len(self._av_tabs) - 1)
+				except Exception:
+					self._av_active_tab = 0
+			elif data:
+				# タブ機能より前に保存されたファイル → 1タブぶんとして取り込む
+				self._av_tabs = [{"name": "試験1", "id": "default",
+				                   "settings": {k: data.get(k) for k in
+				                                 ("aruco_dict", "marker_size_mm", "id_lin",
+				                                  "id_rot", "stride", "rows")
+				                                 if k in data}}]
+				self._av_active_tab = 0
+			self._av_init_tabs()
+		except Exception as e:
+			print(f"[精度検証 状態復元] 一部失敗: {e}")
+			try:
+				self._av_init_tabs()
+			except Exception:
+				pass
+
+	# ---- 解析コア ----
+	@staticmethod
+	def _av_relative_series(poses, detected, timestamps, kind: str, robot=None) -> dict:
+		"""姿勢時系列 → 基準フレーム(最初の検出フレーム)からの相対変位系列。
+
+		kind='lin': ベクトル = p(t) − p(t0)               [mm]
+		kind='rot': ベクトル = rotvec(R(t0)^T R(t))        [deg]
+
+		どちらも t0 で厳密に 0 なので、原点を通る直線として SVD で主軸を取る
+		(中心化しない)。主軸への符号付き投影が「動いた量」、直交成分が
+		「軌跡の乱れ」(直動なら真直度、回転なら回転軸のブレ) になる。
+		"""
+		import numpy as np
+		from scipy.spatial.transform import Rotation as _Rot
+		poses = np.asarray(poses, dtype=float)
+		det = np.asarray(detected, dtype=bool)
+		ts = np.asarray(timestamps, dtype=float)
+		n = int(len(det))
+		out = {"ok": False, "n_frames": n, "n_det": int(det.sum())}
+		idx = np.where(det)[0]
+		if len(idx) < 5:
+			out["reason"] = f"検出フレームが少なすぎます ({len(idx)})"
+			return out
+		i0 = int(idx[0])
+		try:
+			if kind == "lin":
+				vec = poses[idx][:, :3, 3] - poses[i0][:3, 3]
+			else:
+				R0T = poses[i0][:3, :3].T
+				Rrel = np.einsum("ij,mjk->mik", R0T, poses[idx][:, :3, :3])
+				vec = _Rot.from_matrix(Rrel).as_rotvec() * (180.0 / np.pi)
+		except Exception as e:
+			out["reason"] = f"相対量の計算に失敗: {e}"
+			return out
+		good = np.all(np.isfinite(vec), axis=1)
+		if not np.all(good):
+			idx = idx[good]
+			vec = vec[good]
+			if len(idx) < 5:
+				out["reason"] = "有限値のフレームが少なすぎます"
+				return out
+		# 主軸 (原点を通る直線として SVD。t0 で 0 なので中心化しない)
+		try:
+			_U, _S, Vt = np.linalg.svd(vec, full_matrices=False)
+		except Exception as e:
+			out["reason"] = f"主軸の推定に失敗: {e}"
+			return out
+		d = Vt[0] / max(float(np.linalg.norm(Vt[0])), 1e-12)
+		a = vec @ d
+		# 最大振れが正になるよう符号を揃える (片道でも往復でも破綻しない)
+		if abs(float(a.min())) > abs(float(a.max())):
+			d = -d
+			a = -a
+		perp = np.linalg.norm(vec - np.outer(a, d), axis=1)
+		mag = np.linalg.norm(vec, axis=1)
+		disp_a = np.full(n, np.nan)
+		along_a = np.full(n, np.nan)
+		perp_a = np.full(n, np.nan)
+		rate_a = np.full(n, np.nan)
+		disp_a[idx] = mag
+		along_a[idx] = a
+		perp_a[idx] = perp
+		# --- 速度と等速区間 ---
+		# 素の差分は速度推定に使わない: 位置ノイズ σ を dt で割るので発散する
+		# (σ=0.3mm, dt=13ms なら σ_v ≒ 22 mm/s。信号 25 mm/s と同オーダー)。
+		# rate_a は Savitzky-Golay(1次) で平滑化した速度で、CSVに出して
+		# ユーザーが等速区間を目視で切り出すためのもの。
+		#
+		# 傾き v_const の求め方（すべて合成データで実測して決めた）:
+		#   ・速度にしきい値を掛けて等速区間を選ぶ方法は、平滑化しても速度の
+		#     ばらつきでマスクが断片化し、片道の推定が +5.6% ずれた → 不採用
+		#   ・移動量そのもので中央 50% (25〜75%) を切り出し、その区間で
+		#     位置 vs 時刻 を最小二乗フィットする方法が最も正確
+		#     (加減速が時間の5〜30%を占める台形速度で誤差 0.1% 以下)
+		#   ・往復させると往路と復路が両方帯に入り傾きが打ち消し合うので、
+		#     最長の連続区間だけに限定して片道ぶんを採る
+		v_const = float("nan"); v_fit_resid = float("nan"); v_n = 0
+		band_local = None; b_int = float("nan")
+		v_band_dev = float("nan")
+
+		def _fit_band(lo_f, hi_f):
+			"""移動量の [lo_f, hi_f] 帯で 位置 vs 時刻 を回帰する。
+
+			Returns: (傾き, 点数, 残差, 採用したフレームのマスク)
+			マスクは CSV のグラフ用列 (等速区間だけを取り出した列) にも使う。
+			"""
+			_empty = np.zeros(len(a), dtype=bool)
+			rng_a = float(a.max() - a.min())
+			if rng_a <= 0:
+				return float("nan"), 0, float("nan"), _empty, float("nan")
+			mm = (a >= a.min() + lo_f * rng_a) & (a <= a.min() + hi_f * rng_a)
+			pad = np.concatenate(([0], mm.astype(np.int8), [0]))
+			dd = np.diff(pad)
+			st = np.where(dd == 1)[0]; en = np.where(dd == -1)[0]
+			if len(st):
+				bi = int(np.argmax(en - st))
+				mm = np.zeros(len(a), dtype=bool)
+				mm[st[bi]:en[bi]] = True
+			if int(mm.sum()) < 6:
+				return float("nan"), 0, float("nan"), _empty, float("nan")
+			tt = t_ok[mm]; aa = a[mm]
+			A = np.vstack([tt, np.ones_like(tt)]).T
+			sol, _r, _rk, _sv = np.linalg.lstsq(A, aa, rcond=None)
+			return (float(sol[0]), int(mm.sum()), float(np.std(aa - A @ sol)), mm,
+			        float(sol[1]))
+
+		if len(idx) >= 7 and len(ts) == n:
+			t_ok = ts[idx]
+			try:
+				dt = float(np.median(np.diff(t_ok))) if len(t_ok) > 1 else 0.0
+			except Exception:
+				dt = 0.0
+			if dt > 0:
+				try:
+					from scipy.signal import savgol_filter
+					win = max(5, int(round(0.25 / dt)) | 1)
+					cap = len(idx) if len(idx) % 2 == 1 else len(idx) - 1
+					win = min(win, cap)
+					if win >= 5:
+						rate_a[idx] = savgol_filter(a, win, 1, deriv=1, delta=dt)
+					else:
+						rate_a[idx] = np.gradient(a, t_ok)
+				except Exception:
+					try:
+						rate_a[idx] = np.gradient(a, t_ok)
+					except Exception:
+						pass
+				try:
+					v_const, v_n, v_fit_resid, band_local, b_int = _fit_band(0.25, 0.75)
+					# 等速区間が本当に存在するかの判定。
+					# 加減速が支配的 (三角形速度) だと帯の中にも曲率が残り、傾きが
+					# 最大 -11% ずれる。しかもこの誤差はノイズと無関係に効くので、
+					#   ・前半/後半の傾き比較 → 左右対称なので検出できない
+					#   ・回帰残差とノイズ水準の比 → σ が大きいと埋もれて検出できない
+					# のどちらも役に立たなかった (両方とも実測で確認)。
+					# 広い帯(25-75%)と狭い帯(33-67%)の傾きを比べると、等速区間が
+					# あれば一致し、無ければ狭い帯のほうが速く出るので差が開く。
+					# 実測: 加減速30%以下 → 差 0.36% 以下 / 加減速50% → 差 4.6〜5.6%
+					# (σ=0.1〜0.6mm のどこでも同じ) なので しきい値 2% で分離できる。
+					v_narrow, _n2, _r2, _m2, _b2 = _fit_band(0.33, 0.67)
+					if np.isfinite(v_const) and abs(v_const) > 1e-9 and np.isfinite(v_narrow):
+						v_band_dev = abs(v_narrow - v_const) / abs(v_const)
+				except Exception:
+					pass
+				# --- ロボットの指令 (送り/加速度/移動量) から等速区間を割り出す ---
+				# データ依存の帯 (25〜75%) はトラッキングの飛びで位置がずれるので、
+				# 指令が入力されていればそちらを優先する。両方の結果は残しておいて
+				# レポートで突き合わせられるようにする。
+				if robot:
+					try:
+						rob = MainMenuGUI._av_fit_robot_window(
+							t_ok, a, dt, robot.get("feed"), robot.get("accel"),
+							robot.get("translation"))
+					except Exception as _e:
+						rob = {"ok": False, "reason": f"当てはめに失敗: {_e}"}
+					out["robot"] = {kk: vv for kk, vv in rob.items() if kk != "mask"}
+					if rob.get("ok"):
+						v_auto = v_const
+						v_const = float(rob["v_const"])
+						v_fit_resid = float(rob["fit_resid"])
+						v_n = int(rob["n_used"])
+						band_local = np.asarray(rob["mask"], dtype=bool)
+						b_int = float(rob["intercept"])
+						out["v_const_auto"] = v_auto
+						out["window_source"] = "robot"
+		# 撮影ジオメトリ。|Δp| と Δθ 自体はカメラの置き方に依存しないが、
+		# 「その運動をどれだけ正確に測れるか」はカメラとの相対姿勢で大きく変わる:
+		#   ・並進は 奥行き(光軸)方向が最も弱く、横方向が最も強い
+		#   ・回転は マーカー法線まわり(面内)が最も強く、面外の傾きが最も弱い
+		# 軸ごとにカメラを置き直すと、この関係が軸ごとに変わってしまうので記録しておく。
+		try:
+			_nrm = poses[idx][:, :3, 2]
+			_nrm = _nrm[np.all(np.isfinite(_nrm), axis=1)]
+			_nrm = _nrm.mean(axis=0)
+			_nrm = (_nrm / max(float(np.linalg.norm(_nrm)), 1e-12)).tolist()
+			_dist = float(np.nanmean(np.linalg.norm(poses[idx][:, :3, 3], axis=1)))
+			# 主指標は t0 (= 相対量の基準にしている最初の検出フレーム) の距離。
+			# |Δp| も Δθ も p(t0) / R(t0) を基準に作っているので、
+			# 「どこから撮ったか」も同じ時点で言わないと対応が取れない。
+			# 平均は動いた分だけ動いてしまう (直動Zなら移動量ぶん丸ごとずれる)。
+			_dist0 = float(np.linalg.norm(poses[i0][:3, 3]))
+		except Exception:
+			_nrm = None; _dist = float('nan'); _dist0 = float('nan')
+		# 等速区間のマスク (全フレーム長)。CSVのグラフ用列で使う。
+		band_mask = np.zeros(n, dtype=bool)
+		if band_local is not None and len(band_local) == len(idx):
+			band_mask[idx[band_local]] = True
+		# グラフ用マスク: k の推定は保守的な 25-75% のままにしつつ、プロットには
+		# 実データを目一杯使いたいので、回帰直線から外れない所まで帯を左右に広げる。
+		# 加速・減速に入ると直線から離れるので、そこで自動的に止まる。
+		plot_mask = band_mask.copy()
+		try:
+			if out.get("window_source") == "robot":
+				# ロボット指令から出した窓は、そもそも等速区間そのもの。
+				# 広げると加減速に食い込むので、この場合だけ広げない。
+				pass
+			elif (band_local is not None and np.any(band_local)
+				        and np.isfinite(v_const) and np.isfinite(b_int)):
+				# 許容値は実測で決めた。4×残差/1%span だと加速区間に 0.5秒ぶん食い込み、
+				# 2×残差まで詰めると逆に等速区間でも切れてしまう (ノイズ以下になるため)。
+				tol = max(3.0 * v_fit_resid, 0.003 * float(a.max() - a.min()))
+				ii2 = np.where(band_local)[0]
+				lo = int(ii2[0]); hi = int(ii2[-1])
+				while lo - 1 >= 0 and abs(a[lo - 1] - (v_const * t_ok[lo - 1] + b_int)) < tol:
+					lo -= 1
+				while hi + 1 < len(a) and abs(a[hi + 1] - (v_const * t_ok[hi + 1] + b_int)) < tol:
+					hi += 1
+				pm = np.zeros(len(a), dtype=bool); pm[lo:hi + 1] = True
+				plot_mask = np.zeros(n, dtype=bool); plot_mask[idx[pm]] = True
+		except Exception:
+			pass
+		out.update({
+			"ok": True, "idx": idx, "axis_dir": d.tolist(),
+			"marker_normal": _nrm, "dist_mm": _dist, "dist0_mm": _dist0,
+			"disp": disp_a, "along": along_a, "perp": perp_a, "rate": rate_a,
+			"span": float(a.max() - a.min()),
+			# 弦長 = 始点からの最大距離。回転試験ではマーカーの軌跡が円弧になるので、
+			# 主軸投影の span で半径を出すと 0.6% ほど過小になる。半径は弦長から出す。
+			"chord": float(np.nanmax(np.linalg.norm(vec, axis=1))),
+			"v_const": v_const, "v_fit_resid": v_fit_resid, "v_const_n": v_n,
+			"band_mask": band_mask, "plot_mask": plot_mask,
+			"v_band_dev": v_band_dev,
+			"perp_rms": float(np.sqrt(np.mean(perp ** 2))),
+			"perp_max": float(perp.max()),
+			"n_used": int(len(idx)),
+			"first_det": int(idx[0]), "last_det": int(idx[-1]),
+		})
+		return out
+
+	def _av_series_both(self, poses, detected, timestamps, robot=None,
+	                     robot_kind=None) -> dict:
+		"""並進系列と回転系列の両方を返す (回転試験でも半径を出したいので両方要る)。
+
+		robot はロボットの運動指令 {feed, accel, translation}。試験している側
+		(robot_kind) の系列にだけ効かせる (直動試験の回転成分はクロストークなので
+		台形プロファイルに従わない)。"""
+		return {"lin": self._av_relative_series(poses, detected, timestamps, "lin",
+		                                        robot if robot_kind == "lin" else None),
+		        "rot": self._av_relative_series(poses, detected, timestamps, "rot",
+		                                        robot if robot_kind == "rot" else None)}
+
+	def _av_method_poses(self, cache: dict, aid: int) -> dict:
+		"""3手法それぞれの姿勢時系列 (N,4,4) を取り出す。
+
+		_ankle_method_compare は runtime 専用 (npz には保存されない) なので、
+		検出直後にこの関数で回収する。取れない場合は採用姿勢を rgb 扱いにする。
+		"""
+		import numpy as np
+		n = int(len(cache.get("timestamps", [])))
+		store = getattr(self, "_ankle_method_compare", None) or {}
+		slot = store.get(int(aid)) or {}
+		out = {}
+		for disp_name, key in self.AV_METHODS:
+			arr = slot.get(key)
+			if arr is not None and len(arr) == n and n > 0:
+				try:
+					out[disp_name] = np.asarray(arr, dtype=float)
+				except Exception:
+					out[disp_name] = None
+			else:
+				out[disp_name] = None
+		if out.get("rgb") is None:
+			try:
+				out["rgb"] = np.asarray(cache["bones"][int(aid)]["poses"], dtype=float)
+			except Exception:
+				pass
+		return out
+
+	@staticmethod
+	def _av_detected_mask(poses):
+		import numpy as np
+		P = np.asarray(poses, dtype=float)
+		if P.ndim != 3 or len(P) == 0:
+			return np.zeros(0, dtype=bool)
+		return np.all(np.isfinite(P.reshape(len(P), -1)), axis=1)
+
+	# ---- 操作 ----
+	@staticmethod
+	def _av_bag_frame_count(path: str):
+		"""録画ファイルに画像フレームが何枚入っているかを sqlite で直接数える。
+
+		.db3 は rosbag2 の SQLite なので、パイプラインを起こさずに調べられる。
+		「録画開始を押さずに終了した」ファイルはヘッダだけ (数十KB・0フレーム) に
+		なるが、症状は「マーカーが1つも検出されない」なので原因が分かりにくい。
+		Returns: 画像フレーム数 (調べられなければ None)
+		"""
+		try:
+			import sqlite3
+			con = sqlite3.connect(str(path))
+			try:
+				cur = con.cursor()
+				n = cur.execute(
+					"SELECT COUNT(*) FROM messages m JOIN topics t ON m.topic_id = t.id "
+					"WHERE t.name LIKE '%image/data'").fetchone()[0]
+				return int(n)
+			finally:
+				con.close()
+		except Exception:
+			return None
+
+	def _av_scan_all_ids(self, bag_path: str, dict_name: str, max_frames: int = 40) -> dict:
+		"""録画の先頭を走査して、辞書内の「どのID」が実際に写っているかを数える。
+
+		目的のIDが0件だったときに「ID違い」なのか「そもそも写っていない」のかを
+		切り分けるための診断。Returns: {id: 検出回数}
+		"""
+		import numpy as np
+		import cv2
+		import pyrealsense2 as rs
+		found = {}
+		pipeline = None
+		try:
+			detector, dictionary, params, use_new_api = self._ankle_make_detector(dict_name)
+			pipeline = rs.pipeline()
+			config = rs.config()
+			rs.config.enable_device_from_file(config, bag_path, repeat_playback=False)
+			config.enable_stream(rs.stream.color)
+			profile = pipeline.start(config)
+			try:
+				profile.get_device().as_playback().set_real_time(False)
+			except Exception:
+				pass
+			n = 0
+			while n < max_frames:
+				try:
+					frames = pipeline.wait_for_frames(timeout_ms=2000)
+				except RuntimeError:
+					break
+				color = frames.get_color_frame()
+				if not color:
+					continue
+				n += 1
+				img = np.asanyarray(color.get_data())
+				gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+				if use_new_api:
+					_c, ids, _r = detector.detectMarkers(gray)
+				else:
+					_c, ids, _r = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
+				if ids is not None:
+					for v in np.asarray(ids).flatten():
+						found[int(v)] = found.get(int(v), 0) + 1
+		except Exception as e:
+			print(f"[精度検証] ID走査に失敗: {e}")
+		finally:
+			try:
+				if pipeline is not None:
+					pipeline.stop()
+			except Exception:
+				pass
+		return found
+
+	def _av_no_detection_message(self, bag: str, dict_name: str, moving_id: int,
+	                              static_id: int, n_frames: int) -> str:
+		"""動作側マーカーが1フレームも取れなかったときの、原因まで踏み込んだメッセージ。"""
+		if n_frames == 0:
+			return ("この録画には画像フレームが1枚も入っていません。\n\n"
+			        "D405の撮影は「プレビュー → 録画開始 → 録画停止」の2段階で、\n"
+			        "プレビュー中はファイルに何も書き込まれません。\n"
+			        "「録画開始」を押す前に終了したか、押した直後に停止した可能性があります。\n\n"
+			        "※ 同じフォルダの _color.mp4 も 0 バイト相当なら、この状態です。\n"
+			        "   撮り直してください。")
+		found = self._av_scan_all_ids(bag, dict_name)
+		if not found:
+			return (f"画像フレームは {n_frames} 枚ありますが、"
+			        f"{dict_name} のマーカーが1つも検出できませんでした。\n\n"
+			        f"考えられる原因:\n"
+			        f"  ・ArUco辞書が違う（印刷したマーカーの辞書と①の設定を確認）\n"
+			        f"  ・マーカーが画角に入っていない / ピントが合っていない\n"
+			        f"  ・露光不足・露出オーバーでマーカーが潰れている")
+		ids_txt = ", ".join(f"ID={k} ({v}回)" for k, v in
+		                     sorted(found.items(), key=lambda x: -x[1]))
+		return (f"動作側マーカー ID={moving_id} が1フレームも検出されませんでした。\n\n"
+		        f"この録画で実際に写っていたのは:\n  {ids_txt}\n\n"
+		        f"①の「直動側 ID」「回転側 ID」を、実際に貼ったマーカーの番号に\n"
+		        f"合わせてください（現在の設定: 直動側={moving_id if moving_id != static_id else '?'}, "
+		        f"もう一方={static_id}）。")
+
+	# ---- 解析結果の永続化 ----
+	# result には手法ごと・並進/回転ごとの時系列配列が入っていて JSON には重いので、
+	# 配列は .npz、それ以外(スカラー・文字列・真偽値)は JSON にして同じ .npz へ同梱する。
+	# 構造は入れ子なので、キーを添字に振り直して平坦化してから保存する。
+	def _av_result_dir(self, tab_id=None, create: bool = False):
+		"""解析結果の保存先。タブごとに別フォルダにする。
+
+		最初のタブ (id='default') だけは従来どおり cache/av_result/ 直下を使う。
+		タブ機能を足す前に取った結果をそのまま読めるようにするため。
+		"""
+		base = Path(__file__).parent / "cache" / "av_result"
+		tid = tab_id if tab_id is not None else self._av_current_tab_id()
+		d = base if (not tid or tid == "default") else (base / str(tid))
+		# 読むだけのときは作らない (タブを見ただけで空フォルダが増えないように)
+		if create:
+			try:
+				d.mkdir(parents=True, exist_ok=True)
+			except Exception:
+				pass
+		return d
+
+	def _av_result_path(self, axis: str, tab_id=None, create: bool = False):
+		return self._av_result_dir(tab_id, create) / f"av_result_{axis}.npz"
+
+	@staticmethod
+	def _av_flatten(obj, path, arrays, meta):
+		"""入れ子の dict/配列/値 を (配列リスト, メタ辞書) に平坦化する。"""
+		import numpy as np
+		if isinstance(obj, dict):
+			meta[path] = {"t": "dict", "keys": [str(k) for k in obj.keys()]}
+			for k, v in obj.items():
+				MainMenuGUI._av_flatten(v, f"{path}.{k}", arrays, meta)
+		elif isinstance(obj, np.ndarray):
+			meta[path] = {"t": "arr", "i": len(arrays)}
+			arrays.append(obj)
+		elif isinstance(obj, (list, tuple)):
+			meta[path] = {"t": "val", "v": list(obj)}
+		elif isinstance(obj, (np.integer,)):
+			meta[path] = {"t": "val", "v": int(obj)}
+		elif isinstance(obj, (np.floating,)):
+			meta[path] = {"t": "val", "v": float(obj)}
+		elif isinstance(obj, (np.bool_,)):
+			meta[path] = {"t": "val", "v": bool(obj)}
+		else:
+			meta[path] = {"t": "val", "v": obj}
+
+	@staticmethod
+	def _av_unflatten(path, arrays, meta):
+		e = meta.get(path)
+		if e is None:
+			return None
+		if e["t"] == "dict":
+			return {k: MainMenuGUI._av_unflatten(f"{path}.{k}", arrays, meta) for k in e["keys"]}
+		if e["t"] == "arr":
+			return arrays[int(e["i"])]
+		return e["v"]
+
+	def _av_signature(self, axis: str) -> dict:
+		"""結果がどの設定で得られたかの指紋。設定を変えたのに古い結果を使う事故を防ぐ。"""
+		row = self.av_rows.get(axis) or {}
+		return {
+			"bag": str(row.get("bag").get()) if row.get("bag") is not None else "",
+			"commanded": self._av_getf(row.get("commanded"), 0.0) if row.get("commanded") is not None else 0.0,
+			"feed": self._av_getf(row.get("feed"), 0.0) if row.get("feed") is not None else 0.0,
+			"accel": self._av_getf(row.get("accel"), 0.0) if row.get("accel") is not None else 0.0,
+			"dict": str(self.av_aruco_dict.get()),
+			"marker_size_mm": self._av_getf(self.av_marker_size_mm, 20.0),
+			"id_lin": int(self._av_getf(self.av_id_lin, -1)),
+			"id_rot": int(self._av_getf(self.av_id_rot, -1)),
+			"stride": int(self._av_getf(self.av_stride, 1)),
+		}
+
+	def _av_save_result(self, axis: str) -> bool:
+		"""1軸の解析結果を .npz に保存する (一時ファイル → 原子的差し替え)。"""
+		import numpy as np
+		import os
+		res = (self.av_rows.get(axis) or {}).get("result")
+		p = self._av_result_path(axis, create=bool(res))
+		if not res:
+			try:
+				if p.exists():
+					p.unlink()
+			except Exception:
+				pass
+			return False
+		try:
+			arrays, meta = [], {}
+			self._av_flatten(res, "root", arrays, meta)
+			payload = {f"a{i}": a for i, a in enumerate(arrays)}
+			payload["meta_json"] = np.array(
+				json.dumps({"meta": meta, "sig": self._av_signature(axis),
+				             "report": self._av_row_report(axis)}, ensure_ascii=False),
+				dtype=object)
+			tmp = f"{p}.tmp{os.getpid()}.npz"
+			try:
+				np.savez_compressed(tmp, **payload)
+				if (not os.path.exists(tmp)) or os.path.getsize(tmp) == 0:
+					raise IOError("npz の書き出しに失敗しました (サイズ0)")
+				os.replace(tmp, str(p))
+			finally:
+				try:
+					if os.path.exists(tmp):
+						os.remove(tmp)
+				except Exception:
+					pass
+			return True
+		except Exception as e:
+			print(f"[精度検証 結果保存] {axis}軸 失敗: {e}")
+			return False
+
+	def _av_load_result(self, axis: str) -> bool:
+		"""1軸の解析結果を .npz から復元する。設定が食い違えば警告だけ出して復元は行う。"""
+		import numpy as np
+		p = self._av_result_path(axis)
+		if not p.exists():
+			return False
+		try:
+			with np.load(str(p), allow_pickle=True) as z:
+				blob = json.loads(str(z["meta_json"].item()))
+				meta = blob["meta"]
+				n_arr = sum(1 for k in z.files if k.startswith("a") and k[1:].isdigit())
+				arrays = [z[f"a{i}"] for i in range(n_arr)]
+				res = self._av_unflatten("root", arrays, meta)
+			row = self.av_rows[axis]
+			row["result"] = res
+			row["state"].set("解析済")
+			row["_report"] = blob.get("report", "")
+			row["_sig"] = blob.get("sig", {})
+			kind = res.get("kind", "lin")
+			unit = self._av_unit(kind)
+			res_unit = "mm" if kind == "lin" else "°"
+			row["summary"].set(f"span {res.get('span', 0.0):.3f}{unit} / "
+			                    f"k={res.get('k', float('nan')):.5f} "
+			                    f"({res.get('err_pct_k', float('nan')):+.2f}%) / "
+			                    f"残差 {res.get('perp_rms', 0.0):.3f}{res_unit}"
+			                    + self._av_geom_summary(res))
+			return True
+		except Exception as e:
+			print(f"[精度検証 結果復元] {axis}軸 失敗: {e}")
+			return False
+
+	def _av_geom_summary(self, res: dict) -> str:
+		"""結果欄に出す撮影ジオメトリの短い説明。
+
+		どの条件で撮ったのかが一覧で分かるようにする。距離は ArUco の PnP が
+		返す並進ベクトルの大きさ (= カメラ原点〜マーカー中心) を、
+		**撮影開始 t=0 (最初に検出できたフレーム)** で取った値。
+		古い結果には t=0 の値が入っていないので、その場合だけ従来どおり
+		全フレーム平均を出し「平均」と付けて区別する。
+		幾何角は 直動なら運動方向とカメラ光軸のなす角 (90°=横移動で最良)、
+		回転なら回転軸とマーカー法線のなす角 (0°=面内回転で最良)。
+		"""
+		import numpy as np
+		out = []
+		try:
+			d0 = res.get("dist0_mm")
+			dm = res.get("dist_mm")
+			if d0 is not None and np.isfinite(d0):
+				out.append(f"距離 {float(d0):.0f}mm")
+			elif dm is not None and np.isfinite(dm):
+				out.append(f"距離 {float(dm):.0f}mm(平均)")
+			gd = res.get("geom_deg")
+			if gd is not None and np.isfinite(gd):
+				if res.get("kind") == "lin":
+					q = "横" if float(gd) > 60 else ("斜" if float(gd) > 30 else "奥")
+				else:
+					q = "面内" if float(gd) < 30 else ("斜" if float(gd) < 60 else "面外")
+				out.append(f"{float(gd):.0f}°({q})")
+		except Exception:
+			pass
+		return (" / " + " ".join(out)) if out else ""
+
+	def _av_save_all_results(self) -> None:
+		for ax, _k in self.AV_AXES:
+			try:
+				self._av_save_result(ax)
+			except Exception:
+				pass
+
+	def _av_load_all_results(self) -> None:
+		n = 0
+		for ax, _k in self.AV_AXES:
+			try:
+				if self._av_load_result(ax):
+					n += 1
+			except Exception:
+				pass
+		if n:
+			print(f"[精度検証] 解析結果を {n} 軸ぶん復元しました (再解析は不要です)")
+		self._av_refresh_status()
+		self._av_check_result_signatures()
+
+	def _av_check_result_signatures(self) -> None:
+		"""復元した結果が、現在の設定と食い違っていないか確かめて状態欄に出す。"""
+		for ax, _k in self.AV_AXES:
+			row = self.av_rows.get(ax) or {}
+			if not row.get("result") or not row.get("_sig"):
+				continue
+			cur = self._av_signature(ax)
+			diff = [k for k, v in row["_sig"].items()
+			        if str(cur.get(k)) != str(v)]
+			if diff:
+				row["state"].set("要再解析")
+				print(f"[精度検証] {ax}軸: 保存時と設定が違います ({', '.join(diff)}) → 再解析を推奨")
+
+	def on_av_show_detail(self, axis: str) -> None:
+		"""保存済みのレポートをいつでも呼び出す (解析直後と同じ内容)。"""
+		row = self.av_rows.get(axis) or {}
+		if not row.get("result"):
+			messagebox.showinfo("詳細結果", f"{axis}軸はまだ解析されていません。")
+			return
+		try:
+			text = self._av_row_report(axis)
+		except Exception:
+			text = row.get("_report") or f"{axis}軸: レポートを生成できませんでした。"
+		self._av_text_window(f"{axis}軸 詳細結果", text)
+
+	def on_av_print_markers(self) -> None:
+		"""この2つのID (直動側/回転側) だけを印刷用PDFにする。
+
+		ankle simulator のPDFボタンは骨リストから作るので、検証専用のIDは
+		そのままでは印刷できない。同じベクタ描画ルーチンを呼んで出力する。
+		"""
+		id_lin = int(self._av_getf(self.av_id_lin, -1))
+		id_rot = int(self._av_getf(self.av_id_rot, -1))
+		if id_lin < 0 or id_rot < 0:
+			messagebox.showwarning("マーカーPDF", "ArUco ID を正しく入力してください。")
+			return
+		if id_lin == id_rot:
+			messagebox.showwarning("マーカーPDF", "直動側と回転側に同じ ID が指定されています。")
+			return
+		items = [(id_lin, "直動側"), (id_rot, "回転側")]
+		self._ankle_marker_pdf_dialog(items, str(self.av_aruco_dict.get()),
+		                              self._av_getf(self.av_marker_size_mm, 20.0))
+
+	def on_av_browse_bag(self, axis: str) -> None:
+		self._av_dialog_ready()
+		row = self.av_rows.get(axis)
+		if not row:
+			return
+		default_dir = Path(__file__).parent / "cache"
+		path = filedialog.askopenfilename(
+			title=f"{axis}軸: 録画データ (.db3) を選択",
+			initialdir=str(default_dir if default_dir.exists() else Path(__file__).parent),
+			filetypes=[("RealSense recording", "*.db3 *.bag"), ("すべてのファイル", "*.*")])
+		if path:
+			# 「録画開始」を押さずに終了した .db3 はヘッダだけで 0 フレームになる。
+			# 症状が「マーカーが検出されない」になって原因が分かりにくいので、
+			# 選んだ時点で調べて知らせる。
+			nf = self._av_bag_frame_count(path)
+			if nf == 0:
+				messagebox.showwarning(
+					"録画データ",
+					f"このファイルには画像フレームが1枚も入っていません。\n\n"
+					f"{Path(path).name}\n\n"
+					f"D405の撮影は「プレビュー → 録画開始 → 録画停止」の2段階で、\n"
+					f"プレビュー中はファイルに何も書き込まれません。撮り直してください。")
+			row["bag"].set(path)
+			row["state"].set("未解析")
+			row["summary"].set("—")
+			row["result"] = None
+			self._av_refresh_status()
+
+	def on_av_record(self, axis: str) -> None:
+		"""D405 で1軸ぶんの動作を録画する (既存の軸校正と同じ2フェーズ録画)。"""
+		self._av_dialog_ready()
+		row = self.av_rows.get(axis)
+		if not row:
+			return
+		if not self._ankle_check_rs() or not self._ankle_check_cv2():
+			return
+		kind = row["kind"]
+		unit = self._av_unit(kind)
+		cmd = self._av_getf(row["commanded"], 0.0)
+		import datetime as _dt
+		default_dir = Path(__file__).parent / "cache"
+		try:
+			default_dir.mkdir(parents=True, exist_ok=True)
+		except Exception:
+			pass
+		tag = f"verify_{axis}_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.db3"
+		bag_path = filedialog.asksaveasfilename(
+			title=f"{axis}軸 精度検証: 録画先 .db3",
+			initialdir=str(default_dir), initialfile=tag,
+			defaultextension=".db3",
+			filetypes=[("RealSense recording", "*.db3"), ("すべてのファイル", "*.*")])
+		if not bag_path:
+			return
+		messagebox.showinfo(
+			f"{axis}軸 精度検証 録画",
+			f"直動側 (ID={self.av_id_lin.get()}) と回転側 (ID={self.av_id_rot.get()}) の\n"
+			f"両方のマーカーが画角に入っていることを確認してください。\n\n"
+			f"1. プレビューで両マーカーが見えることを確認\n"
+			f"2. 「録画開始」\n"
+			f"3. {axis} 軸だけを片道で {cmd:g} {unit} 動かす\n"
+			f"   （②に入れた Translation / Speed / Accel のとおりに動かしてください。\n"
+			f"     等速区間はその値から計算で切り出します）\n"
+			f"4. 完全に停止してから3〜4秒待って「録画停止」\n"
+			f"   （停止直後だと書き込みの積み残しが捨てられ、末尾が切れます）")
+		ok, frame_count, err = self._ankle_rs_run_preview_and_record(bag_path)
+		if err:
+			messagebox.showerror("録画", f"録画失敗: {err}")
+			return
+		if not ok or frame_count < 10:
+			messagebox.showwarning("録画", f"録画フレームが少なすぎます (frames={frame_count})。")
+			return
+		row["bag"].set(bag_path)
+		row["state"].set("未解析")
+		row["summary"].set(f"録画 {frame_count} フレーム")
+		row["result"] = None
+		self._av_refresh_status()
+		if messagebox.askyesno("録画完了", f"{frame_count} フレームを録画しました。\n続けて解析しますか？"):
+			self.on_av_analyze(axis)
+
+	def on_av_analyze(self, axis: str) -> None:
+		row = self.av_rows.get(axis)
+		if not row:
+			return
+		bag = str(row["bag"].get()).strip()
+		if not bag or not Path(bag).exists():
+			messagebox.showwarning("解析", f"{axis}軸の録画データが見つかりません。")
+			return
+		if not self._ankle_check_rs() or not self._ankle_check_cv2():
+			return
+		res, err = self._av_analyze_one(axis)
+		self._av_refresh_status()
+		self._av_dialog_ready()
+		if err:
+			messagebox.showerror(f"{axis}軸 解析失敗", err, parent=self)
+			return
+		self._av_text_window(f"{axis}軸 解析結果", self._av_row_report(axis))
+
+	def on_av_analyze_all(self) -> None:
+		pending = []
+		for ax, _k in self.AV_AXES:
+			bag = str(self.av_rows[ax]["bag"].get()).strip()
+			if self.av_rows[ax]["result"] is None and bag and Path(bag).exists():
+				pending.append(ax)
+		if not pending:
+			messagebox.showinfo("まとめ解析",
+				"解析対象がありません（未解析かつ録画データが存在する軸が対象です）。")
+			return
+		if not self._ankle_check_rs() or not self._ankle_check_cv2():
+			return
+		done, failed = [], []
+		for ax in pending:
+			res, err = self._av_analyze_one(ax)
+			if err:
+				failed.append(f"{ax}: {err}")
+			else:
+				done.append(ax)
+		self._av_refresh_status()
+		msg = f"解析完了: {', '.join(done) if done else 'なし'}"
+		if failed:
+			msg += "\n\n失敗:\n  " + "\n  ".join(failed)
+		messagebox.showinfo("まとめ解析", msg)
+
+	def _av_analyze_one(self, axis: str):
+		"""1軸を検出→解析し、結果を row['result'] に格納する。Returns (result, err_msg)。"""
+		import numpy as np
+		row = self.av_rows[axis]
+		bag = str(row["bag"].get()).strip()
+		kind = row["kind"]
+		try:
+			marker_size_mm = self._av_getf(self.av_marker_size_mm, 0.0)
+			id_lin = int(self._av_getf(self.av_id_lin, -1))
+			id_rot = int(self._av_getf(self.av_id_rot, -1))
+			stride = max(1, int(self._av_getf(self.av_stride, 1)))
+			commanded = self._av_getf(row["commanded"], 0.0)
+		except Exception as e:
+			return None, f"設定値が不正です: {e}"
+		if marker_size_mm <= 0:
+			return None, "マーカー実寸が不正です。"
+		if id_lin == id_rot:
+			return None, "直動側と回転側に同じ ArUco ID が指定されています。"
+		if commanded == 0:
+			return None, "指令値が 0 です。"
+		dict_name = str(self.av_aruco_dict.get())
+		target_ids = {id_lin, id_rot}
+		moving_id = id_lin if kind == "lin" else id_rot
+		static_id = id_rot if kind == "lin" else id_lin
+
+		# 3手法すべてを全フレームで計算させる (比較フレーム上限を一時的に外す)
+		saved_cmp = None
+		try:
+			saved_cmp = int(self.ankle_compare_frames.get())
+			self.ankle_compare_frames.set(10 ** 9)
+		except Exception:
+			saved_cmp = None
+		self._ankle_method_compare = {}
+		row["state"].set("解析中")
+		try:
+			self.update_idletasks()
+		except Exception:
+			pass
+		update_cb, close_cb, cancel_cb = self._ankle_open_progress(f"{axis}軸: ArUco検出中")
+		try:
+			cache = self._ankle_detect_from_bag(
+				bag, dict_name, marker_size_mm, target_ids, stride, update_cb, cancel_cb)
+		except Exception as e:
+			try:
+				close_cb()
+			except Exception:
+				pass
+			row["state"].set("失敗")
+			return None, f"検出に失敗しました: {e}"
+		finally:
+			if saved_cmp is not None:
+				try:
+					self.ankle_compare_frames.set(saved_cmp)
+				except Exception:
+					pass
+		close_cb()
+
+		bones = cache.get("bones", {}) or {}
+		if moving_id not in bones:
+			row["state"].set("失敗")
+			return None, (f"動作側マーカー ID={moving_id} が検出されませんでした。\n"
+			              f"ID・辞書・マーカー実寸の設定を確認してください。")
+		ts = np.asarray(cache.get("timestamps", []), dtype=float)
+		if len(ts) and np.isfinite(ts[0]):
+			ts = ts - ts[0]
+
+		methods = self._av_method_poses(cache, moving_id)
+		# ロボットの運動指令。送り速度と移動量があれば等速区間を計算で切り出す。
+		robot_cmd = {"feed": self._av_getf(row["feed"], 0.0),
+		             "accel": self._av_getf(row["accel"], 0.0),
+		             "translation": commanded}
+		use_robot = robot_cmd["feed"] > 0 and abs(robot_cmd["translation"]) > 0
+		series = {}
+		for mname, _key in self.AV_METHODS:
+			P = methods.get(mname)
+			if P is None:
+				continue
+			series[mname] = self._av_series_both(
+				P, self._av_detected_mask(P), ts,
+				robot_cmd if use_robot else None, kind)
+
+		# 静止側 = ノイズフロア (採用手法 rgb のみで十分)
+		static_series = None
+		if static_id in bones:
+			Ps = self._av_method_poses(cache, static_id).get("rgb")
+			if Ps is not None:
+				static_series = self._av_series_both(Ps, self._av_detected_mask(Ps), ts)
+
+		primary = (series.get("rgb") or {}).get(kind) or {}
+		if not primary.get("ok"):
+			row["state"].set("失敗")
+			# 検出0件は「計算できない」ではなく「そもそも写っていない/ID違い」なので、
+			# 何が原因かまで調べて返す。
+			if int(primary.get("n_det", 0)) == 0:
+				return None, self._av_no_detection_message(
+					bag, dict_name, moving_id, static_id, int(len(ts)))
+			return None, (f"相対変位を計算できませんでした: {primary.get('reason', '不明')}\n"
+				f"（検出フレーム {primary.get('n_det', 0)} / {len(ts)}）")
+		span = float(primary["span"])
+		err_pct = 100.0 * (span - commanded) / commanded
+
+		result = {
+			"axis": axis, "kind": kind, "commanded": commanded, "stride": stride,
+			"feed": self._av_getf(row["feed"], 0.0),
+			"bag": bag, "marker_size_mm": marker_size_mm,
+			"moving_id": moving_id, "static_id": static_id,
+			"timestamps": ts, "n_frames": int(len(ts)),
+			"detected_rate": 100.0 * primary["n_det"] / max(len(ts), 1),
+			"series": series, "static": static_series,
+			"span": span, "err_pct": err_pct,
+			"perp_rms": float(primary["perp_rms"]),
+			"perp_max": float(primary["perp_max"]),
+		}
+		# クロストーク: 直動試験なら回転が、回転試験なら並進が出る量。
+		# 主軸投影の span ではなく弦長 (始点からの最大距離) を使う。
+		cross = (series.get("rgb") or {}).get("rot" if kind == "lin" else "lin") or {}
+		result["cross_max"] = float(cross["chord"]) if cross.get("ok") else float("nan")
+		# 回転試験では並進から回転半径が出る:  弦長 = 2 r sin(Δθ/2)
+		if kind == "rot" and cross.get("ok") and abs(span) > 1e-6:
+			try:
+				result["radius_mm"] = float(cross["chord"]) / (2.0 * np.sin(np.radians(span) / 2.0))
+			except Exception:
+				result["radius_mm"] = float("nan")
+
+		# --- スケール係数 k = 計測値 / 真値 ---
+		# span 基準は極値統計でノイズぶん必ず上振れするうえ、区間端の検出落ちで
+		# 逆に過小にもなる。送り速度が入力されていれば、等速区間の傾き
+		# (v_const / feed) の方が不偏で端の欠損にも強いので、そちらを優先する。
+		# --- 撮影ジオメトリ (この試験がどの向きの運動を測ったのか) ---
+		# ロボットの軸ラベル(X/Y/Z/U/V/W)ではなく、カメラから見た運動の向きが
+		# 測定精度を決める。軸ごとにカメラを置き直す運用では特に重要。
+		result["dist_mm"] = float(primary.get("dist_mm", float("nan")))
+		result["dist0_mm"] = float(primary.get("dist0_mm", float("nan")))
+		try:
+			_d = np.asarray(primary.get("axis_dir"), dtype=float)
+			_n = primary.get("marker_normal")
+			if kind == "lin":
+				# 光軸(カメラZ)成分。0=完全に横移動(最も精度が良い) / 1=完全に奥行き(最も弱い)
+				result["depth_frac"] = float(abs(_d[2]))
+				result["geom_deg"] = float(np.degrees(np.arccos(min(1.0, abs(_d[2])))))
+			else:
+				# 回転軸とマーカー法線のなす角。0°=面内回転(最も強い) / 90°=面外(最も弱い)
+				if _n is not None:
+					_c = float(abs(np.dot(_d, np.asarray(_n, dtype=float))))
+					result["geom_deg"] = float(np.degrees(np.arccos(min(1.0, _c))))
+		except Exception:
+			pass
+		result["k_span"] = span / commanded
+		feed = float(result.get("feed") or 0.0)
+		v_const = float(primary.get("v_const", float("nan")))
+		result["accel"] = self._av_getf(row["accel"], 0.0)
+		result["window_source"] = primary.get("window_source", "auto")
+		if primary.get("robot"):
+			result["robot"] = primary["robot"]
+		if primary.get("v_const_auto") is not None:
+			try:
+				_va = float(primary["v_const_auto"])
+				result["v_const_auto"] = _va
+				if feed > 0 and np.isfinite(_va):
+					result["k_speed_auto"] = _va / feed
+			except Exception:
+				pass
+		if feed > 0 and np.isfinite(v_const) and v_const != 0:
+			result["v_const"] = v_const
+			result["v_const_n"] = int(primary.get("v_const_n", 0))
+			result["k_speed"] = v_const / feed
+			result["k"] = result["k_speed"]
+			result["k_source"] = ("ロボット指令から出した等速区間の傾き"
+			                      if result["window_source"] == "robot"
+			                      else "等速区間の傾き (移動量の中央50%)")
+		else:
+			result["k"] = result["k_span"]
+			result["k_source"] = "span (max−min)"
+		# 直動試験ならマーカー実寸の較正値が出る (|Δp| は実寸に比例するので)
+		if kind == "lin" and result["k"] > 1e-9:
+			result["marker_size_calibrated"] = marker_size_mm / result["k"]
+		# 区間端の検出落ちは span を過小にするので警告できるようにしておく
+		result["edge_dropout"] = (int(primary.get("first_det", 0)) > 0
+			                          or int(primary.get("last_det", 0)) < len(ts) - 1)
+		result["err_pct_k"] = 100.0 * (result["k"] - 1.0)
+
+		row["result"] = result
+		row["state"].set("解析済")
+		unit = self._av_unit(kind)
+		res_unit = "mm" if kind == "lin" else "°"
+		row["summary"].set(f"span {span:.3f}{unit} / k={result['k']:.5f} "
+		                    f"({result['err_pct_k']:+.2f}%) / 残差 {result['perp_rms']:.3f}{res_unit}"
+		                    + self._av_geom_summary(result))
+		self._av_print_report(axis)
+		row.pop("_sig", None)
+		self._av_save_result(axis)   # 再起動後も再解析せずに済むよう保存
+		return result, None
+
+	# ---- フレーム落ちの明示 (詳細ウィンドウの一番上に出す) ----
+	def _av_frame_drop_lines(self, res: dict) -> list:
+		"""この録画にコマ落ちがあるかどうかを最初に言い切るための行を作る。
+
+		2つの情報源を突き合わせる:
+		  A) .db3 そのもの (SQLite で直接数える) …… 記録の真実。ファイルがあれば最優先
+		  B) 解析に使った時刻列の隙間      …… 解析が実際に見たフレーム
+		どちらも「公称の間隔の何倍の隙間が何個あるか」で数える。
+		"""
+		import numpy as np
+		L = []
+		bag = str(res.get("bag") or "")
+		# --- A) ファイルそのものを数える ---
+		file_n = file_dur = file_gaps = None
+		file_info = {}
+		try:
+			if bag and Path(bag).exists():
+				file_n, file_dur, file_gaps, file_info = self._ankle_bag_frame_stats(
+					bag, detail=True)
+		except Exception as e:
+			print(f"[精度検証] .db3 の検査に失敗: {e}")
+		# --- B) 解析に使った時刻列 ---
+		lost = 0
+		n_gap_events = 0
+		max_gap_frames = 0
+		max_gap_sec = 0.0
+		inside = 0
+		nominal_fps = float("nan")
+		eff_fps = float("nan")
+		gap_desc = []
+		try:
+			ts = np.asarray(res.get("timestamps"), dtype=float)
+			if len(ts) > 10:
+				dts = np.diff(ts)
+				nom = float(np.median(dts))
+				if nom > 0:
+					nominal_fps = 1.0 / nom
+					eff_fps = len(ts) / max(float(ts[-1] - ts[0]), 1e-9)
+					gap = dts > nom * 1.5
+					miss = np.round(dts / nom) - 1
+					lost = int(np.sum(miss[gap]))
+					n_gap_events = int(np.sum(gap))
+					if n_gap_events:
+						gi = np.where(gap)[0]
+						j = int(gi[int(np.argmax(miss[gi]))])
+						max_gap_frames = int(miss[j])
+						max_gap_sec = float(dts[j])
+						# グラフに使う等速区間の中に入っているか
+						prim = ((res.get("series") or {}).get("rgb") or {}).get(res.get("kind")) or {}
+						pmk = prim.get("plot_mask")
+						if pmk is not None:
+							jw = np.where(np.asarray(pmk))[0]
+							if len(jw):
+								inside = int(np.sum((gi >= jw[0]) & (gi <= jw[-1])))
+						# 上位3件を時刻つきで出す
+						order = gi[np.argsort(-miss[gi])][:3]
+						for j2 in order:
+							gap_desc.append(f"t={ts[int(j2)]:.2f}s で {int(miss[int(j2)])}枚 "
+							                 f"({dts[int(j2)] * 1000:.0f}ms の空白)")
+		except Exception as e:
+			print(f"[精度検証] コマ落ちの集計に失敗: {e}")
+
+		has_drop = bool(lost > 0 or (file_gaps or 0) > 0)
+		if not has_drop:
+			head = "  【フレーム落ち】 ★ ありません"
+			if file_n:
+				head += (f"   (.db3 に {file_n} 枚 / {file_dur:.2f} s = "
+				         f"{file_n / max(file_dur, 1e-9):.2f} fps、内部の空白 0)")
+			elif np.isfinite(eff_fps):
+				head += f"   (解析フレーム {int(res.get('n_frames', 0))} 枚、実効 {eff_fps:.2f} fps)"
+			L.append(head)
+			L.append("")
+			return L
+
+		L.append("  【フレーム落ち】 ⚠ あります")
+		if file_n is not None:
+			L.append(f"    ・録画ファイル(.db3)    : {file_n} 枚 / {file_dur:.2f} 秒 = "
+			         f"{file_n / max(file_dur, 1e-9):.2f} fps    内部の空白 {file_gaps} 枚")
+			_ev = (file_info or {}).get("events") or []
+			for e in _ev[:3]:
+				L.append(f"        - 録画開始から {e['t']:.2f} 秒の所で {e['frames']} 枚 "
+				         f"({e['sec'] * 1000:.0f} ms の空白)")
+			if _ev and all(e["t"] < 1.5 for e in _ev):
+				L.append("        → すべて録画開始直後。まだロボットを動かしていない"
+				         "時間帯なので、解析には影響しません。")
+		else:
+			L.append("    ・録画ファイル(.db3)    : 見つからないので調べられませんでした "
+			         "（移動・削除された可能性）")
+		stride = 1
+		try:
+			stride = int((res.get("stride") or (res.get("sig") or {}).get("stride") or 1))
+		except Exception:
+			stride = 1
+		L.append(f"    ・解析に使った時刻列    : 欠落 {lost} 枚 / 全 {int(res.get('n_frames', 0))} 枚"
+		         + (f"（stride={stride} で間引いています）" if stride > 1 else ""))
+		if np.isfinite(nominal_fps):
+			L.append(f"    ・実効 {eff_fps:.2f} fps  (公称 {nominal_fps:.2f} fps) "
+			         f"→ {100.0 * (1.0 - eff_fps / nominal_fps):+.1f}%")
+		L.append(f"    ・空白の箇所            : {n_gap_events} 箇所   "
+		         f"最大 {max_gap_frames} 枚連続 ({max_gap_sec * 1000:.0f} ms)")
+		for d in gap_desc:
+			L.append(f"        - {d}")
+		if inside:
+			L.append(f"    ・そのうち {inside} 箇所は【グラフに使う等速区間の内側】です。")
+			L.append("      その時刻だけ点がまばらになります（線が続いて見えるのは隣の点を")
+			L.append("      結んでいるためで、検出に失敗しているわけではありません）。")
+			L.append("      傾き基準の k は残った点の直線回帰なので、値そのものは有効です。")
+		else:
+			L.append("    ・空白はグラフに使う等速区間の外なので、k とグラフには影響しません。")
+		L.append("    → 対策は ankle simulator ⓪ の「コマ落ち対策」を参照してください")
+		L.append("      （MP4を切る / 深度を切る / 優先度を上げる、の順に効きます）。")
+		L.append("")
+		return L
+
+	# ---- 台形速度プロファイルの確認 ----
+	@staticmethod
+	def _av_lowpass(y, fs: float, fc: float):
+		"""ゼロ位相のローパス (Butterworth 2次 + filtfilt)。欠測は跨いで補間する。
+
+		なぜ要るか (2026-09-04 実測):
+		  平面マーカーは「面外の傾き」の推定が構造的に弱い。回転軸とマーカー法線の
+		  なす角で残差RMSがこれだけ変わる:
+		     W (12° = 面内) 0.0152° / V (82° = 面外) 0.0975° / U (82°) 0.2271°
+		  しかも面外側はノイズの 7〜8 割が 6〜15Hz の高周波なので、ローパスがよく効く:
+		     U 0.227→0.116° (-49%) / V 0.0975→0.0255° (-74%) / W 0.0152→0.0078° (-49%)
+		  しかも k はほとんど動かない (U -1.919%→-1.896%) ＝ 偏りを入れない。
+		  0.5Hz まで下げると W が逆に悪化した (0.0189°) ので下げ過ぎは禁物。
+		  残差が底を打つのは 1.0〜1.5Hz だが、3Hz でも U 58% / V 32% / W 80% まで下がる。
+		  カットオフは ankle simulator ⑤ の設定を共用する (既定 2.5Hz)。
+		  ※ ローパスは見た目のばらつきを減らすだけで、面外が弱いこと自体は直らない。
+		     根本的にはマーカー法線を回転軸に近づけて撮り直すこと。
+		"""
+		import numpy as np
+		y = np.asarray(y, dtype=float)
+		out = np.full(len(y), np.nan)
+		ok = np.isfinite(y)
+		if int(ok.sum()) < 12 or fs <= 0 or fc <= 0 or fc >= fs / 2:
+			return out
+		try:
+			from scipy import signal
+		except Exception:
+			return out
+		idx = np.arange(len(y))
+		# 欠測は線形補間で埋めてから掛ける (filtfilt は NaN を扱えない)
+		filled = np.interp(idx, idx[ok], y[ok])
+		try:
+			b, a = signal.butter(2, fc / (fs / 2.0), btype="low")
+			pad = int(min(len(filled) - 1, 3 * max(len(a), len(b))))
+			z = signal.filtfilt(b, a, filled, padlen=max(pad, 0))
+		except Exception as e:
+			print(f"[精度検証] ローパスに失敗: {e}")
+			return out
+		# 元が欠測だった所は欠測のまま返す (埋めた値を結果に混ぜない)
+		out[ok] = z[ok]
+		return out
+
+	def _av_record_rate(self):
+		"""⓪の設定から (MB/s, 解像度の説明) を返す。録画ファイルの大きさの見積り用。"""
+		try:
+			w, h, fps = self._ankle_rs_parse_resolution()
+		except Exception:
+			w, h, fps = 1280, 720, 30
+		try:
+			_k, bpp = self.AV_REC_FORMATS.get(str(self.ankle_rs_color_format.get()), ("yuyv", 2))
+		except Exception:
+			bpp = 2
+		return (w * h * (bpp + 2) * fps) / 1e6, f"{w}x{h}@{fps}"
+
+	def _av_profile_lines(self, axis: str) -> list:
+		"""入力された Translation / Speed / Accel から等速区間を計算して説明する。"""
+		row = self.av_rows.get(axis) or {}
+		kind = row.get("kind", "lin")
+		unit = self._av_unit(kind)
+		D = self._av_getf(row.get("commanded"), 0.0)
+		v = self._av_getf(row.get("feed"), 0.0)
+		acc = self._av_getf(row.get("accel"), 0.0)
+		if v <= 0 or abs(D) <= 0:
+			return [f"  {axis}: Translation と Speed を入れると等速区間を計算します"
+			        f"（現在 移動量={D:g}{unit} / 送り={v:g}{unit}/s）"]
+		if acc <= 0:
+			return [f"  {axis}: 移動量 {abs(D):g}{unit} / 送り {v:g}{unit}/s / 加速度 未入力"
+			        f"  → 全体 {abs(D) / v:.2f}s + 加速時間。"
+			        f" 加速度を入れると等速区間が確定します（未入力ならデータから推定します）"]
+		prof = self._av_profile_times(v, acc, D)
+		if prof is None:
+			return [f"  {axis}: 入力値が不正です"]
+		if prof["kind"] == "triangle":
+			return [f"  {axis}: ⚠ 三角形速度です。移動量 {abs(D):g}{unit} では "
+			        f"送り {v:g}{unit}/s に到達しません "
+			        f"(最高速 {prof['v_peak']:.3f}{unit}/s、全体 {prof['t3']:.2f}s)。"
+			        f" 等速区間が存在しないので、移動量を増やすか送りを遅くしてください。"]
+		# 録画の長さと大きさも出す。実測で、記録の欠落はどの録画でも 1.3 GB 以降に
+		# しか出ておらず、2.0 GB 以下の録画では一度も出ていない。
+		# 動作の前後に 3 秒ずつ余裕を取る想定で見積もる。
+		rate, res = self._av_record_rate()
+		rec_s = prof["t3"] + 6.0
+		gb = rate * rec_s / 1000.0
+		size_note = f"  録画 ≒ {rec_s:.0f}s = {gb:.1f} GB ({res})"
+		if gb > 2.0:
+			# 2 GB に収まる録画長 t_target から、必要な送り速度を逆算する。
+			#   D/v + v/a = t_target  →  v² − a·t_target·v + a·D = 0
+			# 解は2つあるが、遅いほう (小さい根) が「今より少し上げるだけ」の答え。
+			import math
+			t_target = max(2.0 * 1000.0 / rate - 6.0, 1.0)
+			disc = (acc * t_target) ** 2 - 4.0 * acc * abs(D)
+			size_note += ("  ⚠ 2GB超。実測では 2.0GB 以下の録画で欠落は皆無、"
+			               "2.27GB 以上では8本中4本で欠落しています。")
+			if disc > 0:
+				v_need = (acc * t_target - math.sqrt(disc)) / 2.0
+				if v_need > v:
+					size_note += (f" 送りを {v_need:.3g}{unit}/s 以上にすると "
+					               f"{t_target:.0f}s = 2.0GB 以内に収まります"
+					               f"（等速区間は {abs(D) / v_need - v_need / acc:.1f}s に縮みます）")
+			else:
+				size_note += " この加速度では 2GB 以内に収める送り速度がありません"
+		return [f"  {axis}: 移動量 {abs(D):g}{unit} / 送り {v:g}{unit}/s / 加速度 {acc:g}{unit}/s²"
+		        f"  →  加速 {prof['t_ramp']:.2f}s ({0.5 * v * prof['t_ramp']:.3f}{unit}) / "
+		        f"等速 {prof['t_cruise']:.2f}s ({abs(D) - v * prof['t_ramp']:.3f}{unit}) / "
+		        f"減速 {prof['t_ramp']:.2f}s   全体 {prof['t3']:.2f}s",
+		        size_note]
+
+	def on_av_show_profiles(self) -> None:
+		"""6軸ぶんの等速区間を計算して表示する（録画前の確認用）。"""
+		L = ["【ロボットの指令から等速区間を計算する】", ""]
+		L += ["台形速度なので、送り v・加速度 a・移動量 D から次のように決まります:",
+		      "    加速時間  t_ramp   = v / a          （減速も同じ長さ）",
+		      "    加速の距離 d_ramp   = v²/(2a)",
+		      "    等速時間  t_cruise = D/v − v/a",
+		      "    全体時間  t_total  = D/v + v/a",
+		      "",
+		      "例: v=1 mm/s, a=1 mm/s², D=10 mm",
+		      "    → 加速 1.00s / 等速 9.00s / 減速 1.00s、全体 11.00s",
+		      "  「10s から加速1s と減速1s を引いて 8s」ではありません。全体が 10s ではなく",
+		      "  11s になるためで、ランプ1本が失う時間は t_ramp ではなく t_ramp/2 (=0.5s) です。",
+		      "  （加速中も 0.5mm 進んでいるので、失うのは 0.5mm ぶん = 0.5s だけ）",
+		      "",
+		      "実測でも確認済み: X/Y軸 (D=50mm, v=5mm/s) では、加速の中点と減速の中点の",
+		      "間隔がちょうど D/v = 10.00 s になっていて、上の式どおりでした。",
+		      "", "-" * 70, ""]
+		for ax, _k in self.AV_AXES:
+			L += self._av_profile_lines(ax)
+		L += ["", "-" * 70, "",
+		      "解析ではこの区間を『そのまま』使うのではなく、理想の位置プロファイルを",
+		      "実データに最小二乗で当てはめて動作開始時刻を決めてから切り出します。",
+		      "全区間のデータで当てはめるので、途中でトラッキングが乱れても区間はほとんど動きません。",
+		      "加速度が未入力、または指令と実際がずれている場合に備えて、加速時間そのものも",
+		      "同時に推定します（レポートに『実測の加速時間』として出ます）。",
+		      "", "-" * 70, "",
+		      "【録画の大きさについて】(2026-09-04 に既存の録画12本を全数調査した結果)",
+		      "  記録の欠落は、どの録画でも 1.3 GB 以降にしか出ていません。",
+		      "    2.02 GB 以下の 6 本 → 欠落 0",
+		      "    2.27 GB 以上の 8 本 → 4 本で欠落 (3〜87枚)",
+		      "  欠落は必ず color と depth が同時に落ちており、書き込み側で起きています。",
+		      "  ディスク単体の実測では 111 MB/s を 8 GB 流しても詰まりません(最大3.3ms)。",
+		      "  ただし数 GB 書いた後に散発的に 100〜750 ms 止まることがあり、",
+		      "  その時だけまとまって落ちます。狙って再現はできませんでした。",
+		      "  → 録画を 2 GB 以内に収めるのが最も確実な回避策です。",
+		      "  → なお、等速区間の切り出しは 2 秒の欠落があっても誤差 0.01% 以下なので、",
+		      "     多少落ちても k の値そのものは損なわれません。"]
+		try:
+			self.av_profile_note.set("\n".join(
+				x for ax, _k in self.AV_AXES for x in self._av_profile_lines(ax)))
+		except Exception:
+			pass
+		self._av_text_window("等速区間の計算", "\n".join(L))
+
+	# ---- レポート ----
+	def _av_row_report(self, axis: str) -> str:
+		import numpy as np
+		res = self.av_rows[axis]["result"]
+		if not res:
+			return f"{axis}軸: 未解析"
+		kind = res["kind"]
+		unit = self._av_unit(kind)
+		res_unit = "mm" if kind == "lin" else "°"
+		k = float(res.get("k", float("nan")))
+		L = [f"【{axis}軸  {self._av_kind_label(kind)}】", ""]
+		# 一番最初にコマ落ちの有無を言い切る (グラフの点がまばらな理由が
+		# ここで分からないと、検出の失敗と区別がつかないため)
+		L += self._av_frame_drop_lines(res)
+		L += [f"  録画      : {Path(res['bag']).name}   frames={res['n_frames']}   "
+		      f"検出率={res['detected_rate']:.1f}%   (動作側 ID={res['moving_id']})",
+		      f"  指令値    : {res['commanded']:.3f} {unit}",
+		      f"  実測span  : {res['span']:.3f} {unit}    (span基準の誤差 {res['err_pct']:+.2f}%)"]
+		if res.get("k_speed") is not None:
+			L.append(f"  等速区間の速度: {res['v_const']:.4f} {unit}/s "
+			         f"(指令 {res['feed']:.4f} {unit}/s, n={res.get('v_const_n', 0)}点)")
+		# --- ロボット指令から割り出した等速区間 ---
+		notes = []   # 末尾の「注意」に積む (ロボット窓の判定からも足すので先に作る)
+		rob = res.get("robot") or {}
+		if rob:
+			L.append("")
+			L.append("  【ロボット指令から割り出した等速区間】")
+			_acc = float(res.get("accel") or 0.0)
+			L.append(f"    指令: Translation {abs(res['commanded']):g} {unit} / "
+			         f"Speed {res.get('feed', 0):g} {unit}/s / "
+			         f"Accel " + (f"{_acc:g} {unit}/s²" if _acc > 0 else "未入力"))
+			pc = rob.get("prof_cmd") or {}
+			if pc:
+				L.append(f"      指令どおりなら → 加速 {pc['t_ramp']:.2f}s / "
+				         f"等速 {pc['t_cruise']:.2f}s / 減速 {pc['t_ramp']:.2f}s   "
+				         f"全体 {pc['t3']:.2f}s")
+			if rob.get("ok"):
+				pf = rob.get("prof") or {}
+				win = rob.get("win") or (float('nan'), float('nan'))
+				L.append(f"      実データへの当てはめ → 動作開始 t={rob.get('t0', float('nan')):.2f}s / "
+				         f"実測の加速時間 {pf.get('t_ramp', float('nan')):.2f}s "
+				         f"(加速度 {rob.get('acc_fit', float('nan')):.3g} {unit}/s² 相当) / "
+				         f"等速 {pf.get('t_cruise', float('nan')):.2f}s")
+				L.append(f"      採用した等速区間 → t={win[0]:.2f} 〜 {win[1]:.2f} s  "
+				         f"({rob.get('n_used', 0)} 点"
+				         + (f' / 外れ値 {rob["n_rejected"]} 点を除外' if rob.get('n_rejected') else '')
+				         + ")")
+				if _acc > 0 and pc and pc.get("t_ramp"):
+					_r = pf.get("t_ramp", float("nan")) / max(pc["t_ramp"], 1e-9)
+					if np.isfinite(_r) and (_r < 0.6 or _r > 1.7):
+						L.append(f"      ※ 実測の加速時間が指令の {_r:.2f} 倍です。"
+						         f"入力した加速度がロボットの実際の設定と違う可能性があります"
+						         f"（区間は実測側で取っているので k は有効です）。")
+				if rob.get("cut_head") or rob.get("cut_tail"):
+					L.append("      ※ 等速区間の" + ("先頭" if rob.get("cut_head") else "末尾")
+					         + "が録画の端に掛かっています。録画の前後にもう少し余裕を取ってください。")
+				# 等速区間を5等分したときの傾きの散らばり。k がどれだけ信用できるかの指標。
+				_ps = rob.get("part_spread")
+				_pt = rob.get("parts") or []
+				if _ps is not None and np.isfinite(_ps) and len(_pt) >= 3:
+					_fd = float(res.get("feed") or 0.0)
+					_pp = " ".join(f"{100.0 * (float(x) / _fd - 1.0):+.2f}%" for x in _pt) \
+					      if _fd > 0 else " ".join(f"{float(x):.4f}" for x in _pt)
+					L.append(f"      区間を5等分した傾き: {_pp}")
+					_q = ("★ よく揃っている ＝ この軸のスケールが一様にずれている" if _ps < 0.005 else
+					      "おおむね揃っている" if _ps < 0.01 else
+					      "ばらついている ＝ 平均としての k はあまり当てにならない" if _ps < 0.02 else
+					      "⚠ 大きくばらついている ＝ この軸の k は信用できない")
+					L.append(f"      ばらつき(標準偏差/平均) = {100.0 * _ps:.2f}%   ← {_q}")
+					if _ps >= 0.02:
+						notes.append(f"等速区間を5等分すると傾きが {100.0 * _ps:.1f}% もばらつきます。"
+						             f"平均値としての k ({100.0 * (k - 1.0):+.2f}%) には意味がありません。"
+						             f"撮影条件 (ジオメトリ・露光・距離) を見直して撮り直してください。")
+				if res.get("k_speed_auto") is not None:
+					L.append(f"      参考: 従来方式(移動量の中央50%)なら "
+					         f"k={res['k_speed_auto']:.5f} ({100.0 * (res['k_speed_auto'] - 1.0):+.3f}%)")
+			else:
+				L.append(f"      ⚠ 当てはめできませんでした: {rob.get('reason', '理由不明')}")
+				L.append("      → 移動量の中央50%を使う従来方式に切り替えて計算しています。")
+		prim = (res["series"].get("rgb") or {}).get(kind) or {}
+		L += [f"  ★ スケール係数 k = {k:.5f}   → 誤差 {100.0 * (k - 1.0):+.3f} %"
+		      f"   [{res.get('k_source', '')} 基準]",
+		      f"      k = 計測値 / 真値。1.00000 からのズレがそのまま計測倍率の誤差です。",
+		      f"  主軸残差  : RMS {res['perp_rms']:.3f} {res_unit} / 最大 {res['perp_max']:.3f} {res_unit}"
+		      + ("   ← 直動なので真直度" if kind == "lin" else "   ← 回転軸のブレ")]
+		# 等速区間の回帰残差 = 動いている最中の実効ノイズフロア。
+		# 静止側マーカーのノイズフロアはモーションブラーが乗らないぶん楽観的なので、
+		# 「動作中に実際どれだけ暴れているか」はこちらで見る。
+		vr = prim.get("v_fit_resid")
+		if vr is not None and np.isfinite(vr):
+			L.append(f"  等速区間の実効ノイズ: 主軸方向 RMS {vr:.4f} {res_unit}   "
+			         f"(直交方向 RMS {res['perp_rms']:.4f} {res_unit})")
+			L.append("      ← 動いている最中の実測ノイズフロア。"
+			         "静止側マーカーの値はブラーが無いぶん楽観的です。")
+		if res.get("k_source", "").startswith("span"):
+			notes.append("送り速度が未入力なので span 基準です。span は max−min の極値なので"
+			             "ノイズぶん必ず上振れします（例: 位置σ=0.3mm・200点で +0.3%）。"
+			             "送り速度を入力すると、不偏な「等速区間の傾き」基準に切り替わります。")
+		if res.get("edge_dropout"):
+			notes.append("録画の先頭または末尾のフレームで動作側マーカーが未検出です。"
+			             "span がその分だけ過小になっている可能性があります。")
+		# コマ落ちはレポート冒頭の【フレーム落ち】ブロックで詳しく出しているので、
+		# ここでは繰り返さない。
+		# --- 回転側の切り分け: k(span基準) と k(傾き基準) の食い違い ---
+		# k_span   = 実測の総変位 / 指令の総移動量  … 速度指令には依存しない
+		# k_speed  = 実測の角速度 / 指令の送り速度  … 総移動量には依存しない
+		# 両方が同じだけずれていれば「その軸のスケール（機械側の較正か計測側の倍率）」、
+		# 片方だけずれていれば「送り速度だけ／総量だけがずれている」ことになる。
+		# 回転はマーカー実寸に一切依存しないので、計測側に調整できる自由度が無い。
+		# → 両方が揃ってずれていたら、ロボット側の回転軸スケールを疑うのが筋。
+		try:
+			_ks = float(res.get("k_span", float("nan")))
+			_kv = float(res.get("k_speed", float("nan")))
+			if np.isfinite(_ks) and np.isfinite(_kv):
+				L += ["", "  --- k の2通りの出し方 (どちらがずれているかで原因が分かれる) ---",
+				      f"    k(span基準)  = {_ks:.5f} ({100.0 * (_ks - 1.0):+.3f} %)"
+				      f"   … 実測の総変位 / 指令の総移動量。送り速度に依存しない",
+				      f"    k(傾き基準)  = {_kv:.5f} ({100.0 * (_kv - 1.0):+.3f} %)"
+				      f"   … 実測の速度 / 指令の送り速度。総移動量に依存しない"]
+				_d = abs(_ks - _kv)
+				if _d < 0.005:
+					L.append(f"    → 2つは {100.0 * _d:.2f}% 以内で一致。総量も速度も同じだけずれている"
+					         f"ので、この軸の『スケールそのもの』のずれです。")
+					if kind == "rot":
+						L.append("       回転角の計測はマーカー実寸に一切依存しない"
+						         "（＝計測側に調整できる自由度が無い）ので、")
+						L.append("       ロボットの回転軸の較正か、カメラ内部パラメータ(fx,fy)を疑ってください。")
+				else:
+					L.append(f"    → 2つが {100.0 * _d:.2f}% 食い違っています。"
+					         f"総量と速度のどちらか一方だけがずれている、"
+					         f"または span がトラッキングの飛び・端の欠けで汚れています。")
+					L.append("       span は max−min なので、姿勢が一瞬飛ぶだけで大きくなります"
+					         "（実測でV軸が +12% になった原因はこれでした）。")
+					L.append("       傾き基準のほうが飛びに強いので、k は傾き基準を見てください。")
+		except Exception:
+			pass
+		# 動作の途中で録画が終わっていないか。
+		# 検出は 100% でも、ロボットが動いている最中に録画停止すると
+		# 移動量が指令値に届かず、グラフも途中で切れる (実際に Y軸で起きた)。
+		# 「区間の端が録画の端に接している」+「そこでまだ等速で動いている」で判定する。
+		try:
+			pm = prim.get("plot_mask")
+			rt = prim.get("rate")
+			vc = float(prim.get("v_const", float("nan")))
+			if pm is not None and rt is not None and np.isfinite(vc) and abs(vc) > 1e-9:
+				jj = np.where(np.asarray(pm))[0]
+				nfr = int(res.get("n_frames", len(pm)))
+				for side, at_edge, idxs in (("末尾", int(jj[-1]) >= nfr - 3, jj[-8:]),
+					                            ("先頭", int(jj[0]) <= 2, jj[:8])):
+					vv = np.asarray(rt)[idxs]
+					vv = vv[np.isfinite(vv)]
+					if at_edge and len(vv) and abs(float(np.mean(vv))) > 0.5 * abs(vc):
+						notes.append(
+							f"録画の{side}で、ロボットがまだ動いている最中に記録が終わっています"
+							f"（{side}の速度 {float(np.mean(vv)):.2f} ≒ 等速時 {vc:.2f}）。"
+							f"実測span {res['span']:.1f} が指令 {res['commanded']:.1f} に届いていないのは"
+							f"そのためで、グラフも途中で切れます。"
+							f"停止しきってから録画停止してください。"
+							f"※ 等速区間は取れているので スケール係数 k は有効です。")
+		except Exception:
+			pass
+		vbd = prim.get("v_band_dev")
+		if vbd is not None and np.isfinite(vbd) and vbd > 0.02:
+			notes.append(
+				f"等速区間が短すぎる可能性があります（広い帯と狭い帯で傾きが {vbd:.1%} 食い違う。"
+				f"正常なら 0.4% 以下）。加減速が支配的だと k は過小に出ます"
+				f"（実測で最大 -11%）。移動量を増やすか送りを遅くしてください。")
+		if res["detected_rate"] < 95.0:
+			notes.append(f"検出率が {res['detected_rate']:.1f}% と低めです。"
+			             f"モーションブラー（露光・速度）を疑ってください。")
+		# 撮影ジオメトリ。ロボットの軸ラベルではなく、カメラから見た運動の向きが
+		# 精度を決めるので、軸ごとにカメラを置き直す運用ではこれを見て整理する。
+		gd = res.get("geom_deg"); dm = res.get("dist_mm"); d0 = res.get("dist0_mm")
+		if d0 is not None and np.isfinite(d0):
+			_ext = ""
+			if dm is not None and np.isfinite(dm):
+				_ext = f"   (全フレーム平均 {dm:.0f} mm)"
+			L.append(f"  カメラ距離: {d0:.0f} mm  ← 撮影開始 t=0 時点{_ext}")
+		elif dm is not None and np.isfinite(dm):
+			L.append(f"  カメラ距離: {dm:.0f} mm  (全フレーム平均。t=0 の値は再解析で出ます)")
+		if gd is not None and np.isfinite(gd):
+			if kind == "lin":
+				df = res.get("depth_frac", float("nan"))
+				q = ("横移動に近い＝最も精度が良い向き" if df < 0.3 else
+					     "斜め" if df < 0.7 else "奥行き方向に近い＝最も弱い向き")
+				L.append(f"  運動方向 vs カメラ光軸: {gd:.0f}°  (奥行き成分 {df:.2f}) ← {q}")
+			else:
+				q = ("面内回転に近い＝最も精度が良い" if gd < 30 else
+					     "斜め" if gd < 60 else "面外の傾きに近い＝最も弱い")
+				L.append(f"  回転軸 vs マーカー法線: {gd:.0f}° ← {q}")
+				if gd >= 60:
+					# 面外が弱いのは平面マーカーの構造的な性質。実測値を添えて、
+					# 「アルゴリズムの問題ではなく撮り方の問題」だと分かるようにする。
+					L += [
+						"      ※ 平面マーカーは面外の傾きの推定が構造的に弱い方向です。",
+						"         実測(2026-09-04): 残差RMS は 面内12°で 0.015° / "
+						"面外82°で 0.098〜0.227° と 6〜15倍でした。",
+						"         ノイズの7〜8割が6〜15Hzの高周波なので、Excelの『平滑後』の",
+						"         グラフでは残差が半分〜1/4になります (k は変わりません)。",
+						"         根本的に良くするには、マーカーの法線を回転軸に近づけて",
+						"         (＝面内回転になるように) 貼り直して撮り直してください。"]
+		if kind == "lin":
+			L.append(f"  回転クロストーク: {res['cross_max']:.3f} °   （直動なので 0 に近いほど良い）")
+			cal = res.get("marker_size_calibrated")
+			if cal:
+				L += ["",
+				      f"  ★ マーカー実寸の較正値: {cal:.3f} mm   "
+				      f"（現在の設定 {res['marker_size_mm']:.2f} mm）",
+				      f"     直動の |Δp| はマーカー実寸に比例するので  s_true = s_assumed / k  で真値が出ます。",
+				      f"     単眼RGBはスケール不定なので、外から絶対長を入れるしかありません。",
+				      f"     ロボットの位置決め精度はノギスより桁違いに良いので、これが最良の較正です。"]
+		else:
+			L.append(f"  並進クロストーク: {res['cross_max']:.3f} mm   （マーカーが回転軸から離れている分）")
+			rad = res.get("radius_mm")
+			if rad is not None and np.isfinite(rad):
+				L.append(f"      → 回転軸からマーカーまでの半径 ≒ {rad:.1f} mm "
+				         f"（弦長 = 2r·sin(Δθ/2) より）")
+			lever = abs(k - 1.0) * np.radians(res["commanded"]) * 190.0
+			L += ["",
+			      "  ※ 回転角はマーカー実寸に一切依存しません。これは純粋な角度精度です。",
+			      f"     骨先端ではてこ長(約190mm)倍に増幅されるので、誤差 {100.0 * (k - 1.0):+.3f}% は",
+			      f"     指令 {res['commanded']:.1f}° を回したとき骨先端で {lever:.2f} mm 相当のズレです。"]
+		L += ["", "  --- 3手法の比較（同一データ・同一フレーム）---",
+		      f"    {'手法':14s}  {'span':>10s}  {'k(span基準)':>12s}  {'残差RMS':>10s}  {'n':>6s}"]
+		for mname, _mk in self.AV_METHODS:
+			sm = (res["series"].get(mname) or {}).get(kind) or {}
+			if not sm.get("ok"):
+				L.append(f"    {mname:14s}  計算不可 ({sm.get('reason', 'データなし')})")
+				continue
+			kk = sm["span"] / res["commanded"]
+			extra = ""
+			if res.get("feed", 0) > 0 and np.isfinite(sm.get("v_const", float("nan"))):
+				extra = f"   k(傾き基準)={sm['v_const'] / res['feed']:.5f}"
+			L.append(f"    {mname:14s}  {sm['span']:10.3f}  {kk:12.5f}  "
+			         f"{sm['perp_rms']:10.3f}  {sm['n_used']:6d}{extra}")
+		L.append("    → ジッター（ばらつき）ではなく、真値からのズレ＝確度での比較です。")
+		st = res.get("static")
+		if st:
+			sl = st.get("lin") or {}
+			sr = st.get("rot") or {}
+			L += ["", f"  --- ノイズフロア（静止側 ID={res['static_id']}・本来はどちらも 0）---"]
+			if sl.get("ok"):
+				L.append(f"    見かけの並進: span {sl['span']:.3f} mm  (残差RMS {sl['perp_rms']:.3f} mm)")
+			if sr.get("ok"):
+				L.append(f"    見かけの回転: span {sr['span']:.3f} °   (残差RMS {sr['perp_rms']:.3f} °)")
+			if not sl.get("ok") and not sr.get("ok"):
+				L.append("    （静止側マーカーが検出されませんでした）")
+		if notes:
+			L += ["", "  --- 注意 ---"] + [f"    ・{t}" for t in notes]
+		return "\n".join(L)
+
+	def _av_print_report(self, axis: str) -> None:
+		try:
+			self._ankle_safe_print("=" * 78)
+			for line in self._av_row_report(axis).split("\n"):
+				self._ankle_safe_print(line)
+			self._ankle_safe_print("=" * 78)
+		except Exception:
+			pass
+
+	def on_av_show_report(self) -> None:
+		self._av_dialog_ready()
+		import numpy as np
+		done = [ax for ax, _k in self.AV_AXES if self.av_rows[ax]["result"]]
+		if not done:
+			messagebox.showinfo("レポート", "解析済みの軸がありません。")
+			return
+		blocks = [self._av_row_report(ax) for ax in done]
+		cals = [(ax, self.av_rows[ax]["result"]["marker_size_calibrated"])
+		        for ax in done
+		        if self.av_rows[ax]["kind"] == "lin"
+		        and self.av_rows[ax]["result"].get("marker_size_calibrated")]
+		tail = []
+		if cals:
+			vals = [v for _a, v in cals]
+			tail = ["", "=" * 78,
+			        "【直動軸から求めたマーカー実寸】",
+			        "  " + "   ".join(f"{a}={v:.3f}mm" for a, v in cals),
+			        f"  平均 {np.mean(vals):.3f} mm   ばらつき(標準偏差) {np.std(vals):.3f} mm",
+			        "",
+			        "  → この値を ankle simulator ② の「マーカー実寸(mm)」に入れてください。",
+			        "     単眼RGBはスケール不定なので外から絶対長を入れるしかなく、",
+			        "     ロボットの位置決め精度はノギスより桁違いに良いため、",
+			        "     これが最も確かな較正になります。",
+			        "  → 3軸で値が食い違う場合は、カメラ内部パラメータ(fx,fy)か",
+			        "     レンズ歪み補正の残差を疑ってください（方向依存の誤差になります）。"]
+		self._av_text_window("ArUco精度検証 サマリー", "\n\n".join(blocks) + "\n".join(tail))
+
+	def _av_text_window(self, title: str, text: str) -> None:
+		win = tk.Toplevel(self)
+		win.title(title)
+		win.geometry("960x700")
+		# 本体の背後に出ると固まったように見えるので、必ず手前に出す
+		try:
+			win.transient(self)
+			win.lift()
+			win.focus_force()
+		except Exception:
+			pass
+		frm = ttk.Frame(win, padding=8)
+		frm.pack(fill="both", expand=True)
+		sb = ttk.Scrollbar(frm, orient="vertical")
+		sb.pack(side="right", fill="y")
+		txt = tk.Text(frm, wrap="none", font=("Consolas", 10), yscrollcommand=sb.set)
+		txt.pack(side="left", fill="both", expand=True)
+		sb.config(command=txt.yview)
+		txt.insert("1.0", text)
+		txt.config(state="disabled")
+		ttk.Button(win, text="閉じる", command=win.destroy).pack(pady=6)
+
+	def on_av_clear_results(self) -> None:
+		if not messagebox.askyesno("結果クリア",
+			"解析結果をすべて消去しますか？（録画ファイルの指定は残ります）"):
+			return
+		for ax, _k in self.AV_AXES:
+			self.av_rows[ax]["result"] = None
+			self.av_rows[ax]["state"].set("未解析")
+			self.av_rows[ax]["summary"].set("—")
+			self._av_save_result(ax)   # 保存済みの結果も消す
+		self._av_refresh_status()
+
+	def _av_refresh_status(self) -> None:
+		try:
+			done = [ax for ax, _k in self.AV_AXES if self.av_rows[ax]["result"]]
+			todo = [ax for ax, _k in self.AV_AXES if not self.av_rows[ax]["result"]]
+			self.av_status.set(f"解析済: {' '.join(done) if done else '(なし)'}    "
+			                    f"未解析: {' '.join(todo) if todo else '(なし)'}")
+		except Exception:
+			pass
+
+	# ---- CSV ----
+	# ---- テンプレートのグラフを .xlsx に挿し込む ----
+	# openpyxl でグラフを組み直すと線幅・マーカー・スタイルなど細部が変わってしまう
+	# (実際に一度それで作り直したら見た目が変わった)。そこで、ユーザーが Excel 上で
+	# 仕上げたグラフの XML を templates/aruco_chart/ にそのまま置いておき、
+	# 参照するシート名と行範囲だけ書き換えて丸ごとコピーする。書式は一切触らない。
+	AV_CHART_TEMPLATE_FILES = ("chart1.xml", "chart2.xml", "chart3.xml",
+	                            "style.xml", "colors.xml", "drawing.xml")
+
+	def _av_chart_template_dir(self) -> Path:
+		return Path(__file__).parent / "templates" / "aruco_chart"
+
+	def _av_inject_charts(self, path: str, sheets, cols=None) -> tuple:
+		"""出力済みの .xlsx に、テンプレートのグラフを各シートぶん挿し込む。
+
+		sheets: [(シート名, グラフに使う先頭行, 末尾行)] — 行はExcelの1始まり。
+		cols:   グラフ用列の役割→列文字
+		        {"TIME": "AI", "IDEAL": "AJ", "MEAS": {"rgb": "AK", ...}}
+		取り込んだテンプレートがあればそちらを、無ければ既定 (templates/aruco_chart/) を使う。
+		Returns: (挿し込んだグラフ数, エラーメッセージ or None)
+		"""
+		if self._av_user_template_meta() and cols:
+			return self._av_inject_charts_user(path, sheets, cols)
+		return self._av_inject_charts_default(path, sheets, cols)
+
+	def _av_inject_charts_default(self, path: str, sheets, cols=None) -> tuple:
+		"""既定テンプレート (chart1〜3.xml = rgb/depth_corner/fusion) を使う。"""
+		import re
+		tdir = self._av_chart_template_dir()
+		missing = [n for n in self.AV_CHART_TEMPLATE_FILES if not (tdir / n).exists()]
+		if missing:
+			return 0, f"グラフのテンプレートが見つかりません ({', '.join(missing)}): {tdir}"
+		tpl = {n: (tdir / n).read_text(encoding="utf-8") for n in self.AV_CHART_TEMPLATE_FILES}
+
+		def _retarget(xml: str, sheet: str, r0: int, r1: int) -> str:
+			"""<c:f> の参照を、このシート・この行範囲に差し替える (列はテンプレのまま)。"""
+			sq = self._av_quote_sheet(sheet)
+
+			def fix(mm):
+				inner = mm.group(1)
+				g = re.match(r"^.*!\$([A-Z]+)\$\d+:\$([A-Z]+)\$\d+$", inner)
+				if not g:
+					return mm.group(0)
+				return f"<c:f>{sq}!${g.group(1)}${r0}:${g.group(2)}${r1}</c:f>"
+			return re.sub(r"<c:f>(.*?)</c:f>", fix, xml)
+
+		# 平滑後の列があれば「生3枚 + 平滑後3枚」にする。
+		# 既定テンプレは列文字で参照しているので、計測列だけ読み替える。
+		lp_map = {}
+		if cols and cols.get("MEAS_LP"):
+			for m, c in (cols.get("MEAS") or {}).items():
+				lp = (cols["MEAS_LP"] or {}).get(m)
+				if c and lp:
+					lp_map[c] = lp
+
+		def _to_lp(xml: str) -> str:
+			def fix2(mm):
+				inner = mm.group(1)
+				for a_, b_ in lp_map.items():
+					inner = inner.replace(f"${a_}$", f"${b_}$")
+				return f"<c:f>{inner}</c:f>"
+			return re.sub(r"<c:f>(.*?)</c:f>", fix2, xml)
+
+		anchors = self._av_split_anchors(tpl["drawing.xml"])
+		_sz = self._av_getf(self.av_chart_size_cm, 24.0)
+		_pl = self._av_getf(self.av_plot_size_cm, 21.0)
+		_frac = (_pl / _sz) if _sz > 0 else 0.0
+		drawing = self._av_user_drawing_xml(
+			anchors, 6 if lp_map else 3, ncols=(2 if lp_map else 1), size_cm=_sz)
+		plan = []
+		for _sh in sheets:
+			sheet_name, r0, r1 = _sh[0], _sh[1], _sh[2]
+			_unit = _sh[3] if len(_sh) > 3 else "mm"
+			_tmax = _sh[4] if len(_sh) > 4 else 0.0
+			_vmax = _sh[5] if len(_sh) > 5 else 0.0
+			base = [self._av_chart_unit_set(
+				_retarget(tpl[f"chart{j}.xml"], sheet_name, r0, r1), _unit)
+			        for j in (1, 2, 3)]
+			# 【生】【平滑後】を手法ごとに横に並べる
+			ch = []
+			for x in base:
+				ch.append(x)
+				if lp_map:
+					ch.append(_to_lp(x))
+			try:
+				if bool(self.av_axis_auto.get()):
+					ch = [self._av_chart_autoscale(x, cols, _tmax, _vmax) for x in ch]
+			except Exception:
+				pass
+			if _frac > 0:
+				ch = [self._av_chart_plot_square(x, _frac) for x in ch]
+				ch = [self._av_chart_auto_titles(x) for x in ch]
+				# 横軸タイトルだけは枠の最下部へ固定する (目盛と重なるため)
+				ch = [self._av_chart_axis_title_bottom(x, _sz) for x in ch]
+			# グラフタイトルに軸名を入れる (X/Y/Z/U/V/W)
+			try:
+				_names = [m for m, _k in self.AV_METHODS]
+				_titles = []
+				for _m in _names:
+					_titles.append(f"{sheet_name}軸  {_m}")
+					if lp_map:
+						_titles.append(f"{sheet_name}軸  {_m}（平滑後）")
+				ch = [self._av_chart_title_set(x, t) if t else x
+				       for x, t in zip(ch, _titles + [None] * len(ch))]
+			except Exception as _e:
+				print(f"[精度検証] グラフタイトルの設定に失敗: {_e}")
+			plan.append({
+				"sheet": sheet_name, "charts": ch,
+				"style": tpl["style.xml"], "colors": tpl["colors.xml"],
+				"drawing": drawing})
+		return self._av_zip_inject(path, plan)
+
+	def _av_inject_charts_user(self, path: str, sheets, cols: dict) -> tuple:
+		"""取り込んだ見本のグラフを、3手法ぶんに増やして挿し込む。"""
+		d = self._av_user_template_dir()
+		try:
+			tpl = (d / "chart.xml").read_text(encoding="utf-8")
+			style = (d / "style.xml").read_text(encoding="utf-8")
+			colors = (d / "colors.xml").read_text(encoding="utf-8")
+			anchor = (d / "anchor.xml").read_text(encoding="utf-8")
+		except Exception as e:
+			return 0, f"取り込んだテンプレートを読めませんでした: {e}"
+		methods = [m for m, _k in self.AV_METHODS]
+		# 平滑後の列があれば「生3枚 + 平滑後3枚」の計6枚を出す。
+		# 面外回転(U/V)は生のままだと見た目が真っ黒になるが、平滑後なら形が見える。
+		has_lp = bool(cols.get("MEAS_LP"))
+		try:
+			auto_axis = bool(self.av_axis_auto.get())
+		except Exception:
+			auto_axis = True
+		# 枠と作図エリアの一辺 [cm]。作図エリア/枠 の比を w にも h にも入れる
+		frame_cm = self._av_getf(self.av_chart_size_cm, 24.0)
+		plot_cm = self._av_getf(self.av_plot_size_cm, 21.0)
+		plot_frac = (plot_cm / frame_cm) if frame_cm > 0 else 0.0
+		n_charts_per_sheet = len(methods) * (2 if has_lp else 1)
+		# 2列 × 3行。左が生、右が平滑後。同じ手法が横に並ぶ。
+		drawing = self._av_user_drawing_xml(
+			anchor, n_charts_per_sheet, ncols=(2 if has_lp else 1),
+			size_cm=frame_cm)
+		plan = []
+		for _sh in sheets:
+			sheet_name, r0, r1 = _sh[0], _sh[1], _sh[2]
+			_unit = _sh[3] if len(_sh) > 3 else "mm"
+			_tmax = _sh[4] if len(_sh) > 4 else 0.0
+			_vmax = _sh[5] if len(_sh) > 5 else 0.0
+			# 【rgb】【rgb(平滑後)】/【depth_corners】【…】/【fusion】【…】 の順
+			ch = []
+			for m in methods:
+				ch.append(self._av_user_chart_xml(tpl, sheet_name, r0, r1, cols, m, _unit))
+				if has_lp:
+					ch.append(self._av_user_chart_xml(
+						tpl, sheet_name, r0, r1, cols, m, _unit, use_lp=True))
+			if auto_axis:
+				ch = [self._av_chart_autoscale(x, cols, _tmax, _vmax) for x in ch]
+			if plot_frac > 0:
+				ch = [self._av_chart_plot_square(x, plot_frac) for x in ch]
+				# 作図エリアを動かしたら、タイトルの固定座標は必ず外すこと。
+				# 残すとタイトルがグラフ内部に食い込む (実測)。
+				ch = [self._av_chart_auto_titles(x) for x in ch]
+				# ただし横軸タイトルだけは自動配置だと目盛の数字と重なるので、
+				# 枠の最下部へ明示的に置き直す (単位が ° のとき顕著)。
+				ch = [self._av_chart_axis_title_bottom(x, frame_cm) for x in ch]
+			plan.append({
+				"sheet": sheet_name, "charts": ch,
+				"style": style, "colors": colors, "drawing": drawing})
+		return self._av_zip_inject(path, plan)
+
+	# ---- テンプレート(取り込み分)から3手法ぶんのグラフXMLを作る ----
+	def _av_user_chart_xml(self, tpl: str, sheet: str, r0: int, r1: int,
+	                        cols: dict, method: str, unit: str = "mm",
+	                        use_lp: bool = False) -> str:
+		"""役割トークンを、この軸のシート・行範囲・手法の列に差し替える。"""
+		import re
+		sq = self._av_quote_sheet(sheet)
+
+		def _col_of(role: str) -> str:
+			if role.startswith("COL:"):
+				return role[4:]
+			if role in ("MEAS", "MEAS_LP"):
+				# use_lp のときは、テンプレが「計測」を指していても平滑後の列に読み替える
+				key = "MEAS_LP" if (use_lp or role == "MEAS_LP") else "MEAS"
+				mp = cols.get(key) or cols.get("MEAS") or {}
+				return mp.get(method) or mp.get("rgb") or "A"
+			return cols.get(role) or "A"
+
+		def _rng(mm):
+			role0, role1 = mm.group(1), mm.group(2)
+			return (f"<c:f>{sq}!${_col_of(role0)}${r0}:"
+			        f"${_col_of(role1)}${r1}</c:f>")
+
+		def _cell(mm):
+			role, row = mm.group(1), mm.group(2)
+			return f"<c:f>{sq}!${_col_of(role)}${row}</c:f>"
+
+		out = re.sub(r"<c:f>\{\{RANGE\|([^|}]+)\|([^|}]+)\}\}</c:f>", _rng, tpl)
+		out = re.sub(r"<c:f>\{\{CELL\|([^|}]+)\|(\d+)\}\}</c:f>", _cell, out)
+		out = self._av_chart_unit_set(out, unit)
+		# グラフタイトルは「軸名 + 手法」。シート名がそのまま軸名 (X/Y/Z/U/V/W)。
+		# 6枚を並べたときにどれがどの軸か分かるようにする。
+		title = f"{sheet}軸  {method}（平滑後）" if use_lp else f"{sheet}軸  {method}"
+		return self._av_chart_title_set(out, title)
+
+	@staticmethod
+	def _av_nice_ceil(x):
+		"""軸の最大値として見栄えのする値へ切り上げる (19 → 20, 47.5 → 50)。"""
+		import math
+		try:
+			x = float(x)
+		except Exception:
+			return None
+		if not math.isfinite(x) or x <= 0:
+			return None
+		e = math.floor(math.log10(x))
+		base = 10.0 ** e
+		for m in (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+			if x <= m * base * (1.0 + 1e-9):
+				return m * base
+		return 10.0 * base
+
+	@staticmethod
+	def _av_chart_auto_titles(xml: str) -> str:
+		"""グラフ/軸タイトルの固定座標 (manualLayout) を外し、自動配置に戻す。
+
+		テンプレのタイトルは、作られたときの作図エリアに合わせた固定座標を持っている。
+		作図エリアの大きさ・位置を変えると、タイトルだけが元の場所に残るので
+		**目盛やグラフ本体に重なる**（実測: 横軸タイトル y=0.9396 に対し
+		作図エリアの下端が 0.9136 になり、目盛ラベルと衝突した）。
+		Excel の自動配置なら、作図エリアの外側に必ず置かれる。
+		※ <c:title> は入れ子にならないので、非貪欲マッチで安全に取れる。
+		"""
+		import re
+
+		def _fix(mm):
+			b = mm.group(0)
+			return re.sub(r"<c:layout>.*?</c:layout>", "<c:layout/>", b, flags=re.S)
+
+		return re.sub(r"<c:title>.*?</c:title>", _fix, xml, flags=re.S)
+
+	@staticmethod
+	def _av_chart_plot_square(xml: str, frac: float) -> str:
+		"""作図エリア（目盛の内側の箱）を、枠に対する割合 frac の正方形にする。
+
+		枠が正方形でも、作図エリアの割合が縦横で違うと y=x が 45° に見えない。
+		実測: テンプレは w=0.887 / h=0.855 で、y=x が 43.9° になっていた。
+		枠 24cm・作図エリア 21cm なら frac = 21/24 = 0.875 を w にも h にも入れる。
+
+		※ <c:manualLayout> は 凡例や軸タイトルにもあるので、必ず <c:plotArea> 直後の
+		   <c:layout> だけを書き換える (全部置換すると凡例が壊れる)。
+		"""
+		import re
+		try:
+			frac = float(frac)
+		except Exception:
+			return xml
+		if not (0.05 < frac <= 0.98):
+			return xml
+		i = xml.find("<c:plotArea>")
+		if i < 0:
+			return xml
+		j = xml.find("<c:layout", i)
+		if j < 0:
+			return xml
+		# 自己終了 <c:layout/> と <c:layout>...</c:layout> の両方に対応する
+		if xml.startswith("<c:layout/>", j):
+			k = j + len("<c:layout/>")
+			blk = xml[j:k]
+		else:
+			k = xml.find("</c:layout>", j)
+			if k < 0:
+				return xml
+			k += len("</c:layout>")
+			blk = xml[j:k]
+		# 余った余白の配分。テンプレの比をそのまま使うと、テンプレが下に厚い場合
+		# 上がタイトルに足りなくなる (実測: 上 0.93cm に対しタイトル24pt≒0.85cm)。
+		# 何が入るかで決める:
+		#   左 = 縦軸の目盛ラベル + 回転した縦軸タイトル → 広めに
+		#   右 = 最後の目盛ラベルのはみ出しぶんだけ
+		#   上 = グラフタイトル / 下 = 横軸の目盛ラベル + 横軸タイトル
+		leftover = max(0.0, 1.0 - frac)
+		x = leftover * 0.85
+		y = leftover * 0.40
+		new = ("<c:layout><c:manualLayout><c:layoutTarget val=\"inner\"/>"
+		       "<c:xMode val=\"edge\"/><c:yMode val=\"edge\"/>"
+		       f'<c:x val="{x:.10g}"/><c:y val="{y:.10g}"/>'
+		       f'<c:w val="{frac:.10g}"/><c:h val="{frac:.10g}"/>'
+		       "</c:manualLayout></c:layout>")
+		return xml[:j] + new + xml[k:]
+
+	@staticmethod
+	def _av_chart_axis_title_bottom(xml: str, frame_cm: float = 24.0,
+	                                 gap_cm: float = 0.10) -> str:
+		"""横軸タイトルを枠の一番下へ置き、目盛の数字と重ならないようにする。
+
+		【なぜ要るのか】(2026-09-08 ユーザー報告 → 実測)
+		単位が ° のとき、横軸タイトルと目盛の数字が少し重なる。
+		作図エリアは 枠24cm・作図21cm なので下余白は 1.80cm しかなく、
+		そこへ 目盛ラベル(10pt) と 軸タイトル(18pt) が入る。
+		固定座標を外して Excel の自動配置に任せると、この帯の中央寄りに
+		置かれるため目盛に近づく。特に ° は代替フォントに落ちて行の高さが
+		増えるらしく、mm では出ない重なりが出る。
+
+		そこで横軸タイトルだけ「枠の下端から gap_cm 上」に固定する。
+		目盛ラベルとの間隔が最大になるので、構造的に重ならない。
+		横位置 (x) はテンプレートの値をそのまま使う (中央寄せの調整を壊さない)。
+		縦軸タイトルは自動配置のままにする (左右方向は余裕があるため)。
+
+		まだ重なる場合は gap_cm を大きくすると、さらに下がる。
+		"""
+		import re
+		i = xml.find('<c:axPos val="b"/>')
+		if i < 0:
+			return xml
+		# その軸の <c:title> ブロックを探す (axPos の前後どちらにもあり得る)
+		ax_start = max(xml.rfind("<c:catAx>", 0, i), xml.rfind("<c:valAx>", 0, i))
+		if ax_start < 0:
+			return xml
+		ax_end = xml.find("</c:catAx>", ax_start)
+		if ax_end < 0:
+			ax_end = xml.find("</c:valAx>", ax_start)
+		if ax_end < 0:
+			return xml
+		block = xml[ax_start:ax_end]
+		t0 = block.find("<c:title>")
+		if t0 < 0:
+			return xml                      # 軸タイトルが無い → 何もしない
+		t1 = block.find("</c:title>", t0)
+		if t1 < 0:
+			return xml
+		tblock = block[t0:t1]
+		# タイトルの文字サイズ (1/100 pt)。読めなければ 18pt とみなす。
+		# ブロックの中には既定値の小さいサイズ (10pt など) も混ざっているので
+		# 最大のものを採る。小さい方を拾うと高さを見誤り、タイトルが枠から
+		# はみ出して結局 Excel に押し戻される (実測: 10pt と誤認して 0.58cm しか
+		# 確保できず、18pt の 0.86cm が入らなかった)。
+		_szs = [float(v) / 100.0 for v in re.findall(r'\bsz="(\d+)"', tblock)]
+		pt = max(_szs) if _szs else 18.0
+		try:
+			frame_cm = float(frame_cm)
+		except Exception:
+			frame_cm = 24.0
+		if frame_cm <= 0:
+			return xml
+		# 行の高さは フォント × 1.35 とみる (実測の見た目に合わせた係数)。
+		h_cm = pt * 0.03528 * 1.35
+		y = 1.0 - (h_cm + float(gap_cm)) / frame_cm
+		if not (0.5 < y < 0.999):
+			return xml
+		# 既存の x があれば残す (テンプレートの中央寄せを壊さない)
+		m_x = re.search(r'<c:x val="([-0-9.eE]+)"/>', tblock)
+		x = m_x.group(1) if m_x else "0.45"
+		lay = ('<c:layout><c:manualLayout>'
+		       '<c:xMode val="edge"/><c:yMode val="edge"/>'
+		       f'<c:x val="{x}"/><c:y val="{y:.10g}"/>'
+		       '</c:manualLayout></c:layout>')
+		if "<c:layout" in tblock:
+			new_t = re.sub(r"<c:layout(/>|>.*?</c:layout>)", lay, tblock, count=1, flags=re.S)
+		else:
+			# <c:title> の直後に入れる (tx より前でよい)
+			new_t = tblock[:len("<c:title>")] + lay + tblock[len("<c:title>"):]
+		return xml[:ax_start + t0] + new_t + xml[ax_start + t1:]
+
+	def _av_chart_autoscale(self, xml: str, cols: dict, t_max: float, v_max: float) -> str:
+		"""グラフの軸を 0 起点・データに合う最大値へ自動調整する。
+
+		テンプレートには作成時の軸範囲 (例 <c:max val=\"10\"/>) が焼き付いている。
+		試験ごとに移動量が変わるので、そのままだとグラフが途中で切れる
+		(実測: 等速区間 19° の試験なのに軸が 0〜10 で右半分が見えなかった)。
+		横軸が『経過時間』か『理想』かは、系列が参照している列で判断する。
+		最小値は 0 に固定する (負にならないように)。
+		"""
+		import re
+		if not (t_max or v_max):
+			return xml
+		# 横軸に使われている列を調べる
+		mx = re.search(r"<c:xVal>.*?<c:f>([^<]+)</c:f>", xml, flags=re.S)
+		xcol = None
+		if mx:
+			g = re.search(r"\$([A-Z]+)\$", mx.group(1))
+			xcol = g.group(1) if g else None
+		x_is_time = bool(xcol and cols and xcol == cols.get("TIME"))
+		x_max = self._av_nice_ceil(t_max if x_is_time else v_max)
+		y_max = self._av_nice_ceil(v_max)
+		if x_max is None and y_max is None:
+			return xml
+
+		def _scaling(vmax):
+			# CT_Scaling の子の順番は logBase → orientation → max → min
+			if vmax is None:
+				return "<c:scaling><c:orientation val=\"minMax\"/><c:min val=\"0\"/></c:scaling>"
+			return (f"<c:scaling><c:orientation val=\"minMax\"/>"
+			        f"<c:max val=\"{vmax:g}\"/><c:min val=\"0\"/></c:scaling>")
+
+		out = []
+		pos = 0
+		while True:
+			i = xml.find("<c:valAx>", pos)
+			if i < 0:
+				out.append(xml[pos:])
+				break
+			j = xml.find("</c:valAx>", i)
+			if j < 0:
+				out.append(xml[pos:])
+				break
+			j += len("</c:valAx>")
+			blk = xml[i:j]
+			is_x = 'axPos val="b"' in blk
+			new_sc = _scaling(x_max if is_x else y_max)
+			blk2 = re.sub(r"<c:scaling>.*?</c:scaling>", lambda _m: new_sc, blk,
+			               count=1, flags=re.S)
+			out.append(xml[pos:i])
+			out.append(blk2)
+			pos = j
+		return "".join(out)
+
+	@staticmethod
+	def _av_chart_unit_set(xml: str, unit: str) -> str:
+		"""軸タイトルの単位を差し替える。
+
+		テンプレートは直動軸で作られていることが多く、軸タイトルが「真値 [mm]」の
+		まま固定文字列で入っている。回転軸のシートでは単位が嘘になるので、
+		文字列 [mm] だけを差し替える (他の文字には触らない)。
+		"""
+		if not unit or unit == "mm":
+			return xml
+		import re
+
+		def _fix(mm):
+			t = mm.group(1)
+			for a, b in (("[mm]", f"[{unit}]"), ("[ mm ]", f"[{unit}]"),
+			              ("(mm)", f"({unit})"), ("［mm］", f"［{unit}］")):
+				t = t.replace(a, b)
+			return f"<a:t>{t}</a:t>"
+		return re.sub(r"<a:t>(.*?)</a:t>", _fix, xml, flags=re.S)
+
+	@staticmethod
+	def _av_chart_title_set(xml: str, text: str) -> str:
+		"""グラフ本体のタイトル文字列を差し替える (軸タイトルには触らない)。
+
+		タイトルが無い / セル参照になっている場合はそのまま返す。
+		"""
+		import re
+		i = xml.find("<c:chart>")
+		if i < 0:
+			return xml
+		j = xml.find("<c:title>", i)
+		if j < 0:
+			return xml
+		pa = xml.find("<c:plotArea>", i)
+		if pa >= 0 and j > pa:
+			return xml          # グラフのタイトルではなく軸タイトル → 触らない
+		k = xml.find("</c:title>", j)
+		if k < 0:
+			return xml
+		block = xml[j:k]
+		runs = list(re.finditer(r"<a:t>.*?</a:t>", block, flags=re.S))
+		if not runs:
+			return xml
+		new_block = block[:runs[0].start()] + f"<a:t>{text}</a:t>" + block[runs[0].end():]
+		# 2つ目以降の文字列は空にする (元が複数ランに分かれている場合)
+		new_block = re.sub(r"(<a:t>)(?!" + re.escape(text) + r"</a:t>).*?(</a:t>)",
+		                    r"\1\2", new_block, flags=re.S)
+		return xml[:j] + new_block + xml[k:]
+
+	@staticmethod
+	def _av_split_anchors(drawing_xml: str) -> list:
+		"""drawing.xml から <xdr:twoCellAnchor> を取り出し、r:id をトークン化して返す。"""
+		import re
+		out = []
+		for tag in ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor"):
+			start = f"<xdr:{tag}"
+			end = f"</xdr:{tag}>"
+			i = 0
+			while True:
+				i = drawing_xml.find(start, i)
+				if i < 0:
+					break
+				j = drawing_xml.find(end, i)
+				if j < 0:
+					break
+				blk = drawing_xml[i:j + len(end)]
+				out.append(re.sub(r'r:id="rId\d+"', 'r:id="{{AVRID}}"', blk))
+				i = j + len(end)
+		return out
+
+	# EMU (English Metric Unit) の換算。OOXML の座標はすべてこれ。
+	#   1 cm = 360000 EMU / 1 px(96dpi) = 9525 EMU
+	#   Excel 既定の列幅 = 64px = 609600 EMU / 既定の行高 = 20px = 190500 EMU
+	AV_EMU_PER_CM = 360000
+	AV_EMU_PER_COL = 609600
+	AV_EMU_PER_ROW = 190500
+
+	def _av_user_drawing_xml(self, anchor_tpl, n: int = 3, ncols: int = 1,
+	                          size_cm: float = 24.0, gap_cm: float = 2.0,
+	                          base_col: int = 35, base_row: int = 1) -> str:
+		"""グラフを「正方形・格子配置」で並べた drawing.xml を作る。
+
+		テンプレートのアンカー (twoCellAnchor) は「セルに合わせて伸縮」なので、
+		列幅や行高でグラフの縦横比が変わってしまう。真値×計測値のグラフでは
+		y=x が 45° に見えないと比較しづらいので、oneCellAnchor + 明示的な ext で
+		**大きさを正方形に固定**する (位置だけがセル基準)。
+
+		ncols=2 なら 左に生・右に平滑後 が並ぶ 2列×3行 になる。
+		"""
+		import math
+		import re
+		NS = ('<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/'
+		      'spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">')
+		src = anchor_tpl if isinstance(anchor_tpl, (list, tuple)) else [anchor_tpl]
+		src = [x for x in src if x]
+		if not src:
+			src = [self._av_default_anchor_xml()]
+		# アンカーの中身 (graphicFrame) だけを借りて、枠は組み直す
+		m = re.search(r"<xdr:graphicFrame.*?</xdr:graphicFrame>", src[0], flags=re.S)
+		if not m:
+			m = re.search(r"<xdr:graphicFrame.*?</xdr:graphicFrame>",
+			               self._av_default_anchor_xml(), flags=re.S)
+		frame_tpl = m.group(0) if m else None
+		if frame_tpl is None:
+			return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + NS + "</xdr:wsDr>"
+		size = int(round(float(size_cm) * self.AV_EMU_PER_CM))
+		step = size + int(round(float(gap_cm) * self.AV_EMU_PER_CM))
+		col_step = int(math.ceil(step / float(self.AV_EMU_PER_COL)))
+		row_step = int(math.ceil(step / float(self.AV_EMU_PER_ROW)))
+		ncols = max(1, int(ncols))
+		parts = []
+		for i in range(int(n)):
+			r, c = divmod(i, ncols)
+			frame = frame_tpl.replace("{{AVRID}}", f"rId{i + 1}")
+			frame = re.sub(r'(<xdr:cNvPr\b[^>]*?\bid=")\d+(")',
+			                r"\g<1>" + str(i + 2) + r"\2", frame)
+			frame = re.sub(r'(<xdr:cNvPr\b[^>]*?\bname=")[^"]*(")',
+			                r"\g<1>グラフ " + str(i + 1) + r"\2", frame)
+			parts.append(
+				"<xdr:oneCellAnchor>"
+				f"<xdr:from><xdr:col>{base_col + c * col_step}</xdr:col>"
+				f"<xdr:colOff>0</xdr:colOff>"
+				f"<xdr:row>{base_row + r * row_step}</xdr:row>"
+				f"<xdr:rowOff>0</xdr:rowOff></xdr:from>"
+				f'<xdr:ext cx="{size}" cy="{size}"/>'
+				+ frame + "<xdr:clientData/></xdr:oneCellAnchor>")
+		return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+		        + NS + "".join(parts) + "</xdr:wsDr>")
+
+	# ---- .xlsx にグラフ一式を書き込む共通処理 ----
+	def _av_zip_inject(self, path: str, plan: list) -> tuple:
+		"""出力済み .xlsx に、シートごとのグラフ一式を挿し込む。
+
+		plan: [{"sheet": シート名, "charts": [chartXML,...],
+		         "style": XML, "colors": XML, "drawing": XML}]
+		drawing の中の rId1..N が charts の並びに対応する。
+		Returns: (挿し込んだグラフ数, エラーメッセージ or None)
+		"""
+		import zipfile
+		import re
+		import shutil
+		CT = {"chart": "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+		      "style": "application/vnd.ms-office.chartstyle+xml",
+		      "colors": "application/vnd.ms-office.chartcolorstyle+xml",
+		      "drawing": "application/vnd.openxmlformats-officedocument.drawing+xml"}
+		NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+		R_CHART = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
+		R_DRAW = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+		R_STYLE = "http://schemas.microsoft.com/office/2011/relationships/chartStyle"
+		R_COLOR = "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle"
+		NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+		try:
+			with zipfile.ZipFile(path) as z:
+				parts = {n: z.read(n) for n in z.namelist()}
+		except Exception as e:
+			return 0, f"出力ファイルを開けませんでした: {e}"
+		# シート名 → worksheet パーツ名
+		try:
+			wbx = parts["xl/workbook.xml"].decode("utf-8")
+			rels = parts["xl/_rels/workbook.xml.rels"].decode("utf-8")
+			rid2tgt = {}
+			for tag in re.findall(r"<Relationship\b[^>]*/>", rels):
+				mid = re.search(r'\bId="([^"]+)"', tag)
+				mtg = re.search(r'\bTarget="([^"]+)"', tag)
+				if mid and mtg:
+					rid2tgt[mid.group(1)] = mtg.group(1)
+			name2part = {}
+			for tag in re.findall(r"<sheet\b[^>]*/>", wbx):
+				mnm = re.search(r'\bname="([^"]+)"', tag)
+				mri = re.search(r'r:id="([^"]+)"', tag)
+				if not (mnm and mri):
+					continue
+				tgt = rid2tgt.get(mri.group(1), "")
+				if tgt:
+					name2part[mnm.group(1)] = "xl/" + tgt.lstrip("/").replace("xl/", "", 1)
+		except Exception as e:
+			return 0, f"ワークブック構造の解析に失敗: {e}"
+
+		n_charts = 0
+		cid = 0
+		did = 0
+		new_ct = []
+		for item in plan:
+			ws_part = name2part.get(item["sheet"])
+			if not ws_part or ws_part not in parts:
+				continue
+			did += 1
+			chart_ids = []
+			for body in item["charts"]:
+				cid += 1
+				chart_ids.append(cid)
+				parts[f"xl/charts/chart{cid}.xml"] = body.encode("utf-8")
+				parts[f"xl/charts/style{cid}.xml"] = item["style"].encode("utf-8")
+				parts[f"xl/charts/colors{cid}.xml"] = item["colors"].encode("utf-8")
+				parts[f"xl/charts/_rels/chart{cid}.xml.rels"] = (
+					'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+					f'<Relationships xmlns="{NS_REL}">'
+					f'<Relationship Id="rId1" Type="{R_STYLE}" Target="style{cid}.xml"/>'
+					f'<Relationship Id="rId2" Type="{R_COLOR}" Target="colors{cid}.xml"/>'
+					'</Relationships>').encode("utf-8")
+				new_ct += [f'<Override PartName="/xl/charts/chart{cid}.xml" ContentType="{CT["chart"]}"/>',
+				           f'<Override PartName="/xl/charts/style{cid}.xml" ContentType="{CT["style"]}"/>',
+				           f'<Override PartName="/xl/charts/colors{cid}.xml" ContentType="{CT["colors"]}"/>']
+				n_charts += 1
+			parts[f"xl/drawings/drawing{did}.xml"] = item["drawing"].encode("utf-8")
+			parts[f"xl/drawings/_rels/drawing{did}.xml.rels"] = (
+				'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+				f'<Relationships xmlns="{NS_REL}">'
+				+ "".join(f'<Relationship Id="rId{k + 1}" Type="{R_CHART}" '
+				           f'Target="../charts/chart{c}.xml"/>'
+				           for k, c in enumerate(chart_ids))
+				+ '</Relationships>').encode("utf-8")
+			new_ct.append(f'<Override PartName="/xl/drawings/drawing{did}.xml" '
+			               f'ContentType="{CT["drawing"]}"/>')
+			rel_part = ws_part.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels"
+			if rel_part in parts:
+				rx = parts[rel_part].decode("utf-8")
+				used = [int(g) for g in re.findall(r'Id="rId(\d+)"', rx)]
+				rid = max(used) + 1 if used else 1
+				rx = rx.replace("</Relationships>",
+					f'<Relationship Id="rId{rid}" Type="{R_DRAW}" '
+					f'Target="../drawings/drawing{did}.xml"/></Relationships>')
+			else:
+				rid = 1
+				rx = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+				      f'<Relationships xmlns="{NS_REL}">'
+				      f'<Relationship Id="rId{rid}" Type="{R_DRAW}" '
+				      f'Target="../drawings/drawing{did}.xml"/></Relationships>')
+			parts[rel_part] = rx.encode("utf-8")
+			wsx = parts[ws_part].decode("utf-8")
+			if "<drawing " not in wsx:
+				# openpyxl のシートは r: 名前空間を宣言していないことがあるので、
+				# drawing 要素の側で宣言してしまう (未宣言だとファイルが壊れる)。
+				wsx = wsx.replace("</worksheet>",
+					                  f'<drawing xmlns:r="{NS_R}" r:id="rId{rid}"/></worksheet>')
+				parts[ws_part] = wsx.encode("utf-8")
+		if not n_charts:
+			return 0, "グラフを挿し込めるシートがありませんでした。"
+		try:
+			ctx = parts["[Content_Types].xml"].decode("utf-8")
+			ctx = ctx.replace("</Types>", "".join(new_ct) + "</Types>")
+			parts["[Content_Types].xml"] = ctx.encode("utf-8")
+		except Exception as e:
+			return 0, f"[Content_Types].xml の更新に失敗: {e}"
+		tmp = f"{path}.tmp"
+		try:
+			with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+				for n, b in parts.items():
+					z.writestr(n, b)
+			shutil.move(tmp, path)
+		except Exception as e:
+			try:
+				import os
+				if os.path.exists(tmp):
+					os.remove(tmp)
+			except Exception:
+				pass
+			return 0, f"グラフの書き込みに失敗: {e}"
+		return n_charts, None
+
+	# ==================================================================
+	# ユーザーがアップロードした Excel のグラフをテンプレートにする
+	# ==================================================================
+	# 従来は templates/aruco_chart/chart1〜3.xml (RGB / depth_corner / fusion) を
+	# 固定で持っていた。グラフの体裁は今後も変わっていくので、
+	#   「見本のグラフが入った .xlsx を1つ渡せば、それを雛形にする」
+	# 方式にする。1枚だけ渡してもらえば、出力時には rgb / depth_corners / fusion の
+	# 3つに増やして各シートへ挿し込む。
+	#
+	# 肝は「見本のグラフが、どの列を横軸/縦軸に使っているか」を役割で覚えること。
+	# 見本が (横軸=理想, 縦軸=計測) と (横軸=理想, 縦軸=理想 ← y=x の線) の
+	# 2系列でも、役割さえ分かっていれば手法ごとに縦軸だけ差し替えられる。
+	# 列は「見本のシートの見出し行」から判定する:
+	#     見出しに「経過時間」→ TIME / 「理想」→ IDEAL / 「計測」→ MEAS
+	# 判定できない列があれば、取り込み時にダイアログで手動指定してもらう。
+	AV_CHART_ROLES = (("TIME", "経過時間"), ("IDEAL", "理想（ロボット）"),
+	                   ("MEAS", "計測（手法ごとに差し替え）"),
+	                   ("MEAS_LP", "計測・平滑後（手法ごとに差し替え）"))
+
+	def _av_user_template_dir(self) -> Path:
+		return Path(__file__).parent / "templates" / "aruco_chart_user"
+
+	def _av_user_template_meta(self):
+		"""取り込み済みテンプレートの meta.json を返す (無ければ None)。"""
+		try:
+			p = self._av_user_template_dir() / "meta.json"
+			if not p.exists():
+				return None
+			meta = json.load(p.open("r", encoding="utf-8"))
+			for n in ("chart.xml", "style.xml", "colors.xml", "anchor.xml"):
+				if not (self._av_user_template_dir() / n).exists():
+					return None
+			return meta
+		except Exception:
+			return None
+
+	def _av_refresh_template_label(self) -> None:
+		meta = self._av_user_template_meta()
+		if not meta:
+			self.av_template_status.set(
+				"現在: 既定のテンプレート (templates/aruco_chart/) を使用中")
+			return
+		self.av_template_status.set(
+			f"現在: 取り込んだテンプレートを使用中 — {meta.get('source_name', '?')}"
+			f"（{meta.get('imported_at', '')} 取り込み / 系列 {meta.get('n_series', '?')} 本 / "
+			f"役割 {', '.join(meta.get('roles_used', []))}）")
+
+	@staticmethod
+	def _av_col_to_index(col: str) -> int:
+		n = 0
+		for ch in str(col).upper():
+			if "A" <= ch <= "Z":
+				n = n * 26 + (ord(ch) - 64)
+		return n
+
+	@staticmethod
+	def _av_index_to_col(idx: int) -> str:
+		s = ""
+		n = int(idx)
+		while n > 0:
+			n, r = divmod(n - 1, 26)
+			s = chr(65 + r) + s
+		return s or "A"
+
+	@staticmethod
+	def _av_quote_sheet(name: str) -> str:
+		"""シート名を <c:f> に書ける形にする (英数字だけならそのまま)。"""
+		s = str(name)
+		if s and all((c.isalnum() or c == "_") for c in s) and not s[0].isdigit():
+			return s
+		return "'" + s.replace("'", "''") + "'"
+
+	def on_av_import_chart_template(self) -> None:
+		"""グラフの見本が入った .xlsx を取り込んでテンプレートにする。"""
+		import re
+		import zipfile
+		import datetime as _dt
+		self._av_dialog_ready()
+		path = filedialog.askopenfilename(
+			parent=self,
+			title="見本のグラフが入った Excel を選択（グラフ1つ・シート1枚でOK）",
+			initialdir=str(Path(__file__).parent),
+			filetypes=[("Excel", "*.xlsx"), ("すべてのファイル", "*.*")])
+		if not path:
+			return
+		try:
+			with zipfile.ZipFile(path) as z:
+				names = z.namelist()
+				charts = sorted(n for n in names
+				                 if re.match(r"^xl/charts/chart\d+\.xml$", n))
+				if not charts:
+					messagebox.showerror(
+						"テンプレートの取り込み",
+						"このファイルにはグラフが入っていません。\n\n"
+						"Excel でグラフを1つ作って保存したファイルを選んでください。\n"
+						"（このタブの「Excel出力」で出したファイルにグラフを作るのが一番確実です。\n"
+						"　列の見出しから横軸・縦軸の役割を自動で判定できます）", parent=self)
+					return
+				# グラフが複数入っている .xlsx（＝これまでの出力そのもの）でも使えるよう、
+				# どれを雛形にするか選んでもらう。1つしか無ければ黙ってそれを使う。
+				chart_part = (charts[0] if len(charts) == 1
+				              else self._av_pick_chart(z, charts, path))
+				if not chart_part:
+					return
+				chart_xml = z.read(chart_part).decode("utf-8")
+				# 付随する style / colors
+				rel_part = ("xl/charts/_rels/"
+				            + chart_part.rsplit("/", 1)[1] + ".rels")
+				style_xml = colors_xml = None
+				if rel_part in names:
+					rels = z.read(rel_part).decode("utf-8")
+					for tag in re.findall(r"<Relationship\b[^>]*/>", rels):
+						mt = re.search(r'Type="([^"]+)"', tag)
+						mg = re.search(r'Target="([^"]+)"', tag)
+						if not (mt and mg):
+							continue
+						tgt = "xl/charts/" + mg.group(1).replace("../", "").split("/")[-1]
+						if tgt not in names:
+							continue
+						if mt.group(1).endswith("chartStyle"):
+							style_xml = z.read(tgt).decode("utf-8")
+						elif mt.group(1).endswith("chartColorStyle"):
+							colors_xml = z.read(tgt).decode("utf-8")
+				# 配置 (アンカー)
+				anchor_xml = self._av_extract_anchor(z, names, chart_part)
+		except Exception as e:
+			messagebox.showerror("テンプレートの取り込み",
+			                      f"ファイルを読めませんでした:\n{e}", parent=self)
+			return
+
+		# --- 参照している列を集め、役割を決める ---
+		refs = re.findall(r"<c:f>(.*?)</c:f>", chart_xml)
+		if not refs:
+			messagebox.showerror("テンプレートの取り込み",
+				"グラフがセルを参照していません（手入力の系列だけのグラフのようです）。",
+				parent=self)
+			return
+		sheet_names = set()
+		cols = []
+		for r in refs:
+			m = re.match(r"^(?:'([^']*)'|([^!]*))!\$([A-Z]+)\$(\d+)(?::\$([A-Z]+)\$(\d+))?$", r)
+			if not m:
+				continue
+			sheet_names.add(m.group(1) or m.group(2))
+			for c in (m.group(3), m.group(5)):
+				if c and c not in cols:
+					cols.append(c)
+		if not cols:
+			messagebox.showerror("テンプレートの取り込み",
+				f"参照の形を解釈できませんでした:\n{refs[:3]}", parent=self)
+			return
+		src_sheet = sorted(sheet_names)[0] if sheet_names else None
+		headers = self._av_read_header_row(path, src_sheet)
+		roles = {}
+		unknown = []
+		for c in cols:
+			h = headers.get(c, "")
+			# 「平滑」は「計測」より先に見る (見出しが 計測_rgb_平滑1Hz のため)
+			if "平滑" in h:
+				roles[c] = "MEAS_LP"
+			elif "経過時間" in h:
+				roles[c] = "TIME"
+			elif "理想" in h:
+				roles[c] = "IDEAL"
+			elif "計測" in h:
+				roles[c] = "MEAS"
+			else:
+				unknown.append(c)
+		if unknown:
+			got = self._av_ask_column_roles(unknown, headers, src_sheet)
+			if got is None:
+				return
+			roles.update(got)
+
+		if not ({"MEAS", "MEAS_LP"} & set(roles.values())):
+			messagebox.showerror(
+				"テンプレートの取り込み",
+				"「計測」に当たる列が指定されていません。\n"
+				"手法ごとに差し替える列が分からないと、rgb / depth_corners / fusion の\n"
+				"3つに増やせません。もう一度取り込んでください。", parent=self)
+			return
+
+		# --- <c:f> を役割トークンへ置き換えて保存 ---
+		def _tok(mm):
+			inner = mm.group(1)
+			m = re.match(r"^(?:'([^']*)'|([^!]*))!\$([A-Z]+)\$(\d+)(?::\$([A-Z]+)\$(\d+))?$", inner)
+			if not m:
+				return mm.group(0)
+			c0 = m.group(3); r0 = m.group(4); c1 = m.group(5); r1 = m.group(6)
+			role0 = roles.get(c0, "COL:" + c0)
+			if c1 is None:
+				# 単一セル参照 (系列名の見出しなど) は行をそのまま残す
+				return f"<c:f>{{{{CELL|{role0}|{r0}}}}}</c:f>"
+			role1 = roles.get(c1, "COL:" + c1)
+			return f"<c:f>{{{{RANGE|{role0}|{role1}}}}}</c:f>"
+
+		chart_tok = re.sub(r"<c:f>(.*?)</c:f>", _tok, chart_xml)
+		# 数値キャッシュは消す (古い値が焼き付くうえ、ファイルが数倍に膨らむ)
+		chart_tok = re.sub(r"<c:numCache>.*?</c:numCache>", "", chart_tok, flags=re.S)
+		chart_tok = re.sub(r"<c:strCache>.*?</c:strCache>", "", chart_tok, flags=re.S)
+
+		d = self._av_user_template_dir()
+		try:
+			d.mkdir(parents=True, exist_ok=True)
+			(d / "chart.xml").write_text(chart_tok, encoding="utf-8")
+			(d / "style.xml").write_text(style_xml or self._av_default_style_xml(),
+			                              encoding="utf-8")
+			(d / "colors.xml").write_text(colors_xml or self._av_default_colors_xml(),
+			                               encoding="utf-8")
+			(d / "anchor.xml").write_text(anchor_xml or self._av_default_anchor_xml(),
+			                               encoding="utf-8")
+			meta = {
+				"source_name": Path(path).name,
+				"source_path": str(path),
+				"imported_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+				"source_sheet": src_sheet,
+				"n_series": chart_xml.count("<c:ser>"),
+				"n_charts_in_file": len(charts),
+				"chart_part": chart_part,
+				"roles": roles,
+				"roles_used": sorted(set(roles.values())),
+				"headers": {c: headers.get(c, "") for c in cols},
+				"had_anchor": bool(anchor_xml),
+			}
+			(d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+			                              encoding="utf-8")
+		except Exception as e:
+			messagebox.showerror("テンプレートの取り込み",
+			                      f"保存に失敗しました:\n{e}", parent=self)
+			return
+		self._av_refresh_template_label()
+		roles_txt = "\n".join(
+			f"    列 {c} 「{headers.get(c, '(見出しなし)')}」 → "
+			+ {"TIME": "経過時間", "IDEAL": "理想", "MEAS": "計測",
+			   "MEAS_LP": "計測(平滑後)"}.get(roles[c], roles[c])
+			for c in cols)
+		messagebox.showinfo(
+			"テンプレートの取り込み 完了",
+			f"{Path(path).name} のグラフをテンプレートにしました。\n\n"
+			f"  系列 {meta['n_series']} 本"
+			+ (f"（ファイル内のグラフ {len(charts)} 個のうち "
+			   f"{chart_part.rsplit('/', 1)[1].replace('.xml', '')} を使いました）"
+			   if len(charts) > 1 else "")
+			+ f"\n  参照していた列と役割:\n{roles_txt}\n\n"
+			f"次回の「Excel出力」から、各シートに rgb / depth_corners / fusion の\n"
+			f"3つのグラフを、この体裁のまま挿し込みます。\n"
+			f"（縦軸の「計測」だけを手法ごとに差し替え、グラフのタイトルを手法名にします）\n\n"
+			f"保存先: {d}", parent=self)
+
+	def _av_describe_chart(self, chart_xml: str, headers_by_sheet: dict) -> dict:
+		"""グラフXMLから、選択画面に出すための要約 (タイトル・系列・参照列) を作る。"""
+		import re
+		out = {"title": "", "series": [], "sheet": ""}
+
+		def _split(ref):
+			m = re.match(r"^(?:'([^']*)'|([^!]*))!\$([A-Z]+)\$\d+", ref or "")
+			if not m:
+				return None, None
+			return (m.group(1) or m.group(2)), m.group(3)
+
+		i = chart_xml.find("<c:chart>")
+		t0 = chart_xml.find("<c:title>", i) if i >= 0 else -1
+		if t0 >= 0:
+			t1 = chart_xml.find("</c:title>", t0)
+			out["title"] = "".join(re.findall(r"<a:t>(.*?)</a:t>", chart_xml[t0:t1], flags=re.S))
+		for m in re.finditer(r"<c:ser>.*?</c:ser>", chart_xml, flags=re.S):
+			b = m.group(0)
+			nm = re.findall(r"<c:tx>\s*<c:v>([^<]*)</c:v>", b)
+			xs = re.findall(r"<c:xVal>.*?<c:f>([^<]+)</c:f>", b, flags=re.S)
+			ys = re.findall(r"<c:yVal>.*?<c:f>([^<]+)</c:f>", b, flags=re.S)
+			if not ys:
+				ys = re.findall(r"<c:val>.*?<c:f>([^<]+)</c:f>", b, flags=re.S)
+			sx, cx = _split(xs[0] if xs else "")
+			sy, cy = _split(ys[0] if ys else "")
+			out["sheet"] = out["sheet"] or sy or sx or ""
+			hx = (headers_by_sheet.get(sx) or {}).get(cx, "")
+			hy = (headers_by_sheet.get(sy) or {}).get(cy, "")
+			out["series"].append({"name": nm[0] if nm else "",
+			                      "x": cx, "y": cy, "hx": hx, "hy": hy})
+		return out
+
+	def _av_pick_chart(self, z, charts, xlsx_path: str):
+		"""複数グラフの中から雛形にする1つを選ばせる。選ばなければ None。"""
+		import re
+		headers_by_sheet = {}
+		infos = []
+		for c in charts:
+			try:
+				x = z.read(c).decode("utf-8")
+			except Exception:
+				continue
+			for ref in re.findall(r"<c:f>([^<]+)</c:f>", x):
+				m = re.match(r"^(?:'([^']*)'|([^!]*))!", ref)
+				sn = (m.group(1) or m.group(2)) if m else None
+				if sn and sn not in headers_by_sheet:
+					headers_by_sheet[sn] = self._av_read_header_row(xlsx_path, sn)
+			infos.append((c, self._av_describe_chart(x, headers_by_sheet)))
+		if not infos:
+			return None
+
+		def _label(c, d):
+			nm = c.rsplit("/", 1)[1].replace(".xml", "")
+			head = f"{nm}  「{d['title'] or '(タイトルなし)'}」  シート {d['sheet'] or '?'}"
+			rows = []
+			for sname in d["series"]:
+				rows.append(f"      系列「{sname['name'] or '?'}」 "
+				             f"横軸 {sname['x'] or '?'}={sname['hx'] or '不明'} / "
+				             f"縦軸 {sname['y'] or '?'}={sname['hy'] or '不明'}")
+			return head + ("\n" + "\n".join(rows) if rows else "")
+
+		win = tk.Toplevel(self)
+		win.title("どのグラフを雛形にしますか")
+		win.geometry("900x520")
+		win.transient(self)
+		win.grab_set()
+		try:
+			win.lift(); win.focus_force()
+		except Exception:
+			pass
+		frm = ttk.Frame(win, padding=10)
+		frm.pack(fill="both", expand=True)
+		ttk.Label(frm, justify="left", wraplength=860, text=(
+			f"このファイルにはグラフが {len(infos)} 個入っています。"
+			f"雛形にするものを1つ選んでください。\n"
+			f"選んだグラフの体裁のまま、出力時に rgb / depth_corners / fusion の3つに増やします。"
+			)).pack(anchor="w", pady=(0, 8))
+		sel = tk.IntVar(value=0)
+		cv = tk.Canvas(frm, highlightthickness=0)
+		sb = ttk.Scrollbar(frm, orient="vertical", command=cv.yview)
+		inner = ttk.Frame(cv)
+		inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+		cv.create_window((0, 0), window=inner, anchor="nw")
+		cv.configure(yscrollcommand=sb.set)
+		cv.pack(side="left", fill="both", expand=True)
+		sb.pack(side="right", fill="y")
+		for i, (c, d) in enumerate(infos):
+			tk.Radiobutton(inner, text=_label(c, d), variable=sel, value=i,
+			               justify="left", anchor="w", font=(self.ui_font_family, 9),
+			               ).pack(fill="x", anchor="w", pady=1)
+		res = {"ok": False}
+
+		def _ok():
+			res["ok"] = True
+			win.destroy()
+
+		btns = ttk.Frame(win)
+		btns.pack(fill="x", pady=6)
+		ttk.Button(btns, text="このグラフを使う", command=_ok).pack(side="right", padx=8)
+		ttk.Button(btns, text="キャンセル", command=win.destroy).pack(side="right")
+		self.wait_window(win)
+		if not res["ok"]:
+			return None
+		return infos[max(0, min(int(sel.get()), len(infos) - 1))][0]
+
+	def _av_extract_anchor(self, z, names, chart_part: str):
+		"""この chart を貼り付けているアンカー (配置枠) を drawing から取り出す。"""
+		import re
+		target_tail = chart_part.rsplit("/", 1)[1]
+		for dn in sorted(n for n in names if re.match(r"^xl/drawings/drawing\d+\.xml$", n)):
+			rel = ("xl/drawings/_rels/" + dn.rsplit("/", 1)[1] + ".rels")
+			if rel not in names:
+				continue
+			rid = None
+			try:
+				rels = z.read(rel).decode("utf-8")
+			except Exception:
+				continue
+			for tag in re.findall(r"<Relationship\b[^>]*/>", rels):
+				mg = re.search(r'Target="([^"]+)"', tag)
+				mi = re.search(r'\bId="([^"]+)"', tag)
+				if mg and mi and mg.group(1).endswith(target_tail):
+					rid = mi.group(1)
+					break
+			if not rid:
+				continue
+			try:
+				dx = z.read(dn).decode("utf-8")
+			except Exception:
+				continue
+			for tag in ("twoCellAnchor", "oneCellAnchor", "absoluteAnchor"):
+				start = f"<xdr:{tag}"
+				end = f"</xdr:{tag}>"
+				i = 0
+				while True:
+					i = dx.find(start, i)
+					if i < 0:
+						break
+					j = dx.find(end, i)
+					if j < 0:
+						break
+					blk = dx[i:j + len(end)]
+					if f'r:id="{rid}"' in blk:
+						return blk.replace(f'r:id="{rid}"', 'r:id="{{AVRID}}"')
+					i = j + len(end)
+		return None
+
+	def _av_read_header_row(self, xlsx_path: str, sheet_name) -> dict:
+		"""見本ファイルの見出し行 (1行目) を {列文字: 見出し} で返す。"""
+		out = {}
+		try:
+			from openpyxl import load_workbook
+			wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+			try:
+				ws = wb[sheet_name] if (sheet_name and sheet_name in wb.sheetnames) else wb.worksheets[0]
+				for row in ws.iter_rows(min_row=1, max_row=1):
+					for cell in row:
+						if cell.value is None:
+							continue
+						out[self._av_index_to_col(int(cell.column))] = str(cell.value)
+					break
+			finally:
+				wb.close()
+		except Exception as e:
+			print(f"[精度検証] 見出し行の読み取りに失敗: {e}")
+		return out
+
+	def _av_ask_column_roles(self, cols, headers, sheet_name):
+		"""見出しから役割を判定できなかった列を、手で指定してもらう。"""
+		win = tk.Toplevel(self)
+		win.title("グラフの列の役割を指定")
+		win.transient(self)
+		win.grab_set()
+		try:
+			win.lift(); win.focus_force()
+		except Exception:
+			pass
+		frm = ttk.Frame(win, padding=12)
+		frm.pack(fill="both", expand=True)
+		ttk.Label(frm, justify="left", wraplength=560, text=(
+			f"見本のグラフが参照している列のうち、見出しから役割を判定できないものがあります"
+			f"（シート「{sheet_name}」）。\n"
+			f"それぞれ何に当たるかを選んでください。\n"
+			f"  経過時間 … 等速区間の先頭を0にした時刻\n"
+			f"  理想     … ロボットの指令から作った理想値（y=x の線もこれ）\n"
+			f"  計測     … 計測値。ここを rgb / depth_corners / fusion に差し替えます"
+		)).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+		choices = ["経過時間", "理想", "計測", "計測(平滑後)", "（この列はそのまま）"]
+		key = {"経過時間": "TIME", "理想": "IDEAL", "計測": "MEAS",
+		       "計測(平滑後)": "MEAS_LP"}
+		vars_ = {}
+		for i, c in enumerate(cols):
+			ttk.Label(frm, text=f"列 {c}").grid(row=i + 1, column=0, sticky="w", padx=(0, 8), pady=2)
+			ttk.Label(frm, text=f"見出し: 「{headers.get(c, '(空)')}」", foreground="#555"
+			          ).grid(row=i + 1, column=1, sticky="w", padx=(0, 8))
+			v = tk.StringVar(value=choices[2] if i == 0 else choices[3])
+			ttk.Combobox(frm, textvariable=v, values=choices, width=22, state="readonly"
+			             ).grid(row=i + 1, column=2, sticky="w", pady=2)
+			vars_[c] = v
+		res = {"ok": False}
+
+		def _ok():
+			res["ok"] = True
+			win.destroy()
+
+		btns = ttk.Frame(frm)
+		btns.grid(row=len(cols) + 1, column=0, columnspan=3, sticky="e", pady=(12, 0))
+		ttk.Button(btns, text="OK", command=_ok).pack(side="right", padx=4)
+		ttk.Button(btns, text="キャンセル", command=win.destroy).pack(side="right")
+		self.wait_window(win)
+		if not res["ok"]:
+			return None
+		out = {}
+		for c, v in vars_.items():
+			r = key.get(v.get())
+			if r:
+				out[c] = r
+			else:
+				out[c] = "COL:" + c
+		return out
+
+	def on_av_reset_chart_template(self) -> None:
+		"""取り込んだテンプレートを捨てて、既定に戻す。"""
+		d = self._av_user_template_dir()
+		if not self._av_user_template_meta():
+			messagebox.showinfo("グラフのテンプレート",
+			                     "取り込んだテンプレートはありません（既に既定です）。", parent=self)
+			return
+		if not messagebox.askyesno("グラフのテンプレート",
+			f"取り込んだテンプレートを削除して既定に戻しますか？\n\n{d}", parent=self):
+			return
+		try:
+			for n in ("chart.xml", "style.xml", "colors.xml", "anchor.xml", "meta.json"):
+				p = d / n
+				if p.exists():
+					p.unlink()
+		except Exception as e:
+			messagebox.showerror("グラフのテンプレート", f"削除に失敗しました: {e}", parent=self)
+			return
+		self._av_refresh_template_label()
+
+	# ---- 既定 (取り込み前) の付属ファイル ----
+	def _av_default_style_xml(self) -> str:
+		try:
+			return (self._av_chart_template_dir() / "style.xml").read_text(encoding="utf-8")
+		except Exception:
+			return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+			        '<cs:chartStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle"'
+			        ' id="240"/>')
+
+	def _av_default_colors_xml(self) -> str:
+		try:
+			return (self._av_chart_template_dir() / "colors.xml").read_text(encoding="utf-8")
+		except Exception:
+			return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+			        '<cs:colorStyle xmlns:cs="http://schemas.microsoft.com/office/drawing/2012/chartStyle"'
+			        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+			        ' meth="cycle" id="10"><a:schemeClr val="accent1"/>'
+			        '<cs:variation/></cs:colorStyle>')
+
+	def _av_default_anchor_xml(self) -> str:
+		"""アンカーが取れなかったときの、無難な配置枠 (1つぶん)。"""
+		return (
+			'<xdr:twoCellAnchor>'
+			'<xdr:from><xdr:col>35</xdr:col><xdr:colOff>0</xdr:colOff>'
+			'<xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+			'<xdr:to><xdr:col>50</xdr:col><xdr:colOff>0</xdr:colOff>'
+			'<xdr:row>31</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+			'<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr>'
+			'<xdr:cNvPr id="2" name="グラフ 1"/><xdr:cNvGraphicFramePr/>'
+			'</xdr:nvGraphicFramePr>'
+			'<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>'
+			'<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+			'<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"'
+			' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+			' r:id="{{AVRID}}"/></a:graphicData></a:graphic></xdr:graphicFrame>'
+			'<xdr:clientData/></xdr:twoCellAnchor>')
+
+	def _av_dialog_ready(self) -> None:
+		"""ダイアログを開く前に本体ウィンドウを前面に出す。
+
+		Windows の Tk では、親を指定しないダイアログが本体の背後に出ることがある。
+		モーダルなので操作を受け付けず、アプリが固まったように見える。
+		特に上書き確認は「既にファイルがある時だけ」出るので、症状が不定期になる。
+		以降のダイアログには parent=self も渡して、必ず手前に来るようにする。
+		"""
+		try:
+			self.lift()
+			self.focus_force()
+			self.update_idletasks()
+		except Exception:
+			pass
+
+	def _av_busy(self, on: bool, msg: str = "") -> None:
+		"""処理中はカーソルを砂時計にして、止まっていないことを示す。"""
+		try:
+			self.configure(cursor="watch" if on else "")
+			if msg:
+				self.av_status.set(msg)
+			self.update_idletasks()
+		except Exception:
+			pass
+
+	@staticmethod
+	def _av_err_stats(ideal, meas) -> dict:
+		"""理想と計測から誤差の指標を出す。y=x グラフを数字にしたもの。
+
+		誤差 = 計測 - 理想 と定義し、
+		  RMSE     … 総合誤差 (二乗平均平方根)。1つだけ示すならこれ
+		  かたより … 系統誤差 (誤差の平均)
+		  ばらつき … ランダム誤差 (誤差の標準偏差)
+		を返す。RMSE^2 = かたより^2 + ばらつき^2 の関係にある。
+		併せて y=x グラフの傾き (SLOPE) と決定係数 (RSQ) も返す。
+		"""
+		import numpy as np
+		try:
+			a = np.asarray(ideal, dtype=float)
+			b = np.asarray(meas, dtype=float)
+		except Exception:
+			return {}
+		if a.shape != b.shape:
+			return {}
+		m = np.isfinite(a) & np.isfinite(b)
+		n = int(m.sum())
+		if n < 3:
+			return {}
+		a, b = a[m], b[m]
+		e = b - a
+		out = {"n": n,
+		        "rmse": float(np.sqrt(np.mean(e ** 2))),
+		        "bias": float(np.mean(e)),
+		        "sd": float(np.std(e, ddof=1))}
+		# 傾きと R^2 (理想を x、計測を y とした最小二乗直線)
+		try:
+			va = float(np.var(a))
+			if va > 0:
+				sl = float(np.cov(a, b, ddof=1)[0, 1] / np.var(a, ddof=1))
+				out["slope"] = sl
+				r = float(np.corrcoef(a, b)[0, 1])
+				out["r2"] = r * r
+		except Exception:
+			pass
+		return out
+
+	def _av_write_error_sheet(self, ws, rows, lp_hz: float) -> None:
+		"""「誤差まとめ」シートを書く。手法ごとのブロックに分ける。
+
+		rows の各要素は
+		  [軸, 種別, 指令値, 単位, 手法, データ, n, RMSE, かたより, ばらつき,
+		   傾き, 傾き誤差, R2, k, 残差RMS, 幾何角, カメラ距離]
+		手法 (index 4) でブロックに分け、その列自体は見出しへ移すので表からは外す。
+		rgb を先頭に置く (姿勢は rgb のみが最良と実測済みで、普段はこれしか見ない)。
+		"""
+		from openpyxl.styles import Alignment, Font
+		# (見出し, 列幅, 表示書式)。データ駆動にして列ズレを防ぐ。
+		COLS = (("軸", 6, None), ("種別", 8, None), ("指令値", 9, None),
+		        ("単位", 6, None), ("データ", 10, None), ("n", 7, "0"),
+		        ("RMSE", 11, "0.0000"), ("かたより", 11, "0.0000"),
+		        ("ばらつき", 11, "0.0000"), ("傾き", 10, "0.00000"),
+		        ("傾き誤差[%]", 12, "+0.000;-0.000"), ("R2", 9, "0.00000"),
+		        ("k(②の結果)", 11, "0.00000"), ("残差RMS", 10, "0.0000"),
+		        ("幾何角[°]", 10, "0"), ("カメラ距離[mm]", 14, "0"))
+		NC = len(COLS)
+		note_font = Font(name="Arial", size=9)
+
+		def _put(values, bold=False, fill=None):
+			ws.append(values)
+			r = ws.max_row
+			for c in range(1, len(values) + 1):
+				cell = ws.cell(row=r, column=c)
+				if bold:
+					cell.font = Font(name="Arial", bold=True)
+				if c > 1:
+					cell.alignment = Alignment(horizontal="center")
+			return r
+
+		def _note(text):
+			"""注記を A:P 結合で書く (A 列だけが広がるのを防ぐ)。"""
+			r = ws.max_row + 1
+			ws.cell(row=r, column=1, value=text).font = note_font
+			try:
+				ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NC)
+				ws.cell(row=r, column=1).alignment = Alignment(horizontal="left")
+			except Exception:
+				pass
+
+		ws.cell(row=1, column=1,
+		         value="誤差まとめ  ロボットの指令値を真値としたときの計測精度").font = \
+			Font(name="Arial", bold=True, size=12)
+		ws.append([])
+
+		methods = [m for m, _k in self.AV_METHODS]
+		for m in sorted({str(r[4]) for r in rows}):
+			if m not in methods:
+				methods.append(m)
+		for m in methods:
+			sub = [r for r in rows if str(r[4]) == m]
+			if not sub:
+				continue
+			ws.append([])
+			hint = "  ← 通常はこれを見てください（姿勢は rgb が最良と実測済み）" if m == "rgb" else ""
+			ws.append([f"■ {m}{hint}"])
+			ws.cell(row=ws.max_row, column=1).font = Font(name="Arial", bold=True, size=11)
+			_put([c[0] for c in COLS], bold=True)
+			for row in sub:
+				vals = list(row[:4]) + list(row[5:])        # 手法の列は落とす
+				rr = _put(vals)
+				for i, (_h, _w, fmt) in enumerate(COLS, start=1):
+					if fmt:
+						try:
+							ws.cell(row=rr, column=i).number_format = fmt
+						except Exception:
+							pass
+		for i, (_h, w, _f) in enumerate(COLS, start=1):
+			try:
+				ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+			except Exception:
+				pass
+
+		lp_txt = (f"平滑後 … ankle simulator ⑤ のカットオフ {lp_hz:g}Hz でローパスを掛けた列"
+		           if lp_hz > 0 else "平滑後 … （今回は平滑列を出していません）")
+		for line in (
+			"",
+			"【この表の前提】",
+			"  ロボットの指令値を真値として、マーカー計測がどれだけずれたかを表します。",
+			"  対象は 等速区間だけ です（加速・減速は自動で除外し、区間の先頭を 0 に置き直しています）。",
+			"  誤差 = 計測 − 理想。各軸シートの『グラフ用_計測_*』と『グラフ用_理想_ロボット』の差です。",
+			"  ＝ 横軸 理想・縦軸 計測 の散布図で、点が y=x からどれだけ離れているか、を数字にしたものです。",
+			"",
+			"【指標の意味】",
+			"  RMSE        総合誤差。「平均して ±この値ずれる」。1つだけ示すならこれ。",
+			"              Excel なら  =SQRT(SUMSQ(誤差列)/COUNT(誤差列))",
+			"  かたより    系統誤差。誤差の平均。＋なら常に大きめ、−なら常に小さめに出ている。",
+			"              Excel なら  =AVERAGE(誤差列)",
+			"  ばらつき    ランダム誤差。誤差の標準偏差。フレームごとの揺れ。",
+			"              Excel なら  =STDEV.S(誤差列)",
+			"  ※ RMSE² ≒ かたより² + ばらつき²  の関係にあります",
+			"     （ばらつきは Excel の STDEV.S と同じ不偏標準偏差なので、点数が多ければほぼ厳密に成り立ちます）。",
+			"     RMSE だけ見ても、系統的にずれているのか揺れているのか分かりません。必ず内訳も見てください。",
+			"",
+			"  傾き        横軸 理想・縦軸 計測 の散布図での、点の並びの傾き。1.00000 なら計測倍率が正しい。",
+			"              Excel なら  =SLOPE(計測列, 理想列)",
+			"  傾き誤差    (傾き − 1) × 100 [%]",
+			"  R2          直線への当てはまりの良さ。1.0 に近いほど良い。 =RSQ(計測列, 理想列)",
+			"  k(②の結果)  ②の結果欄に出ている k と同じ値（等速区間の速度 ÷ 指令の送り速度）。",
+			"              上の『傾き』とほぼ一致するはずです。大きく食い違う場合は等速区間の取り方を疑ってください。",
+			"  残差RMS     主軸からの直交残差。直動なら真直度、回転なら回転軸のブレ。",
+			"  幾何角      直動: 運動方向とカメラ光軸のなす角 (90°=横移動で最良)",
+			"              回転: 回転軸とマーカー法線のなす角 (0°=面内回転で最良 / 90°=面外で最弱)",
+			"  カメラ距離  撮影開始 t=0 時点の カメラ〜マーカー距離。",
+			f"  データ      生 … 平滑化なし / {lp_txt}",
+			"",
+			"【手法について】",
+			"  rgb            solvePnP のみ。実測でこれが最良。通常はこのブロックだけ見れば十分です。",
+			"  depth_corners  四隅の深度から姿勢を出す方式。参考値。",
+			"  fusion         RGB と深度の融合。面外回転では大きく外れることがあります。",
+			"",
+			"【マーカーの条件（大きさ・距離・向き）を比べるときは】",
+			"  ・同じ軸・同じ指令値どうしで比べてください。",
+			"  ・違う軸をまとめて1枚の図にするときは  RMSE ÷ 移動量 × 100 [%]  に正規化してください",
+			"    （直動 [mm] と回転 [°] を同じ図に並べられます）。",
+			"  ・条件の差はふつう『ばらつき』に出ます。マーカーが小さいほど画像上の画素数が減り、",
+			"    四隅の座標の揺れがそのまま姿勢の揺れになるためです。",
+			"  ・『かたより』や『傾き』に大きな差が出た場合は、マーカー実寸の設定ミスや",
+			"    等速区間の取り方を先に疑ってください（マーカーの大きさ自体では、ここは動きません）。",
+			"  ・回転角はマーカー実寸に一切依存しません。実寸設定の影響を受けるのは直動だけです。",
+		):
+			_note(line)
+
+	def on_av_export_sheets(self) -> None:
+		"""解析済みの全軸を1つのExcelへ、軸ごとのシートに分けて出力する。
+
+		シート名は軸名そのもの (X / Y / Z / U / V / W)。
+		1フレーム1行、3手法を横並び。数値は文字列でなく数値として書くので、
+		Excel 側でそのままグラフや計算に使える。
+		"""
+		import datetime as _dt
+		import numpy as np
+		try:
+			from openpyxl import Workbook
+			from openpyxl.styles import Font, Alignment
+		except ImportError:
+			messagebox.showerror("Excel出力",
+				"openpyxl が必要です。venvで pip install openpyxl を実行してください。")
+			return
+		done = [ax for ax, _k in self.AV_AXES if self.av_rows[ax]["result"]]
+		if not done:
+			messagebox.showinfo("Excel出力", "解析済みの軸がありません。", parent=self)
+			return
+		# ダイアログが本体の背後に出ると固まって見えるので、必ず前面に出す
+		self._av_dialog_ready()
+		path = filedialog.asksaveasfilename(
+			parent=self,
+			title="精度検証データ 保存先",
+			defaultextension=".xlsx",
+			initialfile=f"aruco_verify_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+			filetypes=[("Excel", "*.xlsx"), ("すべてのファイル", "*.*")])
+		if not path:
+			return
+		self._av_busy(True, "Excelを書き出しています…")
+		mnames = [m for m, _k in self.AV_METHODS]
+		header = ["axis", "kind", "commanded", "unit", "feed_rate", "marker_id", "role",
+		          "dist0_mm", "dist_mm", "geom_deg", "depth_frac",
+		          "frame", "t_sec", "robot_ideal"]
+		for m in mnames:
+			header += [f"detected_{m}", f"disp_{m}", f"along_{m}", f"perp_{m}",
+			           f"rot_deg_{m}", f"speed_{m}", f"omega_{m}"]
+		# --- そのままグラフにできる列 ---
+		# 加速・減速区間を自動で除き、等速区間だけを 区間先頭=0 に置き直した値。
+		# 区間外と静止側は空欄なので、Excel で列を選ぶだけでグラフになる。
+		#   ・経過時間 × (理想, 計測_rgb)  → 2本の線が重なるかを見る
+		#   ・理想 × 計測_rgb              → y=x の散布図になる
+		# 【横軸】【縦軸】という名前だと、横軸が「理想」になるグラフ
+		# (理想 × 計測 の y=x 散布図) を作るときに合わなくなるので、
+		# 役割だけを表す名前にする。テンプレートの取り込みも、この見出しの
+		# 「経過時間 / 理想 / 計測」で列の役割を判定する。
+		header += ["グラフ用_経過時間_s", "グラフ用_理想_ロボット"]
+		for m in mnames:
+			header += [f"グラフ用_計測_{m}"]
+		# 平滑化した計測列。既存5列の位置は変えないので末尾に足す
+		# (既定テンプレートは AI..AM を列文字で参照しているため)。
+		# 平滑化のカットオフは ankle simulator ⑤ の設定を共用する
+		lp_hz = self._av_getf(self.ankle_smooth_cutoff_hz, 0.0)
+		if lp_hz > 0:
+			for m in mnames:
+				header += [f"グラフ用_計測_{m}_平滑{lp_hz:g}Hz"]
+		# テンプレートに渡す「役割 → 列文字」の対応
+		chart_cols = {
+			"TIME": self._av_index_to_col(header.index("グラフ用_経過時間_s") + 1),
+			"IDEAL": self._av_index_to_col(header.index("グラフ用_理想_ロボット") + 1),
+			"MEAS": {m: self._av_index_to_col(header.index(f"グラフ用_計測_{m}") + 1)
+			          for m in mnames},
+		}
+		if lp_hz > 0:
+			chart_cols["MEAS_LP"] = {
+				m: self._av_index_to_col(
+					header.index(f"グラフ用_計測_{m}_平滑{lp_hz:g}Hz") + 1) for m in mnames}
+
+		def _num(arr, i):
+			"""配列の i 番目を数値で返す (無いか非有限なら None = 空セル)。"""
+			if arr is None or i >= len(arr):
+				return None
+			v = float(arr[i])
+			return None if not np.isfinite(v) else v
+
+		n_rows = 0
+		no_feed = []      # 送り速度が未入力の軸 (理想の列が空になる)
+		chart_sheets = []  # [(シート名, グラフ用の先頭行, 末尾行)] Excelの1始まり
+		try:
+			wb = Workbook()
+			wb.remove(wb.active)
+			# 誤差の指標をまとめるシート。先に作って先頭に置く (中身は最後に書く)
+			ws_sum = wb.create_sheet(title="誤差まとめ")
+			err_rows = []
+			for ax in done:
+				res = self.av_rows[ax]["result"]
+				kind = res["kind"]
+				unit = self._av_unit(kind)
+				ts = np.asarray(res["timestamps"], dtype=float)
+				feed = float(res.get("feed") or 0.0)
+				n = int(len(ts))
+				if feed <= 0:
+					no_feed.append(ax)
+				_g = res.get("geom_deg"); _dm = res.get("dist_mm"); _df = res.get("depth_frac")
+				_d0 = res.get("dist0_mm")
+				_g = _g if (_g is not None and np.isfinite(_g)) else None
+				_dm = _dm if (_dm is not None and np.isfinite(_dm)) else None
+				_d0 = _d0 if (_d0 is not None and np.isfinite(_d0)) else None
+				_df = _df if (_df is not None and np.isfinite(_df)) else None
+				targets = [("moving", res["moving_id"], res["series"])]
+				if res.get("static"):
+					targets.append(("static", res["static_id"], {"rgb": res["static"]}))
+				# --- グラフ用列の基準 (基準手法の等速区間で行を決め、全系列を揃える) ---
+				plot_base = None
+				for m in mnames:
+					sm = (res["series"].get(m) or {}).get(kind) or {}
+					bm = sm.get("plot_mask")
+					if bm is not None and bool(np.any(bm)):
+						plot_base = (bm, float(ts[int(np.where(bm)[0][0])]))
+						break
+				plot_ref = {}
+				for m in mnames:
+					sm = (res["series"].get(m) or {}).get(kind) or {}
+					al = sm.get("along")
+					if al is None or plot_base is None:
+						plot_ref[m] = None
+						continue
+					ii = np.where(plot_base[0])[0]
+					fin = [int(j) for j in ii if np.isfinite(al[j])]
+					if len(fin) < 2:
+						plot_ref[m] = None
+						continue
+					a0 = float(al[fin[0]])
+					sgn = 1.0 if float(al[fin[-1]]) >= a0 else -1.0
+					plot_ref[m] = (al, a0, sgn)
+				# --- 平滑化した系列 (グラフ用の区間の中だけ) ---
+				# 面外回転はノイズの 7〜8 割が 6〜15Hz の高周波なので、
+				# 1Hz のローパスで残差が半分〜1/4 になる。k は動かない。
+				plot_lp = {}
+				if lp_hz > 0 and plot_base is not None:
+					try:
+						_dt = float(np.median(np.diff(ts))) if len(ts) > 1 else 0.0
+						_fs = (1.0 / _dt) if _dt > 0 else 0.0
+						_ii = np.where(plot_base[0])[0]
+						for m in mnames:
+							ref = plot_ref.get(m)
+							if ref is None or _fs <= 0:
+								plot_lp[m] = None
+								continue
+							al, a0, sgn = ref
+							seg = np.asarray(al, dtype=float)[_ii]
+							z = self._av_lowpass(seg, _fs, lp_hz)
+							full = np.full(n, np.nan)
+							full[_ii] = z
+							plot_lp[m] = (full, a0, sgn)
+					except Exception as _e:
+						print(f"[精度検証] 平滑列の作成に失敗 ({ax}): {_e}")
+						plot_lp = {}
+
+				ws = wb.create_sheet(title=ax)
+				ws.append(header)
+				# グラフに使う行 = 動作側マーカーの等速区間。ヘッダが1行目、
+				# フレーム i は Excel の i+2 行目になる。
+				if plot_base is not None:
+					_bi = np.where(plot_base[0])[0]
+					# 単位・軸の最大値も渡す。
+					# テンプレの軸範囲は作成時の値で固定なので、試験ごとに移動量が
+					# 変わるとグラフが途中で切れる。
+					_t_max = float(ts[int(_bi[-1])] - plot_base[1])
+					if feed > 0:
+						_v_max = feed * _t_max
+					else:
+						# 送り速度が未入力なら理想列が空になるので、計測値の幅で代用する
+						_v_max = 0.0
+						for _m in mnames:
+							_r = plot_ref.get(_m)
+							if _r is None:
+								continue
+							_al, _a0, _sg = _r
+							_vals = _sg * (np.asarray(_al, dtype=float)[_bi] - _a0)
+							_vals = _vals[np.isfinite(_vals)]
+							if len(_vals):
+								_v_max = max(_v_max, float(np.nanmax(_vals)))
+					chart_sheets.append((ax, int(_bi[0]) + 2, int(_bi[-1]) + 2, unit,
+					                     _t_max, _v_max))
+				for role, mid, series in targets:
+					for i in range(n):
+						t = float(ts[i])
+						line = [ax, kind, res["commanded"], unit, feed, mid, role,
+						        _d0, _dm, _g, _df, i, t, (feed * t if feed > 0 else None)]
+						for m in mnames:
+							s = series.get(m)
+							if not s:
+								line += [None] * 7
+								continue
+							sl = s.get("lin") or {}
+							sr = s.get("rot") or {}
+							prim = sl if kind == "lin" else sr
+							dv = _num(prim.get("disp"), i)
+							line += [1 if dv is not None else 0, dv,
+							         _num(prim.get("along"), i), _num(prim.get("perp"), i),
+							         _num(sr.get("disp"), i), _num(sl.get("rate"), i),
+							         _num(sr.get("rate"), i)]
+						# グラフ用列
+						if (role != "moving" or plot_base is None or i >= len(plot_base[0])
+								or not bool(plot_base[0][i])):
+							line += ([None, None] + [None] * len(mnames)
+							         + ([None] * len(mnames) if lp_hz > 0 else []))
+						else:
+							te = t - plot_base[1]
+							line += [te, (feed * te if feed > 0 else None)]
+							for m in mnames:
+								ref = plot_ref.get(m)
+								if ref is None:
+									line += [None]
+									continue
+								al, a0, sgn = ref
+								if i >= len(al) or not np.isfinite(al[i]) or not np.isfinite(a0):
+									line += [None]
+									continue
+								line += [sgn * (float(al[i]) - a0)]
+							if lp_hz > 0:
+								for m in mnames:
+									ref2 = plot_lp.get(m)
+									if ref2 is None:
+										line += [None]
+										continue
+									zz, a0z, sgnz = ref2
+									if i >= len(zz) or not np.isfinite(zz[i]) or not np.isfinite(a0z):
+										line += [None]
+									else:
+										line += [sgnz * (float(zz[i]) - a0z)]
+						ws.append(line)
+						n_rows += 1
+				# 見出しを固定して読みやすく
+				for c in range(1, len(header) + 1):
+					cell = ws.cell(row=1, column=c)
+					cell.font = Font(name="Arial", bold=True)
+					cell.alignment = Alignment(horizontal="center")
+				ws.freeze_panes = "A2"
+				# --- 誤差の指標を計算してまとめシート用に溜める ---
+				# 行の書き出しと同じ式（等速区間だけ、区間先頭を0に置き直し）を使う。
+				try:
+					if plot_base is not None and feed > 0:
+						_bi = np.where(plot_base[0])[0]
+						_ideal = feed * (ts[_bi] - plot_base[1])
+						_kind_lbl = "直動" if kind == "lin" else "回転"
+						for _m in mnames:
+							for _lbl, _src in (("生", plot_ref.get(_m)),
+							                    ("平滑後", plot_lp.get(_m) if lp_hz > 0 else None)):
+								if _src is None:
+									continue
+								_al, _a0, _sgn = _src
+								_meas = _sgn * (np.asarray(_al, dtype=float)[_bi] - _a0)
+								st = self._av_err_stats(_ideal, _meas)
+								if not st:
+									continue
+								_sl = st.get("slope")
+								err_rows.append([
+									ax, _kind_lbl, res["commanded"], unit, _m, _lbl,
+									st["n"], st["rmse"], st["bias"], st["sd"],
+									_sl, ((_sl - 1.0) * 100.0 if _sl is not None else None),
+									st.get("r2"), res.get("k"), res.get("perp_rms"),
+									_g, (_d0 if _d0 is not None else _dm)])
+				except Exception as _e:
+					print(f"[精度検証] 誤差指標の計算に失敗 ({ax}): {_e}")
+			try:
+				self._av_write_error_sheet(ws_sum, err_rows, lp_hz)
+			except Exception as _e:
+				print(f"[精度検証] 誤差まとめシートの作成に失敗: {_e}")
+			wb.save(path)
+		except PermissionError:
+			self._av_busy(False)
+			messagebox.showerror(
+				"Excel出力",
+				f"ファイルに書き込めませんでした。\n\n{path}\n\n"
+				f"同じファイルを Excel で開いたままだと保存できません。\n"
+				f"閉じてからやり直すか、別の名前で保存してください。", parent=self)
+			return
+		except Exception as e:
+			self._av_busy(False)
+			messagebox.showerror("Excel出力", f"書き出しに失敗しました: {e}", parent=self)
+			return
+		# テンプレートのグラフを、書式そのままで各シートに挿し込む
+		n_charts, chart_err = self._av_inject_charts(path, chart_sheets, chart_cols)
+		self._av_busy(False)
+		self._av_dialog_ready()
+		messagebox.showinfo(
+			"Excel出力 完了",
+			f"{len(done)} 枚のシート / {n_rows} 行 / グラフ {n_charts} 個を書き出しました。\n"
+			+ (f"\n[グラフ] {chart_err}\n" if chart_err
+			   else ("  グラフは取り込んだテンプレートの書式そのまま、"
+			          "rgb / depth_corners / fusion の3つを各シートに入れました\n"
+			          if self._av_user_template_meta()
+			          else "  グラフは既定テンプレート (templates/aruco_chart/) の書式そのままです\n")) + f"\n"
+			f"ファイル: {path}\n"
+			f"シート:   誤差まとめ / {' / '.join(done)}\n"
+			f"\n★ 先頭の『誤差まとめ』シートに、RMSE・かたより・ばらつき・傾きを\n"
+			f"   軸ごと手法ごとに計算してあります（指標の意味も同じシートに書いてあります）。\n"
+			+ (f"\n※ 送り速度が未入力の軸: {' '.join(no_feed)}\n"
+				f"   → グラフ用_理想_ロボット の列が空になります。②の行に Speed を入れて再解析してください\n"
+			   if no_feed else "") + f"\n"
+			f"【列の意味】\n"
+			f"  along_*   : 主軸への符号付き投影 ＝ 動いた量\n"
+			f"  disp_*    : |Δp| または |Δθ|（常に正）\n"
+			f"  perp_*    : 主軸からの直交残差（直動=真直度 / 回転=軸のブレ）\n"
+			f"  rot_deg_* : 相対回転角（直動軸ではクロストークの指標）\n"
+			f"  speed_*   : 主軸方向の速度 / omega_* : 回転角速度\n"
+			f"  dist0_mm  : カメラ〜マーカー距離（撮影開始 t=0 時点）＝結果欄に出ている値\n"
+			f"  dist_mm   : 同じ距離の 全フレーム平均（動いた分だけ変わる）\n"
+			f"  geom_deg / depth_frac: 撮影ジオメトリ（軸ごとに一定）\n"
+			f"    直動 → geom_deg は運動方向とカメラ光軸のなす角 (90°=横移動で最良)\n"
+			f"    回転 → geom_deg は回転軸とマーカー法線のなす角 (0°=面内回転で最良)\n"
+			f"  role=static の行は静止側マーカー ＝ ノイズフロアです\n\n"
+			f"  ★グラフ用の列: グラフ用_経過時間_s / グラフ用_理想_ロボット /\n"
+			f"    グラフ用_計測_rgb ・計測_depth_corners ・計測_fusion\n"
+			+ (f"    さらに 平滑{lp_hz:g}Hz を掛けた同じ3列（末尾）。\n"
+			   f"    → 1シートに 生3枚 + 平滑後3枚 の計6枚のグラフが入ります。\n"
+			   f"    カットオフは ankle simulator ⑤『時系列平滑化 カットオフ周波数』と共用です。\n"
+			   f"    面外回転(U/V)はノイズの7〜8割が6〜15Hzの高周波なので、\n"
+			   f"    平滑後は残差が半分〜1/4になります（k は変わりません）。\n"
+			   if lp_hz > 0 else "")
+			+ f"    加速・減速を自動で除き、等速区間の先頭を 0 にしてあります。\n"
+			f"    ※ 動き出す前の行は空欄です（先頭の何百行かは空で正常）\n"
+			f"    使い方1: 経過時間 × (理想, 計測_rgb) → 2本の線が重なるかを見る\n"
+			f"    使い方2: 理想 × 計測_rgb           → y=x の散布図になる",
+			parent=self)
+
+	# endregion ArUco精度検証
 
 	def _create_org_tab(self) -> None:
 		"""ORGタブのUIを構築"""
@@ -12248,6 +18228,168 @@ class MainMenuGUI(_BaseWindow):
 			messagebox.showerror("エラー", f"処理に失敗しました:\n{e}\n{traceback.format_exc()}")
 
 	# ----- UI Helpers -----
+	# ---- 試験タブバー（左右スクロール式・「＋」は常に右端に固定） ----
+	# タブを増やすと横に伸びて「＋」がウィンドウ外へ押し出されてしまっていた。
+	# タブ名は省略せず（どの試験か分からなくなるため）、代わりに帯そのものを
+	# Canvas に載せて ◀ ▶ で左右へ動かす。「＋」は Canvas の外に pack するので
+	# タブが何個あっても必ず見える。
+	def _make_tabbar(self, parent, key: str, on_add, label: str = "試験タブ:"):
+		"""タブバーの器を作り、ボタンを並べる内側 Frame を返す。
+
+		key は 'ankle' / 'knee' / 'av' など、バーを識別する任意の文字列。
+		"""
+		if not hasattr(self, "_tabbar_ui"):
+			self._tabbar_ui = {}
+		row = tk.Frame(parent)
+		row.pack(side="top", fill="x", padx=4, pady=(4, 0))
+		tk.Label(row, text=label, font=(self.ui_font_family, 9)).pack(side="left", padx=(0, 4))
+		# 右側の固定部品を先に pack する（pack は先に置いたものが端を取るので、
+		# こうしないとタブが増えたときに「＋」から順に押し出される）
+		plus = tk.Button(row, text="＋", command=on_add, padx=6, pady=2)
+		plus.pack(side="right", padx=(6, 2))
+		btn_right = tk.Button(row, text="▶", width=2, padx=2, pady=2,
+		                      command=lambda: self._tabbar_scroll(key, +1))
+		btn_right.pack(side="right", padx=(0, 2))
+		btn_left = tk.Button(row, text="◀", width=2, padx=2, pady=2,
+		                     command=lambda: self._tabbar_scroll(key, -1))
+		btn_left.pack(side="right", padx=(2, 0))
+		canvas = tk.Canvas(row, height=26, highlightthickness=0, bd=0,
+		                   xscrollincrement=20)
+		canvas.pack(side="left", fill="x", expand=True)
+		inner = tk.Frame(canvas)
+		win = canvas.create_window((0, 0), window=inner, anchor="nw")
+		canvas.configure(background=row.cget("background"))
+		inner.configure(background=row.cget("background"))
+		inner.bind("<Configure>", lambda e, k=key: self._tabbar_sync(k))
+		canvas.bind("<Configure>", lambda e, k=key: self._tabbar_sync(k))
+		self._tabbar_ui[key] = {"row": row, "canvas": canvas, "inner": inner,
+		                         "win": win, "left": btn_left, "right": btn_right,
+		                         "plus": plus, "active": None}
+		self._tabbar_bind_wheel(canvas, key)
+		self._tabbar_bind_wheel(inner, key)
+		return inner
+
+	def _tabbar_bind_wheel(self, widget, key: str) -> None:
+		"""タブバーの上ではホイールを「横スクロール」に割り当てる。"""
+		def _h(event, k=key):
+			step = _mousewheel_units(event)
+			if step:
+				self._tabbar_scroll(k, 1 if step > 0 else -1)
+			return "break"
+		for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+			try:
+				widget.bind(seq, _h)
+			except Exception:
+				pass
+
+	def _tabbar_scroll(self, key: str, direction: int) -> None:
+		ui = getattr(self, "_tabbar_ui", {}).get(key)
+		if not ui:
+			return
+		try:
+			ui["canvas"].xview_scroll(6 * int(direction), "units")
+		except Exception:
+			pass
+		self._tabbar_update_arrows(key)
+
+	def _tabbar_update_arrows(self, key: str) -> None:
+		"""はみ出していないときは ◀ ▶ を押せなくする（見た目で状況が分かる）。"""
+		ui = getattr(self, "_tabbar_ui", {}).get(key)
+		if not ui:
+			return
+		try:
+			lo, hi = ui["canvas"].xview()
+		except Exception:
+			return
+		try:
+			ui["left"].configure(state=("normal" if lo > 0.0005 else "disabled"))
+			ui["right"].configure(state=("normal" if hi < 0.9995 else "disabled"))
+		except Exception:
+			pass
+
+	def _tabbar_sync(self, key: str, scroll_to=None) -> None:
+		"""内容の幅が変わったあとに呼ぶ: スクロール範囲・高さ・矢印の状態を更新する。"""
+		ui = getattr(self, "_tabbar_ui", {}).get(key)
+		if not ui:
+			return
+		canvas = ui["canvas"]; inner = ui["inner"]
+		try:
+			canvas.update_idletasks()
+			bbox = canvas.bbox("all")
+			if bbox:
+				canvas.configure(scrollregion=bbox)
+			h = max(int(inner.winfo_reqheight()), 20)
+			if int(canvas.cget("height")) != h:
+				canvas.configure(height=h)
+		except Exception:
+			pass
+		if scroll_to is None:
+			scroll_to = ui.get("active")
+		if scroll_to is not None:
+			self._tabbar_show_widget(key, scroll_to)
+		self._tabbar_update_arrows(key)
+
+	def _tabbar_show_widget(self, key: str, widget) -> None:
+		"""選択中のタブが画面外にあれば見える位置まで寄せる。"""
+		ui = getattr(self, "_tabbar_ui", {}).get(key)
+		if not ui or widget is None:
+			return
+		canvas = ui["canvas"]
+		try:
+			canvas.update_idletasks()
+			x0 = widget.winfo_x()
+			x1 = x0 + widget.winfo_width()
+			total = max(int(ui["inner"].winfo_reqwidth()), 1)
+			view_w = max(int(canvas.winfo_width()), 1)
+			if total <= view_w:
+				canvas.xview_moveto(0.0)
+				return
+			left = canvas.canvasx(0)
+			if x0 < left:
+				canvas.xview_moveto(max(0.0, (x0 - 8) / total))
+			elif x1 > left + view_w:
+				canvas.xview_moveto(min(1.0, (x1 - view_w + 8) / total))
+		except Exception:
+			pass
+
+	def _install_wheel_guards(self) -> None:
+		"""ホイールで Combobox/Spinbox の値が変わるのを禁止する。
+
+		ttk の既定のクラスバインドは、マウスが乗っているだけの Combobox/Spinbox の
+		値をホイールで変えてしまう。ArUco辞書やマーカー実寸のような設定値が
+		スクロールのついでに書き換わると、誤操作に気付けないまま解析してしまうので
+		クラスバインド自体を「値を変えず、代わりに親のスクロール領域を動かす」
+		ハンドラに差し替える（個々のウィジェットを列挙しなくて済む）。
+		"""
+		for cls in ("TCombobox", "TSpinbox", "Spinbox"):
+			for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+				try:
+					self.bind_class(cls, seq, self._wheel_guard)
+				except Exception:
+					pass
+
+	def _wheel_guard(self, event):
+		"""値は変えず、祖先のスクロール可能 Canvas をスクロールして "break" を返す。
+
+		スクロール枠は canvas.create_window(..., window=ttk.Frame(canvas)) で作って
+		あるので、ウィジェットの master を遡れば必ずその Canvas に行き当たる。
+		"""
+		step = _mousewheel_units(event)
+		w = getattr(event, "widget", None)
+		node = getattr(w, "master", None)
+		depth = 0
+		while node is not None and depth < 40:
+			depth += 1
+			if isinstance(node, tk.Canvas):
+				try:
+					if step:
+						node.yview_scroll(step, "units")
+				except Exception:
+					pass
+				break
+			node = getattr(node, "master", None)
+		return "break"
+
 	def _setup_fonts(self) -> None:
 		"""環境に合わせたUI/等幅フォントを選択し、Tkのデフォルトに適用する"""
 		try:
@@ -22675,6 +28817,10 @@ class MainMenuGUI(_BaseWindow):
 		self.org_model_path.set(str(data.get("org_model", "")))
 		self.org_pp_path.set(str(data.get("org_pp", "")))
 
+		# 単体で使うタブのパス (2026-09-07 追加)。
+		# この時点ではまだ作られていない変数があるので、名前で扱って保留する。
+		self._restore_late_paths(data)
+
 		# A-Bファイルの復元
 		self.a_b_model_a_path.set(str(data.get("a_b_model_a", "")))
 		self.a_b_model_b_path.set(str(data.get("a_b_model_b", "")))
@@ -22985,6 +29131,9 @@ class MainMenuGUI(_BaseWindow):
 			"fem_show_dist_mesh": self.fem_show_dist_mesh.get(),
 			"fem_show_bone": self.fem_show_bone.get(),
 			"show_fem_analysis": self.show_fem_analysis.get(),
+			# 単体で使うタブのパス (保存対象から漏れていた: 2026-09-07 追加)。
+			# 生成が遅い変数を含むので getattr 経由 (_LATE_PATH_SPECS 参照)。
+			**self._late_path_state(),
 			# 共有キャッシュ設定
 			"cache_nas_path": self.cache_nas_path.get(),
 			"cache_enabled": self.cache_enabled.get(),
@@ -22999,9 +29148,8 @@ class MainMenuGUI(_BaseWindow):
 		joint = self.joint_var.get()
 		try:
 			p = self._state_file_path()
-			with p.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[状態保存] {p}")
+			if self._write_json_state(p, data, "状態保存"):
+				print(f"[状態保存] {p}")
 		except Exception as e:
 			print(f"[状態保存] 失敗: {e}")
 
@@ -23015,8 +29163,10 @@ class MainMenuGUI(_BaseWindow):
 				else:
 					main_data = {}
 				main_data["joint"] = 2
-				with main_path.open("w", encoding="utf-8") as f:
-					json.dump(main_data, f, ensure_ascii=False, indent=2)
+				# 素の open("w") だと書き込み中に落ちたときにメインの状態ファイルが
+				# 壊れる (パスがすべて消える)。自動保存で呼ばれる回数が増えたので、
+				# 他と同じ「一時ファイル → 検証 → 原子的差し替え」に揃える。
+				self._write_json_state(main_path, main_data, "メイン joint更新")
 			except Exception as e:
 				print(f"[メイン joint更新] 失敗: {e}")
 
@@ -23059,9 +29209,8 @@ class MainMenuGUI(_BaseWindow):
 			data["cs_dist_model1_region"] = self.cs_dist_model1_region_path.get()
 			data["cs_dist_model2_whole"] = self.cs_dist_model2_whole_path.get()
 			data["cs_dist_model2_region"] = self.cs_dist_model2_region_path.get()
-			with target.open("w", encoding="utf-8") as f:
-				json.dump(data, f, ensure_ascii=False, indent=2)
-			print(f"[関節別状態保存] joint={joint} → {target}")
+			if self._write_json_state(target, data, "関節別状態保存"):
+				print(f"[関節別状態保存] joint={joint} → {target}")
 		except Exception as e:
 			print(f"[関節別状態保存] 失敗: {e}")
 
@@ -23112,9 +29261,19 @@ class MainMenuGUI(_BaseWindow):
 		self.cs_dist_model2_region_path.set(str(data.get("cs_dist_model2_region", "")))
 
 	def _on_close(self) -> None:
-		self._save_state()
-		self._save_knee_state()
-		self._save_ankle_state()
+		# 1つが例外で落ちても残りを必ず保存する。
+		# 以前は素直に並べていたので、前の方 (hip) で例外が出ると
+		# 後ろ (精度検証) が保存されずに消えていた。
+		self._flush_state_autosave()
+		for label, fn in (("hip", self._save_state),
+		                   ("knee", self._save_knee_state),
+		                   ("ankle", self._save_ankle_state),
+		                   ("精度検証", self._save_av_state),
+		                   ("精度検証の結果", self._av_save_all_results)):
+			try:
+				fn()
+			except Exception as e:
+				print(f"[終了時保存] {label} の保存に失敗: {e}")
 		self.destroy()
 	
 	def _save_initial_geometry(self) -> None:

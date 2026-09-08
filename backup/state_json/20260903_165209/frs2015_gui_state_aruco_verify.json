@@ -1,0 +1,39 @@
+{
+  "aruco_dict": "DICT_4X4_100",
+  "marker_size_mm": 20.0,
+  "id_lin": 1,
+  "id_rot": 11,
+  "stride": 1,
+  "rows": {
+    "X": {
+      "commanded": 50.0,
+      "feed": 5.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/ankle_d405_20260903_154303.db3"
+    },
+    "Y": {
+      "commanded": 70.0,
+      "feed": 0.0,
+      "bag": ""
+    },
+    "Z": {
+      "commanded": 70.0,
+      "feed": 0.0,
+      "bag": ""
+    },
+    "U": {
+      "commanded": 50.0,
+      "feed": 0.0,
+      "bag": ""
+    },
+    "V": {
+      "commanded": 50.0,
+      "feed": 0.0,
+      "bag": ""
+    },
+    "W": {
+      "commanded": 50.0,
+      "feed": 0.0,
+      "bag": ""
+    }
+  }
+}

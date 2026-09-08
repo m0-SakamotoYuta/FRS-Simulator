@@ -1,0 +1,97 @@
+{
+  "aruco_dict": "DICT_4X4_100",
+  "marker_size_mm": 20.0,
+  "id_lin": 1,
+  "id_rot": 2,
+  "stride": 1,
+  "rows": {
+    "X": {
+      "commanded": 50.0,
+      "feed": 5.0,
+      "accel": 0.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/X軸_正（下へ）/新/ankle_d405_20260903_213341.db3"
+    },
+    "Y": {
+      "commanded": 50.0,
+      "feed": 5.0,
+      "accel": 0.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/Y軸/新/ankle_d405_20260903_214208.db3"
+    },
+    "Z": {
+      "commanded": 50.0,
+      "feed": 5.0,
+      "accel": 0.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/Z軸/新/ankle_d405_20260903_214425.db3"
+    },
+    "U": {
+      "commanded": 20.0,
+      "feed": 1.0,
+      "accel": 0.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/U軸/ankle_d405_20260903_220013.db3"
+    },
+    "V": {
+      "commanded": 20.0,
+      "feed": 1.0,
+      "accel": 0.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/V軸/ankle_d405_20260903_222728.db3"
+    },
+    "W": {
+      "commanded": 20.0,
+      "feed": 1.0,
+      "accel": 0.0,
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/W軸/ankle_d405_20260903_220801.db3"
+    }
+  },
+  "tabs": [
+    {
+      "name": "試験1",
+      "id": "default",
+      "settings": {
+        "aruco_dict": "DICT_4X4_100",
+        "marker_size_mm": 20.0,
+        "id_lin": 1,
+        "id_rot": 2,
+        "stride": 1,
+        "rows": {
+          "X": {
+            "commanded": 50.0,
+            "feed": 5.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/X軸_正（下へ）/新/ankle_d405_20260903_213341.db3"
+          },
+          "Y": {
+            "commanded": 50.0,
+            "feed": 5.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/Y軸/新/ankle_d405_20260903_214208.db3"
+          },
+          "Z": {
+            "commanded": 50.0,
+            "feed": 5.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/Z軸/新/ankle_d405_20260903_214425.db3"
+          },
+          "U": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/U軸/ankle_d405_20260903_220013.db3"
+          },
+          "V": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/V軸/ankle_d405_20260903_222728.db3"
+          },
+          "W": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/W軸/ankle_d405_20260903_220801.db3"
+          }
+        }
+      }
+    }
+  ],
+  "active": 0
+}

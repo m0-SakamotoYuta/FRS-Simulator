@@ -1,0 +1,204 @@
+{
+  "aruco_dict": "DICT_4X4_100",
+  "marker_size_mm": 20.0,
+  "id_lin": 1,
+  "id_rot": 2,
+  "stride": 1,
+  "axis_auto": true,
+  "chart_size_cm": 24.0,
+  "plot_size_cm": 21.0,
+  "rows": {
+    "X": {
+      "commanded": 0.0,
+      "feed": 0.0,
+      "accel": 0.0,
+      "bag": ""
+    },
+    "Y": {
+      "commanded": 0.0,
+      "feed": 0.0,
+      "accel": 0.0,
+      "bag": ""
+    },
+    "Z": {
+      "commanded": 0.0,
+      "feed": 0.0,
+      "accel": 0.0,
+      "bag": ""
+    },
+    "U": {
+      "commanded": 20.0,
+      "feed": 1.0,
+      "accel": 1.0,
+      "bag": ""
+    },
+    "V": {
+      "commanded": 20.0,
+      "feed": 1.0,
+      "accel": 1.0,
+      "bag": ""
+    },
+    "W": {
+      "commanded": 20.0,
+      "feed": 1.0,
+      "accel": 1.0,
+      "bag": ""
+    }
+  },
+  "tabs": [
+    {
+      "name": "試験1",
+      "id": "default",
+      "settings": {
+        "aruco_dict": "DICT_4X4_100",
+        "marker_size_mm": 20.0,
+        "id_lin": 1,
+        "id_rot": 2,
+        "stride": 1,
+        "rows": {
+          "X": {
+            "commanded": 50.0,
+            "feed": 5.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/X軸_正（下へ）/新/ankle_d405_20260903_213341.db3"
+          },
+          "Y": {
+            "commanded": 50.0,
+            "feed": 5.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/Y軸/新/ankle_d405_20260903_214208.db3"
+          },
+          "Z": {
+            "commanded": 50.0,
+            "feed": 5.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/Z軸/新/ankle_d405_20260903_214425.db3"
+          },
+          "U": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/U軸/ankle_d405_20260903_220013.db3"
+          },
+          "V": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/V軸/ankle_d405_20260903_222728.db3"
+          },
+          "W": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 0.0,
+            "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/W軸/ankle_d405_20260903_220801.db3"
+          }
+        }
+      }
+    },
+    {
+      "name": "260904_ArUco精度検証_正面から",
+      "id": "teff5a3c23c",
+      "settings": {
+        "aruco_dict": "DICT_4X4_100",
+        "marker_size_mm": 20.0,
+        "id_lin": 1,
+        "id_rot": 2,
+        "stride": 1,
+        "axis_auto": true,
+        "chart_size_cm": 24.0,
+        "plot_size_cm": 21.0,
+        "rows": {
+          "X": {
+            "commanded": 0.0,
+            "feed": 0.0,
+            "accel": 0.0,
+            "bag": ""
+          },
+          "Y": {
+            "commanded": 0.0,
+            "feed": 0.0,
+            "accel": 0.0,
+            "bag": ""
+          },
+          "Z": {
+            "commanded": 0.0,
+            "feed": 0.0,
+            "accel": 0.0,
+            "bag": ""
+          },
+          "U": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 1.0,
+            "bag": ""
+          },
+          "V": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 1.0,
+            "bag": ""
+          },
+          "W": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 1.0,
+            "bag": ""
+          }
+        }
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から",
+      "id": "t523cdff390",
+      "settings": {
+        "aruco_dict": "DICT_4X4_100",
+        "marker_size_mm": 20.0,
+        "id_lin": 1,
+        "id_rot": 2,
+        "stride": 1,
+        "axis_auto": true,
+        "chart_size_cm": 24.0,
+        "plot_size_cm": 21.0,
+        "rows": {
+          "X": {
+            "commanded": 0.0,
+            "feed": 0.0,
+            "accel": 0.0,
+            "bag": ""
+          },
+          "Y": {
+            "commanded": 0.0,
+            "feed": 0.0,
+            "accel": 0.0,
+            "bag": ""
+          },
+          "Z": {
+            "commanded": 0.0,
+            "feed": 0.0,
+            "accel": 0.0,
+            "bag": ""
+          },
+          "U": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 1.0,
+            "bag": ""
+          },
+          "V": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 1.0,
+            "bag": ""
+          },
+          "W": {
+            "commanded": 20.0,
+            "feed": 1.0,
+            "accel": 1.0,
+            "bag": ""
+          }
+        }
+      }
+    }
+  ],
+  "active": 2
+}

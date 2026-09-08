@@ -1,0 +1,22 @@
+{
+  "source_name": "グラフのテンプレ.xlsx",
+  "source_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/グラフのテンプレ.xlsx",
+  "imported_at": "2026-09-04 21:28",
+  "source_sheet": "X",
+  "n_series": 2,
+  "n_charts_in_file": 1,
+  "chart_part": "xl/charts/chart1.xml",
+  "roles": {
+    "AJ": "IDEAL",
+    "AK": "MEAS"
+  },
+  "roles_used": [
+    "IDEAL",
+    "MEAS"
+  ],
+  "headers": {
+    "AJ": "【縦軸】理想_ロボット",
+    "AK": "【縦軸】計測_rgb"
+  },
+  "had_anchor": true
+}
