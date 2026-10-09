@@ -703,23 +703,6 @@ class MainMenuGUI(_BaseWindow):
 		# 2026-10-09: 実寸を「ノギスで測った値」と「補正後（計算に使う値）」に分けた。
 		# 補正後は、深度から推定した実効的な大きさで自動更新する（手で変えると手動になる）。
 		self.ankle_marker_size_true_mm = tk.DoubleVar(value=20.0)   # 実寸（ノギス, mm）
-		# ヒートマップの色の範囲（めり込み側・離れ側の最大, mm, どちらも正の数で持つ）。2026-10-09
-		self.ankle_hm_neg_mm = tk.DoubleVar(value=2.0)
-		self.ankle_hm_pos_mm = tk.DoubleVar(value=2.0)
-		self.ankle_hm_preset = tk.StringVar(value="デフォルト")
-		# 方眼紙と移動量（2026-10-09）
-		self.ankle_grid_show = tk.BooleanVar(value=True)
-		self.ankle_grid_minor_mm = tk.DoubleVar(value=1.0)
-		self.ankle_grid_major_mm = tk.DoubleVar(value=5.0)
-		self.ankle_grid_size_mm = tk.DoubleVar(value=120.0)
-		self.ankle_disp_show = tk.BooleanVar(value=True)
-		self.ankle_disp_bone = tk.StringVar(value="（自動）")
-		# ロボットの datalog（2026-10-09）
-		self.ankle_robot_log_path = tk.StringVar(value="")
-		self.ankle_robot_log_show = tk.BooleanVar(value=True)
-		self.ankle_robot_log_items = tk.StringVar(value="FE,AP,Fpd")
-		self.ankle_robot_log_offset_s = tk.DoubleVar(value=0.0)    # ロボットの時刻 = 映像の時刻 − これ
-		self.ankle_robot_log_auto = tk.BooleanVar(value=True)       # 開くたびに自動で時刻を合わせる
 		self.ankle_marker_size_auto = tk.BooleanVar(value=True)     # 補正後を自動で更新するか
 		self.ankle_marker_size_note = tk.StringVar(value="")        # 自動の値のメモ（表示用）
 		self.ankle_pose_series_path = tk.StringVar(value="")   # 事前計算済み姿勢時系列(任意, npz/csv)
@@ -3642,83 +3625,6 @@ class MainMenuGUI(_BaseWindow):
 		               "実測フレームレートはログに出ます。",
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=1, column=0, columnspan=6, sticky="w", padx=(20, 0), pady=(2, 0))
-		# ヒートマップの範囲とプリセット（2026-10-09）
-		hmr = ttk.Frame(vis_frame)
-		hmr.grid(row=4, column=0, sticky="w", padx=12, pady=(0, 6))
-		ttk.Label(hmr, text="ヒートマップの範囲: めり込み側（−）").grid(row=0, column=0, sticky="w")
-		ttk.Spinbox(hmr, from_=0.1, to=50.0, increment=0.5, textvariable=self.ankle_hm_neg_mm, width=6
-		            ).grid(row=0, column=1, sticky="w", padx=(2, 2))
-		ttk.Label(hmr, text="mm　離れ側（＋）").grid(row=0, column=2, sticky="w")
-		ttk.Spinbox(hmr, from_=0.0, to=50.0, increment=0.5, textvariable=self.ankle_hm_pos_mm, width=6
-		            ).grid(row=0, column=3, sticky="w", padx=(2, 2))
-		ttk.Label(hmr, text="mm　プリセット").grid(row=0, column=4, sticky="w", padx=(8, 2))
-		self._ankle_hm_preset_cb = ttk.Combobox(hmr, textvariable=self.ankle_hm_preset, width=16, state="readonly",
-		                                        values=list(self._ankle_hm_presets().keys()))
-		self._ankle_hm_preset_cb.grid(row=0, column=5, sticky="w")
-		self._ankle_hm_preset_cb.bind("<<ComboboxSelected>>", lambda e: self._ankle_hm_use_preset())
-		ttk.Button(hmr, text="プリセットとして保存…", command=self._ankle_hm_save_preset_dialog
-		           ).grid(row=0, column=6, sticky="w", padx=(8, 4))
-		ttk.Button(hmr, text="削除", command=self._ankle_hm_delete_preset).grid(row=0, column=7, sticky="w")
-		ttk.Label(hmr, text=("※ −側の最大＝濃い赤、0＝緑（接触）、＋側の最大＝青。＋側より離れたところは骨の色、"
-		                     "−側より深いめり込みは濃い赤のまま。可視化ウィンドウの再生コントロールでも変えられます。"),
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(2, 0))
-
-		# 方眼紙と移動量（2026-10-09）
-		grd = ttk.Frame(vis_frame)
-		grd.grid(row=5, column=0, sticky="w", padx=12, pady=(0, 6))
-		ttk.Checkbutton(grd, text="方眼紙を表示", variable=self.ankle_grid_show).grid(row=0, column=0, sticky="w")
-		ttk.Label(grd, text="細い線").grid(row=0, column=1, sticky="w", padx=(10, 2))
-		ttk.Spinbox(grd, from_=0.5, to=10.0, increment=0.5, textvariable=self.ankle_grid_minor_mm, width=5
-		            ).grid(row=0, column=2, sticky="w")
-		ttk.Label(grd, text="mm　太い線").grid(row=0, column=3, sticky="w", padx=(2, 2))
-		ttk.Spinbox(grd, from_=1.0, to=50.0, increment=1.0, textvariable=self.ankle_grid_major_mm, width=5
-		            ).grid(row=0, column=4, sticky="w")
-		ttk.Label(grd, text="mm　大きさ").grid(row=0, column=5, sticky="w", padx=(2, 2))
-		ttk.Spinbox(grd, from_=20.0, to=400.0, increment=10.0, textvariable=self.ankle_grid_size_mm, width=6
-		            ).grid(row=0, column=6, sticky="w")
-		ttk.Label(grd, text="mm").grid(row=0, column=7, sticky="w", padx=(2, 12))
-		ttk.Checkbutton(grd, text="移動量を表示　測る骨:", variable=self.ankle_disp_show
-		                ).grid(row=0, column=8, sticky="w")
-		self._ankle_disp_bone_cb = ttk.Combobox(grd, textvariable=self.ankle_disp_bone, width=12, state="readonly",
-		                                        postcommand=lambda: self._ankle_disp_bone_cb.configure(
-		                                            values=["（自動）"] + [str(b.get("name", "")) for b in self.ankle_bones]))
-		self._ankle_disp_bone_cb.grid(row=0, column=9, sticky="w", padx=(2, 0))
-		ttk.Label(grd, text=("※ 方眼紙は③で「固定」にした骨（大腿骨など）に対して動きません。再生コントロールの"
-		                     "「方眼紙をこの視点に合わせる」で、いま見ている向き（真横など）の骨の奥に置き直せます（タブごとに保存）。"
-		                     "移動量は、測る骨の関節面の中心（固定した骨に近い部分の中心）が、基準のコマからどれだけ動いたかを"
-		                     "方眼紙の向き（横・縦・奥行き）で示します。「移動の基準をいまのコマにする」で基準を変えられます。"),
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=1, column=0, columnspan=10, sticky="w", pady=(2, 0))
-
-		# ロボットの datalog（2026-10-09）
-		rlg = ttk.Frame(vis_frame)
-		rlg.grid(row=6, column=0, sticky="we", padx=12, pady=(0, 6))
-		ttk.Checkbutton(rlg, text="ロボットの datalog を表示", variable=self.ankle_robot_log_show
-		                ).grid(row=0, column=0, sticky="w")
-		ttk.Entry(rlg, textvariable=self.ankle_robot_log_path, width=60).grid(row=0, column=1, sticky="w", padx=(6, 4))
-		ttk.Button(rlg, text="参照…", command=lambda: self._ankle_choose(
-			self.ankle_robot_log_path, "ロボットの datalog（KKR/CSV）を選択", "robotlog")).grid(row=0, column=2, padx=2)
-		ttk.Button(rlg, text="自動で探す", command=self._ankle_robot_log_autofind_ui).grid(row=0, column=3, padx=2)
-		rlg2 = ttk.Frame(vis_frame)
-		rlg2.grid(row=7, column=0, sticky="w", padx=12, pady=(0, 6))
-		ttk.Label(rlg2, text="表示する項目:").grid(row=0, column=0, sticky="w")
-		ttk.Label(rlg2, textvariable=self.ankle_robot_log_items, foreground="#005580").grid(row=0, column=1, sticky="w", padx=(4, 4))
-		ttk.Button(rlg2, text="選ぶ…", command=lambda: self._ankle_robot_log_items_dialog(self)).grid(row=0, column=2, padx=(0, 16))
-		ttk.Label(rlg2, text="時刻のずれ（ロボット = 映像 − ずれ）").grid(row=0, column=3, sticky="w")
-		ttk.Spinbox(rlg2, from_=-600.0, to=600.0, increment=0.05, textvariable=self.ankle_robot_log_offset_s, width=8
-		            ).grid(row=0, column=4, sticky="w", padx=(4, 2))
-		ttk.Label(rlg2, text="秒").grid(row=0, column=5, sticky="w")
-		ttk.Checkbutton(rlg2, text="開くたびに自動で合わせる（回転の動きを重ねる）", variable=self.ankle_robot_log_auto
-		                ).grid(row=0, column=6, sticky="w", padx=(10, 0))
-		ttk.Label(vis_frame,
-		          text=("※ 可視化ウィンドウの右側に、選んだ項目のグラフと、いまの時刻の赤い線を出します。"
-		                "自動で合わせるときは、③で固定した骨に対する測る骨の回転の量と、ロボットの FE/VV/IE の回転の量の"
-		                "時間変化を重ねてずれを決めます（一致の度合いはコンソールに出ます）。"
-		                "ロボットの変位（ML/AP/PD）は治具・ポッティングのたわみを含むので、骨の動きは方眼紙と移動量で見てください。"),
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=8, column=0, sticky="w", padx=12, pady=(0, 6))
-
 		opt2 = ttk.Frame(vis_frame)
 		opt2.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
 		ttk.Checkbutton(opt2, text="🔧 診断モード: 骨重心をマーカー位置に強制配置 (通常はOFF)",
@@ -3814,8 +3720,6 @@ class MainMenuGUI(_BaseWindow):
 			ft = [("カメラパラメータ", "*.json *.yaml *.yml"), ("すべてのファイル", "*.*")]
 		elif kind == "pose":
 			ft = [("姿勢時系列", "*.npz *.csv *.json"), ("すべてのファイル", "*.*")]
-		elif kind == "robotlog":
-			ft = [("ロボットの datalog", "*.KKR *.kkr *.csv"), ("すべてのファイル", "*.*")]
 		else:
 			ft = [("すべてのファイル", "*.*")]
 		path = filedialog.askopenfilename(title=title, filetypes=ft)
@@ -4182,20 +4086,6 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_marker_size_mm": (self.ankle_marker_size_mm, float),
 			"ankle_marker_size_true_mm": (self.ankle_marker_size_true_mm, float),
 			"ankle_marker_size_auto": (self.ankle_marker_size_auto, bool),
-			"ankle_hm_neg_mm": (self.ankle_hm_neg_mm, float),
-			"ankle_hm_pos_mm": (self.ankle_hm_pos_mm, float),
-			"ankle_hm_preset": (self.ankle_hm_preset, str),
-			"ankle_grid_show": (self.ankle_grid_show, bool),
-			"ankle_grid_minor_mm": (self.ankle_grid_minor_mm, float),
-			"ankle_grid_major_mm": (self.ankle_grid_major_mm, float),
-			"ankle_grid_size_mm": (self.ankle_grid_size_mm, float),
-			"ankle_disp_show": (self.ankle_disp_show, bool),
-			"ankle_disp_bone": (self.ankle_disp_bone, str),
-			"ankle_robot_log_path": (self.ankle_robot_log_path, str),
-			"ankle_robot_log_show": (self.ankle_robot_log_show, bool),
-			"ankle_robot_log_items": (self.ankle_robot_log_items, str),
-			"ankle_robot_log_offset_s": (self.ankle_robot_log_offset_s, float),
-			"ankle_robot_log_auto": (self.ankle_robot_log_auto, bool),
 			"ankle_pose_series": (self.ankle_pose_series_path, str),
 			"ankle_heatmap_prox": (self.ankle_heatmap_prox_var, str),
 			"ankle_heatmap_dist": (self.ankle_heatmap_dist_var, str),
@@ -10167,679 +10057,6 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(win, text="閉じる", command=win.destroy).pack(pady=6)
 		show_est()
 
-	# ---- ロボットの datalog（2026-10-09） ----
-	# FRS-2015 の KKR / CSV: cp932 のテキスト。"Time," で始まる行が見出し、その下が数値（行末にカンマ）。
-	# 見出しより上に "Start Time,YYYY/MM/DD HH:MM"（分まで）。関節座標の列 FE/ML/VV/AP/IE/PD と、
-	# 力・モーメント Mfe/Fml/Mvv/Fap/Mie/Fpd を表示に使う。
-	_ANKLE_LOG_ITEMS = [("FE", "FE [deg]"), ("ML", "ML [mm]"), ("VV", "VV [deg]"), ("AP", "AP [mm]"),
-	                    ("IE", "IE [deg]"), ("PD", "PD [mm]"), ("Mfe", "Mfe"), ("Fml", "Fml [N]"),
-	                    ("Mvv", "Mvv"), ("Fap", "Fap [N]"), ("Mie", "Mie"), ("Fpd", "Fpd [N]")]
-
-	def _ankle_robot_log_load(self, path: str) -> dict:
-		"""datalog を読む。{"cols": {名前: ndarray}, "t": 先頭0秒の時刻, "start": datetime or None}。"""
-		import io as _io
-		import os as _os
-		import datetime as _dt
-		import numpy as np
-		key = (str(path), _os.path.getmtime(path))
-		memo = getattr(self, "_ankle_robot_log_memo", None)
-		if memo is None:
-			memo = self._ankle_robot_log_memo = {}
-		if key in memo:
-			return memo[key]
-		raw = open(path, "rb").read()
-		for enc in ("cp932", "utf-8-sig", "utf-8"):
-			try:
-				text = raw.decode(enc)
-				break
-			except Exception:
-				continue
-		lines = text.splitlines()
-		h = next((i for i, l in enumerate(lines) if l.startswith("Time,")), None)
-		if h is None:
-			raise ValueError("見出しの行（Time, ...）が見つかりません")
-		start = None
-		for l in lines[:h]:
-			if l.startswith("Start Time"):
-				try:
-					start = _dt.datetime.strptime(l.split(",", 1)[1].strip(), "%Y/%m/%d %H:%M")
-				except Exception:
-					start = None
-		cols = [c.strip() for c in lines[h].split(",")]
-		n = len(cols)
-		rows = []
-		for l in lines[h + 1:]:
-			p = l.split(",")
-			if len(p) < n - 2:
-				continue
-			try:
-				rows.append([float(x) if x.strip() else np.nan for x in p[:n]] + [np.nan] * (n - min(len(p), n)))
-			except ValueError:
-				continue
-		if not rows:
-			raise ValueError("数値の行がありません")
-		a = np.asarray(rows, dtype=float)
-		data = {c: a[:, i] for i, c in enumerate(cols) if c}
-		ok = np.isfinite(data["Time"])
-		for c in ("FE", "VV", "IE"):
-			if c in data:
-				ok &= np.isfinite(data[c])
-		data = {c: v[ok] for c, v in data.items()}
-		t = data["Time"] - data["Time"][0]
-		out = {"cols": data, "t": t, "start": start, "path": str(path)}
-		memo[key] = out
-		return out
-
-	def _ankle_robot_log_find(self, src: str):
-		"""録画（ankle_d405_YYYYMMDD_HHMMSS.db3）の時刻に合う datalog を、近くのフォルダから探す。"""
-		import re as _re
-		import datetime as _dt
-		import os as _os
-		if not src:
-			return None
-		sp = Path(src)
-		m = _re.search(r"(\d{8})_(\d{6})", sp.name)
-		if not m:
-			return None
-		rec_start = _dt.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-		try:
-			rec_end = _dt.datetime.fromtimestamp(_os.path.getmtime(src))
-		except Exception:
-			rec_end = rec_start
-		dirs = []
-		for d in (sp.parent, sp.parent.parent, sp.parent.parent.parent):
-			for dd in (d, d / "datalog"):
-				if dd.is_dir() and dd not in dirs:
-					dirs.append(dd)
-		best = None
-		for d in dirs:
-			for f in list(d.glob("*.KKR")) + list(d.glob("*.kkr")) + list(d.glob("*.csv")):
-				try:
-					head = open(f, "rb").read(600).decode("cp932", errors="replace")
-					if "Title," not in head or "Start Time" not in head:
-						continue
-					st = None
-					for l in head.splitlines():
-						if l.startswith("Start Time"):
-							st = _dt.datetime.strptime(l.split(",", 1)[1].strip(), "%Y/%m/%d %H:%M")
-					if st is None:
-						continue
-					end = _dt.datetime.fromtimestamp(_os.path.getmtime(f))
-					score = abs((st - rec_start).total_seconds()) + abs((end - rec_end).total_seconds())
-					if best is None or score < best[0]:
-						best = (score, str(f))
-				except Exception:
-					continue
-		if best is None or best[0] > 900:
-			return None
-		return best[1]
-
-	def _ankle_robot_log_autofind_ui(self) -> None:
-		cache = self._ankle_get_current_cache()
-		src = str((cache or {}).get("source", "") or self.ankle_depth_path.get().strip())
-		f = self._ankle_robot_log_find(src)
-		if not f:
-			messagebox.showinfo("ロボットの datalog", "録画の時刻に合う datalog が見つかりませんでした。\n"
-			                    "「参照…」で選んでください。", parent=self)
-			return
-		self.ankle_robot_log_path.set(f)
-		self._schedule_state_autosave("ankle")
-		messagebox.showinfo("ロボットの datalog", f"見つかりました:\n{f}", parent=self)
-
-	def _ankle_robot_log_items_dialog(self, parent, on_done=None) -> None:
-		cur = [x.strip() for x in str(self.ankle_robot_log_items.get()).split(",") if x.strip()]
-		win = tk.Toplevel(parent)
-		win.title("datalog の項目")
-		win.transient(parent)
-		vs = []
-		ttk.Label(win, text="表示する項目（6つくらいまでが見やすいです）").grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 4))
-		for k, (key, lab) in enumerate(self._ANKLE_LOG_ITEMS):
-			v = tk.BooleanVar(win, value=key in cur)
-			ttk.Checkbutton(win, text=lab, variable=v).grid(row=1 + k // 6, column=k % 6, sticky="w", padx=8, pady=2)
-			vs.append((key, v))
-
-		def ok():
-			sel = [k for k, v in vs if v.get()]
-			self.ankle_robot_log_items.set(",".join(sel))
-			self._schedule_state_autosave("ankle")
-			win.destroy()
-			if callable(on_done):
-				on_done(sel)
-		ttk.Button(win, text="決定", command=ok).grid(row=4, column=0, columnspan=6, pady=8)
-
-	@staticmethod
-	def _ankle_robot_rotations(cols):
-		"""ロボットの関節座標の回転 Rz(FE)·Rx(VV)·Ry(IE)（FRS の膝関節座標系の順）。"""
-		from scipy.spatial.transform import Rotation as _R
-		import numpy as np
-		return _R.from_euler('ZXY', np.c_[cols["FE"], cols["VV"], cols["IE"]], degrees=True)
-
-	def _ankle_robot_log_sync(self, log: dict, Tm, frame_times):
-		"""映像（固定した骨に対する測る骨）とロボットの回転の量の時間変化を重ね、ずれ（秒）を求める。
-
-		返り値: (ずれ, 一致の RMS [deg]) 。ロボットの時刻 = 映像の時刻 − ずれ。
-		2026-10-09 にブタ膝で確認: 一致 0.3°、ずれ 2.75 s / 12.4 s。
-		"""
-		import numpy as np
-		from scipy.spatial.transform import Rotation as _R
-		from scipy.ndimage import median_filter
-		tv = np.asarray(frame_times, dtype=float)
-		Rv = _R.from_matrix(np.asarray(Tm, dtype=float)[:, :3, :3])
-		av = np.degrees((Rv * Rv[0].inv()).magnitude())
-		rr = self._ankle_robot_rotations(log["cols"])
-		ar = np.degrees((rr * rr[0].inv()).magnitude())
-		tr = log["t"]
-		grid = np.arange(0.0, tv[-1], 0.05)
-		avg = np.interp(grid, tv, median_filter(av, 9))
-		best = None
-		for off in np.arange(-120.0, 120.0, 0.05):
-			g2 = grid - off
-			m = (g2 >= 0) & (g2 <= tr[-1])
-			if m.sum() < len(grid) * 0.5:
-				continue
-			e = float(np.sqrt(np.mean((avg[m] - np.interp(g2[m], tr, ar)) ** 2)))
-			if best is None or e < best[1]:
-				best = (float(off), e)
-		if best is None:
-			raise ValueError("映像とログの重なりが短すぎます")
-		return best
-
-	def _ankle_robot_log_extra(self, scene_bones, scene: dict):
-		"""datalog のグラフ（engine の extra_actors に渡す関数）を返す。使わないときは None。"""
-		import numpy as np
-		try:
-			if not bool(self.ankle_robot_log_show.get()):
-				return None
-			path = self.ankle_robot_log_path.get().strip()
-		except Exception:
-			return None
-		if not path:
-			return None
-		if not Path(path).exists():
-			print(f"[datalog] 見つかりません: {path}")
-			return None
-		try:
-			log = self._ankle_robot_log_load(path)
-		except Exception as e:
-			print(f"[datalog] 読み込みに失敗: {e}")
-			return None
-		times = list(scene.get("frame_times") or [])
-		if not times:
-			return None
-		# 時刻合わせ
-		off = float(self.ankle_robot_log_offset_s.get())
-		if bool(self.ankle_robot_log_auto.get()):
-			fixed_si = next((si for si, b in enumerate(scene_bones)
-			                 if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), None)
-			cand = [si for si in range(len(scene_bones)) if si != fixed_si]
-			want = str(self.ankle_disp_bone.get() or "")
-			msi = next((si for si in cand if str(scene_bones[si].get("name", "")) == want), None)
-			if msi is None and cand:
-				msi = next((si for si in cand if "脛骨" in str(scene_bones[si].get("name", ""))), cand[0])
-			if fixed_si is not None and msi is not None:
-				try:
-					off, rms = self._ankle_robot_log_sync(log, scene_bones[msi]["poses"], times)
-					self.ankle_robot_log_offset_s.set(round(off, 2))
-					self._schedule_state_autosave("ankle")
-					print(f"[datalog] 時刻を自動で合わせました: ロボット = 映像 − {off:.2f} 秒（回転の一致 RMS {rms:.2f}°）"
-					      + ("  ※ 一致が悪いので、⑤の「時刻のずれ」を確かめてください" if rms > 2.0 else ""))
-				except Exception as e:
-					print(f"[datalog] 自動の時刻合わせに失敗（⑤の値 {off:.2f} 秒を使います）: {e}")
-			else:
-				print("[datalog] ③で固定した骨が無いので自動の時刻合わせはしません（⑤の値を使います）")
-		items = [x.strip() for x in str(self.ankle_robot_log_items.get()).split(",") if x.strip()]
-		labels = dict(self._ANKLE_LOG_ITEMS)
-		st = {"charts": [], "plotter": None, "items": items}
-		tx = log["t"] + off                                # 映像の時刻でグラフを描く
-
-		def _build(p):
-			for ch, *_ in st["charts"]:
-				try:
-					p.remove_chart(ch)
-				except Exception:
-					pass
-			st["charts"] = []
-			its = [k for k in st["items"] if k in log["cols"]]
-			if not its:
-				return
-			n = len(its)
-			top = 0.74                                 # 右上の姿勢の文字 (Rx, Ry, …) の下から並べる
-			h = min(0.24, (top - 0.02) / n)
-			for k, key in enumerate(its):
-				y = np.asarray(log["cols"][key], dtype=float)
-				ch = pv.Chart2D(size=(0.33, h - 0.01), loc=(0.66, top - (k + 1) * h),
-				                x_label=("time [s]" if k == n - 1 else ""), y_label=labels.get(key, key))
-				ch.line(tx, y, color="b", width=1.2)
-				lo, hi = float(np.nanmin(y)), float(np.nanmax(y))
-				if hi - lo < 1e-9:
-					lo, hi = lo - 1.0, hi + 1.0
-				cur = ch.line([tx[0], tx[0]], [lo, hi], color="r", width=2)
-				ch.background_color = "white"
-				try:
-					ch.active_background_color = "white"
-					ch.interactive = False
-					ch.x_range = [float(times[0]), float(times[-1])]
-				except Exception:
-					pass
-				p.add_chart(ch)
-				st["charts"].append((ch, cur, lo, hi))
-
-		def _update(fi):
-			if not st["charts"]:
-				return
-			t = float(times[min(int(fi), len(times) - 1)])
-			for ch, cur, lo, hi in st["charts"]:
-				try:
-					cur.update([t, t], [lo, hi])
-				except Exception:
-					pass
-
-		def _make(p):
-			st["plotter"] = p
-			_build(p)
-			return _update
-
-		def _choose():
-			def done(sel):
-				st["items"] = sel
-				if st["plotter"] is not None:
-					_build(st["plotter"])
-					try:
-						st["plotter"].render()
-					except Exception:
-						pass
-			self._ankle_robot_log_items_dialog(self, on_done=done)
-
-		scene.setdefault("panel_buttons", []).append(("datalog の項目…", _choose))
-		print(f"[datalog] {Path(path).name}: {len(log['t'])} 行・{log['t'][-1]:.1f} 秒 / 表示: {', '.join(items)}")
-		return _make
-
-	# ---- 方眼紙と移動量（2026-10-09） ----
-	# 世界座標 = 固定した骨の座標（骨固定のとき、固定した骨は動かない）。方眼紙はそこに置くので、
-	# 固定した骨に対して動かない。移動量は「測る骨の関節面の中心」の動きを方眼紙の向きで測る。
-	# 方眼紙の向き（法線・上・置き場所）はタブの "grid_plane" に保存する（世界座標）。
-
-	@staticmethod
-	def _ankle_grid_lines(origin, u, v, size, step, major, which):
-		"""方眼紙の線。which="minor": 太線でない線 / "major": 太線。"""
-		import numpy as np
-		half = float(size) / 2.0
-		n = int(np.floor(half / step + 1e-9))
-		pts, lines = [], []
-		for k in range(-n, n + 1):
-			off = k * step
-			is_major = abs(off / major - round(off / major)) < 1e-6
-			if (which == "major") != is_major:
-				continue
-			for a, b in ((u, v), (v, u)):            # u 方向の線と v 方向の線
-				p0 = origin + a * off - b * half
-				p1 = origin + a * off + b * half
-				i0 = len(pts)
-				pts.extend([p0, p1])
-				lines.extend([2, i0, i0 + 1])
-		if not pts:
-			return None
-		return pv.PolyData(np.asarray(pts, dtype=float), lines=np.asarray(lines, dtype=np.int64))
-
-	def _ankle_grid_extra(self, scene_bones, scene: dict):
-		"""方眼紙・移動量の追加描画（engine の extra_actors に渡す関数）を返す。使わないときは None。"""
-		import numpy as np
-		try:
-			show_grid = bool(self.ankle_grid_show.get())
-			show_disp = bool(self.ankle_disp_show.get())
-			minor = max(0.1, float(self.ankle_grid_minor_mm.get()))
-			major = max(minor, float(self.ankle_grid_major_mm.get()))
-			size = max(10.0, float(self.ankle_grid_size_mm.get()))
-			want = str(self.ankle_disp_bone.get() or "")
-		except Exception:
-			return None
-		if not (show_grid or show_disp) or len(scene_bones) < 2:
-			return None
-		fixed_si = None
-		for si, b in enumerate(scene_bones):
-			bone = self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}
-			if bone.get("fixed"):
-				fixed_si = si
-				break
-		if fixed_si is None:
-			print("[方眼紙] ③で骨を「固定」にしていないので、方眼紙と移動量は表示しません")
-			return None
-		cand = [si for si in range(len(scene_bones)) if si != fixed_si]
-		meas_si = None
-		if want and want != "（自動）":
-			meas_si = next((si for si in cand if str(scene_bones[si].get("name", "")) == want), None)
-		if meas_si is None:
-			meas_si = next((si for si in cand if "脛骨" in str(scene_bones[si].get("name", ""))), cand[0])
-		mb, fb = scene_bones[meas_si], scene_bones[fixed_si]
-		Tm = np.asarray(mb["poses"], dtype=float)
-		Tf0 = np.asarray(fb["poses"][0], dtype=float)
-		N = len(Tm)
-		# 関節面の中心: 測る骨の点のうち、固定した骨に近い (8mm 以内) 点の重心（モデル座標）
-		from scipy.spatial import cKDTree
-		pf = (Tf0[:3, :3] @ np.asarray(fb["mesh"].points, dtype=float).T).T + Tf0[:3, 3]
-		pm_L = np.asarray(mb["mesh"].points, dtype=float)
-		pm0 = (Tm[0][:3, :3] @ pm_L.T).T + Tm[0][:3, 3]
-		d0, _ = cKDTree(pf).query(pm0)
-		near = pm_L[d0 < 8.0]
-		ref_L = near.mean(axis=0) if len(near) >= 10 else pm_L.mean(axis=0)
-		path = np.einsum('nij,j->ni', Tm[:, :3, :3], ref_L) + Tm[:, :3, 3]
-		# 方眼紙の向き: 保存した向き → 無ければ、屈曲の軸に垂直・縦は骨の長軸（近位が上）
-		tabs = getattr(self, "_ankle_tabs", None) or []
-		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
-		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
-		plane = (tab_ref or {}).get("grid_plane") if isinstance(tab_ref, dict) else None
-		allp = np.vstack([pf, pm0])
-		center = allp.mean(axis=0)
-
-		def _default_plane():
-			from scipy.spatial.transform import Rotation as _R
-			idx = np.linspace(0, N - 1, min(N, 400)).astype(int)
-			rv = _R.from_matrix(np.einsum('nij,kj->nik', Tm[idx, :3, :3], Tm[0, :3, :3])).as_rotvec()
-			if np.degrees(np.linalg.norm(rv, axis=1)).max() > 3.0:
-				_, _, Vt = np.linalg.svd(rv - rv.mean(axis=0))
-				n_ = Vt[0]
-				# SVD の向きは表裏が決まらないので、いちばん大きい成分が正になる向きにそろえる
-				# （同じ骨モデル・キャリブなら、切除前後などのタブで同じ側を向く）
-				if n_[int(np.argmax(np.abs(n_)))] < 0:
-					n_ = -n_
-			else:
-				n_ = np.array([0.0, 0.0, 1.0])
-			up = ref_L - pm_L.mean(axis=0)                  # 関節面の中心 ← 骨の重心 = 近位向き（脛骨）
-			up = Tm[0][:3, :3] @ up
-			up = up - n_ * (up @ n_)
-			if np.linalg.norm(up) < 1e-6:
-				up = np.cross(n_, [1.0, 0.0, 0.0])
-			return {"normal": (n_ / np.linalg.norm(n_)).tolist(), "up": (up / np.linalg.norm(up)).tolist()}
-
-		if not (isinstance(plane, dict) and plane.get("normal") and plane.get("up")):
-			plane = _default_plane()
-		st = {"n": None, "u": None, "v": None, "origin": None, "ref": 0, "fi": 0,
-		      "acts": [], "plotter": None, "text": None}
-
-		def _set_plane(n_, up_):
-			n_ = np.asarray(n_, dtype=float); n_ /= np.linalg.norm(n_)
-			v_ = np.asarray(up_, dtype=float); v_ = v_ - n_ * (v_ @ n_); v_ /= np.linalg.norm(v_)
-			u_ = np.cross(v_, n_)                          # 画面の右（n がこちら向き、v が上）
-			depth = float(np.max((center - allp) @ n_))    # いちばん奥の点までの深さ
-			c0 = path[st["ref"]]
-			origin = center - n_ * (depth + 5.0)           # 骨の奥（n の反対側）
-			origin = origin + u_ * ((c0 - origin) @ u_) + v_ * ((c0 - origin) @ v_)   # 関節面の中心の真後ろ
-			st.update(n=n_, u=u_, v=v_, origin=origin)
-
-		_set_plane(plane["normal"], plane["up"])
-		font = self._sim_ligament_font_file()
-
-		def _overlay_renderer(p):
-			"""骨に隠れない重ね描き用のレンダラ（同じカメラを使う上の層）。移動の印と軌跡はここに描く。"""
-			import vtk
-			if st.get("ov") is None:
-				rw = p.render_window
-				rw.SetNumberOfLayers(max(2, rw.GetNumberOfLayers()))
-				ov = vtk.vtkRenderer()
-				ov.SetLayer(1)
-				ov.SetActiveCamera(p.renderer.GetActiveCamera())
-				ov.InteractiveOff()
-				rw.AddRenderer(ov)
-				st["ov"] = ov
-			return st["ov"]
-
-		def _ov_actor(mesh, color, line_width=None):
-			import vtk
-			mp = vtk.vtkPolyDataMapper()
-			mp.SetInputData(mesh)
-			a = vtk.vtkActor()
-			a.SetMapper(mp)
-			pr = a.GetProperty()
-			pr.SetColor(*self._sim_hex_to_rgb01(color))
-			if line_width:
-				pr.SetLineWidth(float(line_width))
-				pr.LightingOff()
-			st["ov"].AddActor(a)
-			return a
-
-		def _draw():
-			p = st["plotter"]
-			for a in st["acts"]:
-				try:
-					p.remove_actor(a)
-				except Exception:
-					pass
-			for a in st.get("ov_acts", []):
-				try:
-					st["ov"].RemoveActor(a)
-				except Exception:
-					pass
-			st["acts"], st["ov_acts"] = [], []
-			n_, u_, v_, o = st["n"], st["u"], st["v"], st["origin"]
-			if show_grid:
-				for which, col, lw, op in (("minor", "#cfd8dc", 1, 0.6), ("major", "#263238", 3, 1.0)):
-					m = self._ankle_grid_lines(o, u_, v_, size, minor, major, which)
-					if m is not None:
-						st["acts"].append(p.add_mesh(m, color=col, line_width=lw, opacity=op,
-						                             lighting=False, name=f"grid_{which}"))
-			if show_disp:
-				_overlay_renderer(p)
-				proj = path - np.outer((path - o) @ n_, n_) + n_ * 0.3      # 方眼紙の上の影
-				line = pv.lines_from_points(proj[::max(1, len(proj) // 1500)])
-				st["ov_acts"].append(_ov_actor(line, "#ff6f00", line_width=2))
-				st["ov_acts"].append(_ov_actor(pv.Sphere(radius=0.7, center=proj[st["ref"]]), "#000000"))
-				st["dot_shadow"] = _ov_actor(pv.Sphere(radius=0.9, center=(0, 0, 0)), "#d50000")
-				st["dot3d"] = _ov_actor(pv.Sphere(radius=0.9, center=(0, 0, 0)), "#d50000")
-				st["ov_acts"] += [st["dot_shadow"], st["dot3d"]]
-				st["proj"] = proj
-			if st["text"] is None:
-				kw = {"font_file": font} if font else {}
-				try:
-					st["text"] = p.add_text(" ", position="lower_left", font_size=11, color="black", **kw)
-				except TypeError:
-					st["text"] = p.add_text(" ", position="lower_left", font_size=11, color="black")
-
-		def _update(fi):
-			import vtk
-			fi = int(fi)
-			st["fi"] = fi
-			if not show_disp or st.get("proj") is None:
-				if st["text"] is not None:
-					st["text"].SetText(0, f"方眼紙: 細い線 {minor:g} mm / 太い線 {major:g} mm")
-				return
-			for key, pos in (("dot3d", path[fi]), ("dot_shadow", st["proj"][fi])):
-				m = vtk.vtkMatrix4x4()
-				for k in range(3):
-					m.SetElement(k, 3, float(pos[k]))
-				try:
-					st[key].SetUserMatrix(m)
-				except Exception:
-					pass
-			d = path[fi] - path[st["ref"]]
-			t_ref = float(scene["frame_times"][st["ref"]]) if scene.get("frame_times") else 0.0
-			txt = (f"{mb.get('name', '')}の関節面の中心の移動（基準 {t_ref:.2f} 秒から）\n"
-			       f"横 {d @ st['u']:+.2f} mm　縦 {d @ st['v']:+.2f} mm　奥行き {d @ st['n']:+.2f} mm"
-			       f"　（合計 {np.linalg.norm(d):.2f} mm）\n"
-			       f"方眼紙: 細い線 {minor:g} mm / 太い線 {major:g} mm（{fb.get('name', '')}に固定）")
-			if st["text"] is not None:
-				st["text"].SetText(0, txt)
-
-		def _make(plotter):
-			st["plotter"] = plotter
-			st["apply_plane"] = _apply_plane
-			reg = [g for g in getattr(self, "_ankle_grid_states", []) if g.get("plotter") is not None
-			       and not getattr(g["plotter"], "closed", False)]
-			reg.append(st)
-			self._ankle_grid_states = reg
-			_draw()
-			return _update
-
-		def _apply_plane(n_, up_):
-			_set_plane(n_, up_)
-			_draw()
-			_update(st["fi"])
-			if isinstance(tab_ref, dict):
-				tab_ref["grid_plane"] = {"normal": st["n"].tolist(), "up": st["v"].tolist()}
-				self._schedule_state_autosave("ankle")
-			try:
-				st["plotter"].render()
-			except Exception:
-				pass
-
-		def _align_to_view():
-			p = st["plotter"]
-			if p is None:
-				return
-			cam = p.renderer.GetActiveCamera()
-			n_ = np.asarray(cam.GetPosition()) - np.asarray(cam.GetFocalPoint())
-			up_ = cam.GetViewUp()
-			_apply_plane(n_, up_)
-			# 比較コントロールで視点を連動しているときは、ほかのウィンドウの方眼紙も同じ向きに
-			try:
-				cst = getattr(self, "_sim_compare_state", None) or {}
-				cw = getattr(self, "_sim_compare_win", None)
-				if cw is not None and cw.winfo_exists() and cst.get("cam_link") is not None and cst["cam_link"].get():
-					linked = [v["plotter"] for v in self._sim_compare_linked()]
-					if p in linked:
-						for g in list(getattr(self, "_ankle_grid_states", [])):
-							gp = g.get("plotter")
-							if g is not st and gp is not None and gp in linked and not getattr(gp, "closed", False):
-								g["apply_plane"](n_, up_)
-			except Exception as e:
-				print(f"[方眼紙] ほかのウィンドウへの反映に失敗: {e}")
-
-		def _face_grid(p=None):
-			p = p or st["plotter"]
-			if p is None:
-				return
-			c = st["origin"]
-			dist = float(np.linalg.norm(allp.max(axis=0) - allp.min(axis=0))) * 2.2 + size
-			cam = p.renderer.GetActiveCamera()
-			cam.SetFocalPoint(*c)
-			cam.SetPosition(*(c + st["n"] * dist))
-			cam.SetViewUp(*st["v"])
-			p.renderer.ResetCameraClippingRange()
-			p.render()
-
-		def _ref_here():
-			st["ref"] = int(st["fi"])
-			_draw()
-			_update(st["fi"])
-			try:
-				st["plotter"].render()
-			except Exception:
-				pass
-
-		btns = scene.setdefault("panel_buttons", [])
-		btns.append(("方眼紙をこの視点に合わせる", _align_to_view))
-		btns.append(("方眼紙に正対する", _face_grid))
-		if show_disp:
-			btns.append(("移動の基準をいまのコマにする", _ref_here))
-		scene["initial_view"] = (lambda p: _face_grid(p)) if show_grid else None
-		return _make
-
-	# ---- ヒートマップの範囲のプリセット（全タブ共通・cache/ankle_heatmap_presets.json） ----
-	_ANKLE_HM_BUILTIN = {
-		"デフォルト": {"neg": 2.0, "pos": 2.0},        # 測定のばらつき(±0.3mm)より十分広く、接触の周りが見える
-		"接触だけ（−2〜0）": {"neg": 2.0, "pos": 0.0},
-		"従来（−10〜0）": {"neg": 10.0, "pos": 0.0},
-	}
-
-	def _ankle_hm_presets_path(self):
-		return Path(__file__).parent / "cache" / "ankle_heatmap_presets.json"
-
-	def _ankle_hm_presets(self) -> dict:
-		d = dict(self._ANKLE_HM_BUILTIN)
-		try:
-			p = self._ankle_hm_presets_path()
-			if p.exists():
-				with open(p, "r", encoding="utf-8") as f:
-					user = json.load(f) or {}
-				for k, v in user.items():
-					if k not in self._ANKLE_HM_BUILTIN:
-						d[str(k)] = {"neg": abs(float(v["neg"])), "pos": abs(float(v["pos"]))}
-		except Exception as e:
-			print(f"[ヒートマップのプリセット] 読み込みに失敗: {e}")
-		return d
-
-	def _ankle_hm_write_user_presets(self, user: dict) -> None:
-		import os as _os
-		p = self._ankle_hm_presets_path()
-		p.parent.mkdir(parents=True, exist_ok=True)
-		tmp = p.with_suffix(".json.tmp")
-		with open(tmp, "w", encoding="utf-8") as f:
-			json.dump(user, f, ensure_ascii=False, indent=1)
-		_os.replace(tmp, p)
-
-	def _ankle_hm_save_preset(self, name: str, neg: float, pos: float) -> None:
-		name = str(name).strip()
-		if not name:
-			raise ValueError("名前が空です")
-		if name in self._ANKLE_HM_BUILTIN:
-			raise ValueError(f"「{name}」は最初から入っているプリセットなので上書きできません。別の名前にしてください")
-		user = {k: v for k, v in self._ankle_hm_presets().items() if k not in self._ANKLE_HM_BUILTIN}
-		user[name] = {"neg": abs(float(neg)), "pos": abs(float(pos))}
-		self._ankle_hm_write_user_presets(user)
-		try:
-			self._ankle_hm_preset_cb.configure(values=list(self._ankle_hm_presets().keys()))
-		except Exception:
-			pass
-
-	def _ankle_hm_use_preset(self) -> None:
-		p = self._ankle_hm_presets().get(self.ankle_hm_preset.get())
-		if p:
-			self.ankle_hm_neg_mm.set(abs(float(p["neg"])))
-			self.ankle_hm_pos_mm.set(abs(float(p["pos"])))
-			self._schedule_state_autosave("ankle")
-
-	def _ankle_hm_save_preset_dialog(self) -> None:
-		from tkinter import simpledialog
-		nm = simpledialog.askstring("プリセットとして保存",
-		                            f"いまの範囲（−{self.ankle_hm_neg_mm.get():g} / ＋{self.ankle_hm_pos_mm.get():g} mm）"
-		                            "を保存します。名前:", parent=self)
-		if not nm:
-			return
-		try:
-			self._ankle_hm_save_preset(nm, self.ankle_hm_neg_mm.get(), self.ankle_hm_pos_mm.get())
-			self.ankle_hm_preset.set(nm.strip())
-			self._schedule_state_autosave("ankle")
-		except Exception as e:
-			messagebox.showerror("プリセット", f"保存できませんでした:\n{e}", parent=self)
-
-	def _ankle_hm_delete_preset(self) -> None:
-		nm = self.ankle_hm_preset.get()
-		if nm in self._ANKLE_HM_BUILTIN:
-			messagebox.showinfo("プリセット", f"「{nm}」は最初から入っているプリセットなので削除できません。", parent=self)
-			return
-		if not messagebox.askyesno("プリセット", f"プリセット「{nm}」を削除しますか？", parent=self):
-			return
-		user = {k: v for k, v in self._ankle_hm_presets().items() if k not in self._ANKLE_HM_BUILTIN and k != nm}
-		self._ankle_hm_write_user_presets(user)
-		self.ankle_hm_preset.set("デフォルト")
-		self._ankle_hm_preset_cb.configure(values=list(self._ankle_hm_presets().keys()))
-
-	def _ankle_hm_scene_cfg(self) -> dict:
-		"""シーンの heatmap に足す設定（範囲・プリセット・変えたら開いたタブに保存）。"""
-		tabs = getattr(self, "_ankle_tabs", None) or []
-		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
-		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
-		try:
-			neg = abs(float(self.ankle_hm_neg_mm.get()))
-			pos = abs(float(self.ankle_hm_pos_mm.get()))
-		except Exception:
-			neg, pos = 2.0, 2.0
-
-		def _on_change(lo, hi):
-			# 開いたときのタブに書く（別のタブに切り替えていても元のタブへ）
-			if tab_ref is None:
-				return
-			if tab_ref is self._ankle_active_tab_dict():
-				self.ankle_hm_neg_mm.set(abs(lo))
-				self.ankle_hm_pos_mm.set(abs(hi))
-			else:
-				sn = tab_ref.setdefault("snapshot", {})
-				sn["ankle_hm_neg_mm"] = abs(lo)
-				sn["ankle_hm_pos_mm"] = abs(hi)
-			self._schedule_state_autosave("ankle")
-
-		return {"clim": (-max(neg, 0.01), pos), "editable": True, "on_range_change": _on_change,
-		        "presets": self._ankle_hm_presets, "save_preset": self._ankle_hm_save_preset}
-
 	def _ankle_marker_true_mm(self) -> float:
 		"""実寸（ノギス）。印刷・自動キャリブ（スキャン上のマーカー）・キャリブの記録に使う。"""
 		try:
@@ -12646,8 +11863,7 @@ class MainMenuGUI(_BaseWindow):
 				print(f"[sim engine] 参考メッシュ表示失敗: {e}")
 
 		# --- 2. 骨アクター ---
-		hm_cmap = self._sim_view_heatmap_cmap(clim_lo, clim_hi)
-		hm_range = [float(clim_lo), float(clim_hi)]
+		hm_cmap = self._sim_view_heatmap_cmap()
 		actors = []            # index を bones と揃える
 		first_T_inv = []
 		bar_shown = [False]
@@ -12910,53 +12126,6 @@ class MainMenuGUI(_BaseWindow):
 			except Exception:
 				pass
 
-		# --- 5a. ヒートマップの範囲を表示中に変える (scene["heatmap"]["editable"] のときだけ。ankle) ---
-		hm_range_cb = None
-		if heatmap_enabled and hm.get("editable"):
-			def _hm_set_range(lo, hi):
-				"""色の範囲を変える。距離は計算済みなので、色を塗り直すだけ。"""
-				lo = -abs(float(lo))
-				hi = abs(float(hi))
-				if lo >= 0.0:
-					lo = -0.01
-				cm = self._sim_view_heatmap_cmap(lo, hi)
-				first = None
-				for bi, b in enumerate(bones):
-					if b.get("scalars") is None or bi >= len(actors) or actors[bi] is None:
-						continue
-					try:
-						lut = pv.LookupTable(cmap=cm, n_values=256, scalar_range=(lo, hi))
-						r, g, bl = self._sim_hex_to_rgb01(b.get("color", "#DEB887"))
-						lut.above_range_color = (r, g, bl, 1.0)
-						lut.below_range_color = (0.5, 0.0, 0.0, 1.0)
-						actors[bi].mapper.lookup_table = lut
-						actors[bi].mapper.scalar_range = (lo, hi)
-						if first is None:
-							first = actors[bi]
-					except Exception as e:
-						print(f"[sim engine] ヒートマップの範囲の変更に失敗: {e}")
-				hm_range[0], hm_range[1] = lo, hi
-				try:
-					if first is not None:
-						anim_plotter.remove_scalar_bar()
-						anim_plotter.add_scalar_bar(title=hm.get("title", "distance [mm]"), mapper=first.mapper,
-						                            color='black')
-				except Exception as e:
-					print(f"[sim engine] 色の帯の更新に失敗: {e}")
-				try:
-					anim_plotter.render()
-				except Exception:
-					pass
-				fn = hm.get("on_range_change")
-				if callable(fn):
-					try:
-						fn(lo, hi)
-					except Exception as e:
-						print(f"[sim engine] 範囲の保存に失敗: {e}")
-
-			hm_range_cb = {"get": lambda: (hm_range[0], hm_range[1]), "apply": _hm_set_range,
-			               "presets": hm.get("presets"), "save_preset": hm.get("save_preset")}
-
 		# --- 5b. 骨の色・透明度 (scene に "bone_style" があるときだけ。hip/knee は渡さない) ---
 		bone_style_cb = None
 		if scene.get("bone_style") is not None:
@@ -13033,8 +12202,6 @@ class MainMenuGUI(_BaseWindow):
 				'on_ligaments': ((lambda: lig_ctx[0]["open"]() if lig_ctx[0] is not None else None)
 				                 if scene.get("ligaments") is not None else None),
 				'bone_style': bone_style_cb,
-				'heatmap_range': hm_range_cb,
-				'extra_buttons': scene.get("panel_buttons"),
 			},
 			features=features)
 		try:
@@ -13231,13 +12398,6 @@ class MainMenuGUI(_BaseWindow):
 					float(a[:, 4].min()), float(a[:, 5].max())])
 		except Exception as e:
 			print(f"[sim engine] カメラフィット失敗: {e}")
-		# 最初の視点をシーン側で決める（ankle の方眼紙: 方眼紙に正対する）
-		try:
-			_iv = scene.get("initial_view")
-			if callable(_iv):
-				_iv(anim_plotter)
-		except Exception as e:
-			print(f"[sim engine] 最初の視点の設定に失敗: {e}")
 
 		try:
 			anim_plotter.iren.add_observer('ExitEvent', lambda obj, ev: _cb_close())
@@ -13887,32 +13047,15 @@ class MainMenuGUI(_BaseWindow):
 		self._sim_engine_run(scene)
 
 	@staticmethod
-	def _sim_view_heatmap_cmap(lo: float = -10.0, hi: float = 0.0):
-		"""接触ヒートマップの共通カラーマップ。hip と揃える。
-
-		範囲 [lo, hi] (lo < 0 <= hi) を  lo=濃い赤 → lo/2=橙 → 0=緑 → hi=青  に塗る。
-		hi = 0 のときは従来どおり (-10mm=赤 → 0mm=緑)。hip / knee は引数なしで呼ぶので変わらない。
-		"""
+	def _sim_view_heatmap_cmap():
+		"""接触ヒートマップの共通カラーマップ (-10mm=赤 → 0mm=緑)。hip と揃える。"""
 		try:
 			from matplotlib.colors import LinearSegmentedColormap
-			lo = float(lo)
-			hi = float(hi)
-			if not (lo < 0.0):
-				lo = -1e-3
-			if hi <= 1e-9:
-				return LinearSegmentedColormap.from_list(
-					'contact_pen',
-					[(0.0, (0.75, 0.0, 0.0)),
-					 (0.5, (1.0, 0.6, 0.0)),
-					 (1.0, (0.1, 0.75, 0.1))])
-			z0 = (0.0 - lo) / (hi - lo)              # 0mm の位置 (0〜1)
 			return LinearSegmentedColormap.from_list(
-				'contact_pen_signed',
+				'contact_pen',
 				[(0.0, (0.75, 0.0, 0.0)),
-				 (z0 * 0.5, (1.0, 0.6, 0.0)),
-				 (z0, (0.1, 0.75, 0.1)),
-				 (z0 + (1.0 - z0) * 0.5, (0.2, 0.75, 0.85)),
-				 (1.0, (0.15, 0.3, 0.95))])
+				 (0.5, (1.0, 0.6, 0.0)),
+				 (1.0, (0.1, 0.75, 0.1))])
 		except Exception:
 			return 'RdYlGn'
 
@@ -14082,18 +13225,14 @@ class MainMenuGUI(_BaseWindow):
 				if cancel_var.get():
 					return []
 				# ペア (i, j) の transform_data を構築
-				# 【2026-10-09 修正】_precompute_heatmaps_o3d は渡された matrix の「逆行列」で
-				# 点を動かす（hip/knee の「遠位の骨が matrix だけ動いた」という約束）。
-				# 骨 i の点を骨 j のローカル系へ移すには inv(Ts_j) @ Ts_i が要るので、
-				# その逆 = inv(Ts_i) @ Ts_j を渡す。以前は inv(Ts_j) @ Ts_i をそのまま渡しており、
-				# 逆向きの位置関係で距離を測っていた（ブタ膝で最小距離 +40mm、正しくは +0.8mm）。
+				#   Trel_ij[t] = inv(Ts_j[t]) @ Ts_i[t] (骨 j ローカル系から見た骨 i の姿勢)
 				transform_data_pair = []
 				for t in range(N):
 					try:
-						Ti_inv = np.linalg.inv(Ts_i[t])
+						Tj_inv = np.linalg.inv(Ts_j[t])
 					except np.linalg.LinAlgError:
-						Ti_inv = np.eye(4)
-					transform_data_pair.append({'matrix': Ti_inv @ Ts_j[t]})
+						Tj_inv = np.eye(4)
+					transform_data_pair.append({'matrix': Tj_inv @ Ts_i[t]})
 
 				# ペア進捗ラップ (全ペア中の進捗を通算)
 				def _pair_progress(cur, tot, msg, _pi=pair_count, _np=n_pairs, _ni=name_i, _nj=name_j):
@@ -15174,74 +14313,6 @@ class MainMenuGUI(_BaseWindow):
 			style_frame.columnconfigure(3, weight=1)
 			building[0] = False
 
-		# 追加のボタン (呼び出し側が extra_buttons を渡したときだけ。ankle の方眼紙・移動量)
-		_xb = [b for b in (callbacks.get('extra_buttons') or []) if b and callable(b[1])]
-		if _xb:
-			xb_frame = ttk.Frame(control_window)
-			xb_frame.pack(pady=(0, 6))
-			for _txt, _fn in _xb:
-				ttk.Button(xb_frame, text=str(_txt), command=_fn).pack(side=tk.LEFT, padx=4)
-			try:
-				_panel_h += 40
-				control_window.geometry(f"850x{_panel_h}")
-			except Exception:
-				pass
-
-		# ヒートマップの範囲 (呼び出し側が heatmap_range を渡したときだけ。ankle)
-		_hr = callbacks.get('heatmap_range')
-		if _hr and callable(_hr.get('apply')):
-			hr_frame = ttk.LabelFrame(control_window, text="ヒートマップの範囲（変えるとすぐ塗り直します。計算し直しは不要）")
-			hr_frame.pack(pady=(2, 8), padx=10, fill=tk.X)
-			lo0, hi0 = _hr['get']()
-			v_neg = tk.StringVar(control_window, value=f"{abs(lo0):g}")
-			v_pos = tk.StringVar(control_window, value=f"{abs(hi0):g}")
-			ttk.Label(hr_frame, text="めり込み側（−）").pack(side=tk.LEFT, padx=(8, 2))
-			ttk.Entry(hr_frame, textvariable=v_neg, width=6).pack(side=tk.LEFT)
-			ttk.Label(hr_frame, text="mm　離れ側（＋）").pack(side=tk.LEFT, padx=(4, 2))
-			ttk.Entry(hr_frame, textvariable=v_pos, width=6).pack(side=tk.LEFT)
-			ttk.Label(hr_frame, text="mm").pack(side=tk.LEFT, padx=(2, 8))
-
-			def _apply_range(*_):
-				try:
-					a, b = float(v_neg.get()), float(v_pos.get())
-				except ValueError:
-					return
-				_hr['apply'](-abs(a), abs(b))
-			ttk.Button(hr_frame, text="適用", width=6, command=_apply_range).pack(side=tk.LEFT)
-			_pfn = _hr.get('presets')
-			if callable(_pfn):
-				v_pre = tk.StringVar(control_window, value="")
-				cb_pre = ttk.Combobox(hr_frame, textvariable=v_pre, width=16, state="readonly",
-				                      values=list(_pfn().keys()))
-				ttk.Label(hr_frame, text="　プリセット").pack(side=tk.LEFT, padx=(8, 2))
-				cb_pre.pack(side=tk.LEFT)
-
-				def _on_pre(*_):
-					p = _pfn().get(v_pre.get())
-					if p:
-						v_neg.set(f"{abs(float(p['neg'])):g}")
-						v_pos.set(f"{abs(float(p['pos'])):g}")
-						_apply_range()
-				cb_pre.bind("<<ComboboxSelected>>", _on_pre)
-				_sv = _hr.get('save_preset')
-				if callable(_sv):
-					def _save_pre():
-						from tkinter import simpledialog
-						nm = simpledialog.askstring("プリセットとして保存", "プリセットの名前:", parent=control_window)
-						if not nm:
-							return
-						try:
-							_sv(nm.strip(), abs(float(v_neg.get())), abs(float(v_pos.get())))
-							cb_pre.configure(values=list(_pfn().keys()))
-							v_pre.set(nm.strip())
-						except Exception as e:
-							messagebox.showerror("プリセット", f"保存できませんでした:\n{e}", parent=control_window)
-					ttk.Button(hr_frame, text="保存…", width=6, command=_save_pre).pack(side=tk.LEFT, padx=(4, 0))
-			try:
-				control_window.geometry(f"850x{_panel_h + 60}")
-			except Exception:
-				pass
-
 		def _on_close():
 			cb = callbacks.get('on_close')
 			if cb is not None:
@@ -15885,7 +14956,7 @@ class MainMenuGUI(_BaseWindow):
 	# 鍵 = 計算に実際に入る中身（各骨の元メッシュと、骨固定前の全フレームの姿勢）と簡略化の点数。
 	# キャリブ・④の検出・平滑化・骨リストのどれが変わっても鍵が変わるので、古い結果は使われない。
 	# 値は 0.01 mm 刻みの int16（±300 mm で打ち切り）。表示（-10〜0 mm の色・最小距離）には影響しない。
-	_ANKLE_HM_VERSION = "hm2"   # hm2: 2026-10-09 距離の向きの不具合を修正（hm1 の保存結果は使わない）
+	_ANKLE_HM_VERSION = "hm1"
 
 	def _ankle_heatmap_dir(self):
 		d = Path(__file__).parent / "cache" / "ankle_heatmap"
@@ -16693,53 +15764,16 @@ class MainMenuGUI(_BaseWindow):
 			"window_title": (f"ankle: {_tn}" if _tn else "ankle: シミュレーション"),
 			"bones": scene_bones,
 			"frame_times": frame_times,
-			"heatmap": {"enabled": heatmap_enabled, **self._ankle_hm_scene_cfg(),
+			"heatmap": {"enabled": heatmap_enabled, "clim": (-10.0, 0.0),
 			             "title": "distance [mm]"},
 			"background_meshes": background,
 			"overlay_text": _overlay,
-			"extra_actors": None,      # 下で、マーカー軸と方眼紙をまとめて入れる
+			"extra_actors": _make_marker_actors,
 			"on_csv_export": (_cb_csv_export if heatmap_enabled else None),
 			"features": {"csv": heatmap_enabled, "export_model": True, "screenshot": True},
 			"ligaments": self._ankle_ligament_scene_cfg(scene_bones),
 			"bone_style": self._ankle_bone_style_cfg(scene_bones),
 		}
-		# 追加描画: マーカー軸 + 方眼紙・移動量（どちらも毎コマ更新する）
-		_grid_make = None
-		try:
-			_grid_make = self._ankle_grid_extra(scene_bones, scene)
-		except Exception as e:
-			print(f"[方眼紙] 準備に失敗: {e}")
-			traceback.print_exc()
-
-		_log_make = None
-		try:
-			_log_make = self._ankle_robot_log_extra(scene_bones, scene)
-		except Exception as e:
-			print(f"[datalog] 準備に失敗: {e}")
-			traceback.print_exc()
-
-		def _extra_all(plotter):
-			ups = []
-			for mk in (_make_marker_actors, _grid_make, _log_make):
-				if mk is None:
-					continue
-				try:
-					u = mk(plotter)
-					if callable(u):
-						ups.append(u)
-				except Exception as e:
-					print(f"[ankle animate] 追加描画の準備に失敗: {e}")
-			if not ups:
-				return None
-
-			def _upd(fi):
-				for u in ups:
-					try:
-						u(fi)
-					except Exception:
-						pass
-			return _upd
-		scene["extra_actors"] = _extra_all
 		self._sim_engine_run(scene)
 
 

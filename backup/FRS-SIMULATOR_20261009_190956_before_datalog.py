@@ -714,12 +714,6 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_grid_size_mm = tk.DoubleVar(value=120.0)
 		self.ankle_disp_show = tk.BooleanVar(value=True)
 		self.ankle_disp_bone = tk.StringVar(value="（自動）")
-		# ロボットの datalog（2026-10-09）
-		self.ankle_robot_log_path = tk.StringVar(value="")
-		self.ankle_robot_log_show = tk.BooleanVar(value=True)
-		self.ankle_robot_log_items = tk.StringVar(value="FE,AP,Fpd")
-		self.ankle_robot_log_offset_s = tk.DoubleVar(value=0.0)    # ロボットの時刻 = 映像の時刻 − これ
-		self.ankle_robot_log_auto = tk.BooleanVar(value=True)       # 開くたびに自動で時刻を合わせる
 		self.ankle_marker_size_auto = tk.BooleanVar(value=True)     # 補正後を自動で更新するか
 		self.ankle_marker_size_note = tk.StringVar(value="")        # 自動の値のメモ（表示用）
 		self.ankle_pose_series_path = tk.StringVar(value="")   # 事前計算済み姿勢時系列(任意, npz/csv)
@@ -3691,34 +3685,6 @@ class MainMenuGUI(_BaseWindow):
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=1, column=0, columnspan=10, sticky="w", pady=(2, 0))
 
-		# ロボットの datalog（2026-10-09）
-		rlg = ttk.Frame(vis_frame)
-		rlg.grid(row=6, column=0, sticky="we", padx=12, pady=(0, 6))
-		ttk.Checkbutton(rlg, text="ロボットの datalog を表示", variable=self.ankle_robot_log_show
-		                ).grid(row=0, column=0, sticky="w")
-		ttk.Entry(rlg, textvariable=self.ankle_robot_log_path, width=60).grid(row=0, column=1, sticky="w", padx=(6, 4))
-		ttk.Button(rlg, text="参照…", command=lambda: self._ankle_choose(
-			self.ankle_robot_log_path, "ロボットの datalog（KKR/CSV）を選択", "robotlog")).grid(row=0, column=2, padx=2)
-		ttk.Button(rlg, text="自動で探す", command=self._ankle_robot_log_autofind_ui).grid(row=0, column=3, padx=2)
-		rlg2 = ttk.Frame(vis_frame)
-		rlg2.grid(row=7, column=0, sticky="w", padx=12, pady=(0, 6))
-		ttk.Label(rlg2, text="表示する項目:").grid(row=0, column=0, sticky="w")
-		ttk.Label(rlg2, textvariable=self.ankle_robot_log_items, foreground="#005580").grid(row=0, column=1, sticky="w", padx=(4, 4))
-		ttk.Button(rlg2, text="選ぶ…", command=lambda: self._ankle_robot_log_items_dialog(self)).grid(row=0, column=2, padx=(0, 16))
-		ttk.Label(rlg2, text="時刻のずれ（ロボット = 映像 − ずれ）").grid(row=0, column=3, sticky="w")
-		ttk.Spinbox(rlg2, from_=-600.0, to=600.0, increment=0.05, textvariable=self.ankle_robot_log_offset_s, width=8
-		            ).grid(row=0, column=4, sticky="w", padx=(4, 2))
-		ttk.Label(rlg2, text="秒").grid(row=0, column=5, sticky="w")
-		ttk.Checkbutton(rlg2, text="開くたびに自動で合わせる（回転の動きを重ねる）", variable=self.ankle_robot_log_auto
-		                ).grid(row=0, column=6, sticky="w", padx=(10, 0))
-		ttk.Label(vis_frame,
-		          text=("※ 可視化ウィンドウの右側に、選んだ項目のグラフと、いまの時刻の赤い線を出します。"
-		                "自動で合わせるときは、③で固定した骨に対する測る骨の回転の量と、ロボットの FE/VV/IE の回転の量の"
-		                "時間変化を重ねてずれを決めます（一致の度合いはコンソールに出ます）。"
-		                "ロボットの変位（ML/AP/PD）は治具・ポッティングのたわみを含むので、骨の動きは方眼紙と移動量で見てください。"),
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
-		          ).grid(row=8, column=0, sticky="w", padx=12, pady=(0, 6))
-
 		opt2 = ttk.Frame(vis_frame)
 		opt2.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
 		ttk.Checkbutton(opt2, text="🔧 診断モード: 骨重心をマーカー位置に強制配置 (通常はOFF)",
@@ -3814,8 +3780,6 @@ class MainMenuGUI(_BaseWindow):
 			ft = [("カメラパラメータ", "*.json *.yaml *.yml"), ("すべてのファイル", "*.*")]
 		elif kind == "pose":
 			ft = [("姿勢時系列", "*.npz *.csv *.json"), ("すべてのファイル", "*.*")]
-		elif kind == "robotlog":
-			ft = [("ロボットの datalog", "*.KKR *.kkr *.csv"), ("すべてのファイル", "*.*")]
 		else:
 			ft = [("すべてのファイル", "*.*")]
 		path = filedialog.askopenfilename(title=title, filetypes=ft)
@@ -4191,11 +4155,6 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_grid_size_mm": (self.ankle_grid_size_mm, float),
 			"ankle_disp_show": (self.ankle_disp_show, bool),
 			"ankle_disp_bone": (self.ankle_disp_bone, str),
-			"ankle_robot_log_path": (self.ankle_robot_log_path, str),
-			"ankle_robot_log_show": (self.ankle_robot_log_show, bool),
-			"ankle_robot_log_items": (self.ankle_robot_log_items, str),
-			"ankle_robot_log_offset_s": (self.ankle_robot_log_offset_s, float),
-			"ankle_robot_log_auto": (self.ankle_robot_log_auto, bool),
 			"ankle_pose_series": (self.ankle_pose_series_path, str),
 			"ankle_heatmap_prox": (self.ankle_heatmap_prox_var, str),
 			"ankle_heatmap_dist": (self.ankle_heatmap_dist_var, str),
@@ -10167,293 +10126,6 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(win, text="閉じる", command=win.destroy).pack(pady=6)
 		show_est()
 
-	# ---- ロボットの datalog（2026-10-09） ----
-	# FRS-2015 の KKR / CSV: cp932 のテキスト。"Time," で始まる行が見出し、その下が数値（行末にカンマ）。
-	# 見出しより上に "Start Time,YYYY/MM/DD HH:MM"（分まで）。関節座標の列 FE/ML/VV/AP/IE/PD と、
-	# 力・モーメント Mfe/Fml/Mvv/Fap/Mie/Fpd を表示に使う。
-	_ANKLE_LOG_ITEMS = [("FE", "FE [deg]"), ("ML", "ML [mm]"), ("VV", "VV [deg]"), ("AP", "AP [mm]"),
-	                    ("IE", "IE [deg]"), ("PD", "PD [mm]"), ("Mfe", "Mfe"), ("Fml", "Fml [N]"),
-	                    ("Mvv", "Mvv"), ("Fap", "Fap [N]"), ("Mie", "Mie"), ("Fpd", "Fpd [N]")]
-
-	def _ankle_robot_log_load(self, path: str) -> dict:
-		"""datalog を読む。{"cols": {名前: ndarray}, "t": 先頭0秒の時刻, "start": datetime or None}。"""
-		import io as _io
-		import os as _os
-		import datetime as _dt
-		import numpy as np
-		key = (str(path), _os.path.getmtime(path))
-		memo = getattr(self, "_ankle_robot_log_memo", None)
-		if memo is None:
-			memo = self._ankle_robot_log_memo = {}
-		if key in memo:
-			return memo[key]
-		raw = open(path, "rb").read()
-		for enc in ("cp932", "utf-8-sig", "utf-8"):
-			try:
-				text = raw.decode(enc)
-				break
-			except Exception:
-				continue
-		lines = text.splitlines()
-		h = next((i for i, l in enumerate(lines) if l.startswith("Time,")), None)
-		if h is None:
-			raise ValueError("見出しの行（Time, ...）が見つかりません")
-		start = None
-		for l in lines[:h]:
-			if l.startswith("Start Time"):
-				try:
-					start = _dt.datetime.strptime(l.split(",", 1)[1].strip(), "%Y/%m/%d %H:%M")
-				except Exception:
-					start = None
-		cols = [c.strip() for c in lines[h].split(",")]
-		n = len(cols)
-		rows = []
-		for l in lines[h + 1:]:
-			p = l.split(",")
-			if len(p) < n - 2:
-				continue
-			try:
-				rows.append([float(x) if x.strip() else np.nan for x in p[:n]] + [np.nan] * (n - min(len(p), n)))
-			except ValueError:
-				continue
-		if not rows:
-			raise ValueError("数値の行がありません")
-		a = np.asarray(rows, dtype=float)
-		data = {c: a[:, i] for i, c in enumerate(cols) if c}
-		ok = np.isfinite(data["Time"])
-		for c in ("FE", "VV", "IE"):
-			if c in data:
-				ok &= np.isfinite(data[c])
-		data = {c: v[ok] for c, v in data.items()}
-		t = data["Time"] - data["Time"][0]
-		out = {"cols": data, "t": t, "start": start, "path": str(path)}
-		memo[key] = out
-		return out
-
-	def _ankle_robot_log_find(self, src: str):
-		"""録画（ankle_d405_YYYYMMDD_HHMMSS.db3）の時刻に合う datalog を、近くのフォルダから探す。"""
-		import re as _re
-		import datetime as _dt
-		import os as _os
-		if not src:
-			return None
-		sp = Path(src)
-		m = _re.search(r"(\d{8})_(\d{6})", sp.name)
-		if not m:
-			return None
-		rec_start = _dt.datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-		try:
-			rec_end = _dt.datetime.fromtimestamp(_os.path.getmtime(src))
-		except Exception:
-			rec_end = rec_start
-		dirs = []
-		for d in (sp.parent, sp.parent.parent, sp.parent.parent.parent):
-			for dd in (d, d / "datalog"):
-				if dd.is_dir() and dd not in dirs:
-					dirs.append(dd)
-		best = None
-		for d in dirs:
-			for f in list(d.glob("*.KKR")) + list(d.glob("*.kkr")) + list(d.glob("*.csv")):
-				try:
-					head = open(f, "rb").read(600).decode("cp932", errors="replace")
-					if "Title," not in head or "Start Time" not in head:
-						continue
-					st = None
-					for l in head.splitlines():
-						if l.startswith("Start Time"):
-							st = _dt.datetime.strptime(l.split(",", 1)[1].strip(), "%Y/%m/%d %H:%M")
-					if st is None:
-						continue
-					end = _dt.datetime.fromtimestamp(_os.path.getmtime(f))
-					score = abs((st - rec_start).total_seconds()) + abs((end - rec_end).total_seconds())
-					if best is None or score < best[0]:
-						best = (score, str(f))
-				except Exception:
-					continue
-		if best is None or best[0] > 900:
-			return None
-		return best[1]
-
-	def _ankle_robot_log_autofind_ui(self) -> None:
-		cache = self._ankle_get_current_cache()
-		src = str((cache or {}).get("source", "") or self.ankle_depth_path.get().strip())
-		f = self._ankle_robot_log_find(src)
-		if not f:
-			messagebox.showinfo("ロボットの datalog", "録画の時刻に合う datalog が見つかりませんでした。\n"
-			                    "「参照…」で選んでください。", parent=self)
-			return
-		self.ankle_robot_log_path.set(f)
-		self._schedule_state_autosave("ankle")
-		messagebox.showinfo("ロボットの datalog", f"見つかりました:\n{f}", parent=self)
-
-	def _ankle_robot_log_items_dialog(self, parent, on_done=None) -> None:
-		cur = [x.strip() for x in str(self.ankle_robot_log_items.get()).split(",") if x.strip()]
-		win = tk.Toplevel(parent)
-		win.title("datalog の項目")
-		win.transient(parent)
-		vs = []
-		ttk.Label(win, text="表示する項目（6つくらいまでが見やすいです）").grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 4))
-		for k, (key, lab) in enumerate(self._ANKLE_LOG_ITEMS):
-			v = tk.BooleanVar(win, value=key in cur)
-			ttk.Checkbutton(win, text=lab, variable=v).grid(row=1 + k // 6, column=k % 6, sticky="w", padx=8, pady=2)
-			vs.append((key, v))
-
-		def ok():
-			sel = [k for k, v in vs if v.get()]
-			self.ankle_robot_log_items.set(",".join(sel))
-			self._schedule_state_autosave("ankle")
-			win.destroy()
-			if callable(on_done):
-				on_done(sel)
-		ttk.Button(win, text="決定", command=ok).grid(row=4, column=0, columnspan=6, pady=8)
-
-	@staticmethod
-	def _ankle_robot_rotations(cols):
-		"""ロボットの関節座標の回転 Rz(FE)·Rx(VV)·Ry(IE)（FRS の膝関節座標系の順）。"""
-		from scipy.spatial.transform import Rotation as _R
-		import numpy as np
-		return _R.from_euler('ZXY', np.c_[cols["FE"], cols["VV"], cols["IE"]], degrees=True)
-
-	def _ankle_robot_log_sync(self, log: dict, Tm, frame_times):
-		"""映像（固定した骨に対する測る骨）とロボットの回転の量の時間変化を重ね、ずれ（秒）を求める。
-
-		返り値: (ずれ, 一致の RMS [deg]) 。ロボットの時刻 = 映像の時刻 − ずれ。
-		2026-10-09 にブタ膝で確認: 一致 0.3°、ずれ 2.75 s / 12.4 s。
-		"""
-		import numpy as np
-		from scipy.spatial.transform import Rotation as _R
-		from scipy.ndimage import median_filter
-		tv = np.asarray(frame_times, dtype=float)
-		Rv = _R.from_matrix(np.asarray(Tm, dtype=float)[:, :3, :3])
-		av = np.degrees((Rv * Rv[0].inv()).magnitude())
-		rr = self._ankle_robot_rotations(log["cols"])
-		ar = np.degrees((rr * rr[0].inv()).magnitude())
-		tr = log["t"]
-		grid = np.arange(0.0, tv[-1], 0.05)
-		avg = np.interp(grid, tv, median_filter(av, 9))
-		best = None
-		for off in np.arange(-120.0, 120.0, 0.05):
-			g2 = grid - off
-			m = (g2 >= 0) & (g2 <= tr[-1])
-			if m.sum() < len(grid) * 0.5:
-				continue
-			e = float(np.sqrt(np.mean((avg[m] - np.interp(g2[m], tr, ar)) ** 2)))
-			if best is None or e < best[1]:
-				best = (float(off), e)
-		if best is None:
-			raise ValueError("映像とログの重なりが短すぎます")
-		return best
-
-	def _ankle_robot_log_extra(self, scene_bones, scene: dict):
-		"""datalog のグラフ（engine の extra_actors に渡す関数）を返す。使わないときは None。"""
-		import numpy as np
-		try:
-			if not bool(self.ankle_robot_log_show.get()):
-				return None
-			path = self.ankle_robot_log_path.get().strip()
-		except Exception:
-			return None
-		if not path:
-			return None
-		if not Path(path).exists():
-			print(f"[datalog] 見つかりません: {path}")
-			return None
-		try:
-			log = self._ankle_robot_log_load(path)
-		except Exception as e:
-			print(f"[datalog] 読み込みに失敗: {e}")
-			return None
-		times = list(scene.get("frame_times") or [])
-		if not times:
-			return None
-		# 時刻合わせ
-		off = float(self.ankle_robot_log_offset_s.get())
-		if bool(self.ankle_robot_log_auto.get()):
-			fixed_si = next((si for si, b in enumerate(scene_bones)
-			                 if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), None)
-			cand = [si for si in range(len(scene_bones)) if si != fixed_si]
-			want = str(self.ankle_disp_bone.get() or "")
-			msi = next((si for si in cand if str(scene_bones[si].get("name", "")) == want), None)
-			if msi is None and cand:
-				msi = next((si for si in cand if "脛骨" in str(scene_bones[si].get("name", ""))), cand[0])
-			if fixed_si is not None and msi is not None:
-				try:
-					off, rms = self._ankle_robot_log_sync(log, scene_bones[msi]["poses"], times)
-					self.ankle_robot_log_offset_s.set(round(off, 2))
-					self._schedule_state_autosave("ankle")
-					print(f"[datalog] 時刻を自動で合わせました: ロボット = 映像 − {off:.2f} 秒（回転の一致 RMS {rms:.2f}°）"
-					      + ("  ※ 一致が悪いので、⑤の「時刻のずれ」を確かめてください" if rms > 2.0 else ""))
-				except Exception as e:
-					print(f"[datalog] 自動の時刻合わせに失敗（⑤の値 {off:.2f} 秒を使います）: {e}")
-			else:
-				print("[datalog] ③で固定した骨が無いので自動の時刻合わせはしません（⑤の値を使います）")
-		items = [x.strip() for x in str(self.ankle_robot_log_items.get()).split(",") if x.strip()]
-		labels = dict(self._ANKLE_LOG_ITEMS)
-		st = {"charts": [], "plotter": None, "items": items}
-		tx = log["t"] + off                                # 映像の時刻でグラフを描く
-
-		def _build(p):
-			for ch, *_ in st["charts"]:
-				try:
-					p.remove_chart(ch)
-				except Exception:
-					pass
-			st["charts"] = []
-			its = [k for k in st["items"] if k in log["cols"]]
-			if not its:
-				return
-			n = len(its)
-			top = 0.74                                 # 右上の姿勢の文字 (Rx, Ry, …) の下から並べる
-			h = min(0.24, (top - 0.02) / n)
-			for k, key in enumerate(its):
-				y = np.asarray(log["cols"][key], dtype=float)
-				ch = pv.Chart2D(size=(0.33, h - 0.01), loc=(0.66, top - (k + 1) * h),
-				                x_label=("time [s]" if k == n - 1 else ""), y_label=labels.get(key, key))
-				ch.line(tx, y, color="b", width=1.2)
-				lo, hi = float(np.nanmin(y)), float(np.nanmax(y))
-				if hi - lo < 1e-9:
-					lo, hi = lo - 1.0, hi + 1.0
-				cur = ch.line([tx[0], tx[0]], [lo, hi], color="r", width=2)
-				ch.background_color = "white"
-				try:
-					ch.active_background_color = "white"
-					ch.interactive = False
-					ch.x_range = [float(times[0]), float(times[-1])]
-				except Exception:
-					pass
-				p.add_chart(ch)
-				st["charts"].append((ch, cur, lo, hi))
-
-		def _update(fi):
-			if not st["charts"]:
-				return
-			t = float(times[min(int(fi), len(times) - 1)])
-			for ch, cur, lo, hi in st["charts"]:
-				try:
-					cur.update([t, t], [lo, hi])
-				except Exception:
-					pass
-
-		def _make(p):
-			st["plotter"] = p
-			_build(p)
-			return _update
-
-		def _choose():
-			def done(sel):
-				st["items"] = sel
-				if st["plotter"] is not None:
-					_build(st["plotter"])
-					try:
-						st["plotter"].render()
-					except Exception:
-						pass
-			self._ankle_robot_log_items_dialog(self, on_done=done)
-
-		scene.setdefault("panel_buttons", []).append(("datalog の項目…", _choose))
-		print(f"[datalog] {Path(path).name}: {len(log['t'])} 行・{log['t'][-1]:.1f} 秒 / 表示: {', '.join(items)}")
-		return _make
-
 	# ---- 方眼紙と移動量（2026-10-09） ----
 	# 世界座標 = 固定した骨の座標（骨固定のとき、固定した骨は動かない）。方眼紙はそこに置くので、
 	# 固定した骨に対して動かない。移動量は「測る骨の関節面の中心」の動きを方眼紙の向きで測る。
@@ -10538,10 +10210,6 @@ class MainMenuGUI(_BaseWindow):
 			if np.degrees(np.linalg.norm(rv, axis=1)).max() > 3.0:
 				_, _, Vt = np.linalg.svd(rv - rv.mean(axis=0))
 				n_ = Vt[0]
-				# SVD の向きは表裏が決まらないので、いちばん大きい成分が正になる向きにそろえる
-				# （同じ骨モデル・キャリブなら、切除前後などのタブで同じ側を向く）
-				if n_[int(np.argmax(np.abs(n_)))] < 0:
-					n_ = -n_
 			else:
 				n_ = np.array([0.0, 0.0, 1.0])
 			up = ref_L - pm_L.mean(axis=0)                  # 関節面の中心 ← 骨の重心 = 近位向き（脛骨）
@@ -10661,25 +10329,8 @@ class MainMenuGUI(_BaseWindow):
 
 		def _make(plotter):
 			st["plotter"] = plotter
-			st["apply_plane"] = _apply_plane
-			reg = [g for g in getattr(self, "_ankle_grid_states", []) if g.get("plotter") is not None
-			       and not getattr(g["plotter"], "closed", False)]
-			reg.append(st)
-			self._ankle_grid_states = reg
 			_draw()
 			return _update
-
-		def _apply_plane(n_, up_):
-			_set_plane(n_, up_)
-			_draw()
-			_update(st["fi"])
-			if isinstance(tab_ref, dict):
-				tab_ref["grid_plane"] = {"normal": st["n"].tolist(), "up": st["v"].tolist()}
-				self._schedule_state_autosave("ankle")
-			try:
-				st["plotter"].render()
-			except Exception:
-				pass
 
 		def _align_to_view():
 			p = st["plotter"]
@@ -10687,21 +10338,13 @@ class MainMenuGUI(_BaseWindow):
 				return
 			cam = p.renderer.GetActiveCamera()
 			n_ = np.asarray(cam.GetPosition()) - np.asarray(cam.GetFocalPoint())
-			up_ = cam.GetViewUp()
-			_apply_plane(n_, up_)
-			# 比較コントロールで視点を連動しているときは、ほかのウィンドウの方眼紙も同じ向きに
-			try:
-				cst = getattr(self, "_sim_compare_state", None) or {}
-				cw = getattr(self, "_sim_compare_win", None)
-				if cw is not None and cw.winfo_exists() and cst.get("cam_link") is not None and cst["cam_link"].get():
-					linked = [v["plotter"] for v in self._sim_compare_linked()]
-					if p in linked:
-						for g in list(getattr(self, "_ankle_grid_states", [])):
-							gp = g.get("plotter")
-							if g is not st and gp is not None and gp in linked and not getattr(gp, "closed", False):
-								g["apply_plane"](n_, up_)
-			except Exception as e:
-				print(f"[方眼紙] ほかのウィンドウへの反映に失敗: {e}")
+			_set_plane(n_, cam.GetViewUp())
+			_draw()
+			_update(st["fi"])
+			if isinstance(tab_ref, dict):
+				tab_ref["grid_plane"] = {"normal": st["n"].tolist(), "up": st["v"].tolist()}
+				self._schedule_state_autosave("ankle")
+			p.render()
 
 		def _face_grid(p=None):
 			p = p or st["plotter"]
@@ -16711,16 +16354,9 @@ class MainMenuGUI(_BaseWindow):
 			print(f"[方眼紙] 準備に失敗: {e}")
 			traceback.print_exc()
 
-		_log_make = None
-		try:
-			_log_make = self._ankle_robot_log_extra(scene_bones, scene)
-		except Exception as e:
-			print(f"[datalog] 準備に失敗: {e}")
-			traceback.print_exc()
-
 		def _extra_all(plotter):
 			ups = []
-			for mk in (_make_marker_actors, _grid_make, _log_make):
+			for mk in (_make_marker_actors, _grid_make):
 				if mk is None:
 					continue
 				try:
