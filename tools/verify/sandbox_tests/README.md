@@ -35,6 +35,11 @@ cd "$SB"
 | `test_share_relink.py relink` | パスの付け替え（テスト用フォルダを作って移動 → 探す → 付け替え）|
 | `test_share_relink.py realdata` | 実際のタブで、見つからないパスがいくつ見つかるか（書き換えはしない）|
 | `test_share_relink.py guide` | キャリブのガイド（図の 1左上〜4左下 = ArUco の角0〜3、U で戻す）|
+| `test_multi_viewer.py` | 可視化ウィンドウを複数開いて比較（番号つきの題名・左右に並ぶ・共通の再生/巻き戻し/コマ送り/速度・ずれを保つ・末尾で止まる・視点の連動・連動を外す・閉じる）。合成データで 43 項目 |
+| `test_multi_viewer_real.py <前> <後> [代用モデル]` | 実際の ankle タブ 2 つで同じことを確かめる。見つからないモデルは代用品で読み込む（本番の経路を通すのが目的）|
+| `test_size_rescale.py [redetect]` | ②の実寸を変えると④なしで反映（位置だけ拡縮・保存済みの④は不変）。redetect で④のやり直しと完全一致を確認（録画が必要。④は録画フォルダに debug_frame0 を書くので注意）|
+| `test_depth_size.py` | 深度から実寸を推定（録画を15コマおきに読む・約2分）、接触で確かめる、窓 |
+| `test_true_size.py 1` → `2` | 実寸（ノギス）と補正後（自動/手動）の分離、メモ、自動に戻す、CSV、再起動後の保存（2 は 1 のあとに実行）|
 | `capture_util.py` | 隠れていても撮れる PrintWindow のスクリーンショット |
 
 `PYTHONIOENCODING=utf-8` を付けて実行する。

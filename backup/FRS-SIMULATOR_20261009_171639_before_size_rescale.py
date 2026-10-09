@@ -699,12 +699,7 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_depth_path = tk.StringVar(value="")         # 深度データ(bag/npz/mkv等)
 		self.ankle_camera_intrinsics_path = tk.StringVar(value="")  # カメラ内部パラメータ(json/yaml)
 		self.ankle_aruco_dict_var = tk.StringVar(value="DICT_4X4_50")  # ArUco辞書
-		self.ankle_marker_size_mm = tk.DoubleVar(value=20.0)   # マーカー実寸・補正後 (計算に使う値, mm)
-		# 2026-10-09: 実寸を「ノギスで測った値」と「補正後（計算に使う値）」に分けた。
-		# 補正後は、深度から推定した実効的な大きさで自動更新する（手で変えると手動になる）。
-		self.ankle_marker_size_true_mm = tk.DoubleVar(value=20.0)   # 実寸（ノギス, mm）
-		self.ankle_marker_size_auto = tk.BooleanVar(value=True)     # 補正後を自動で更新するか
-		self.ankle_marker_size_note = tk.StringVar(value="")        # 自動の値のメモ（表示用）
+		self.ankle_marker_size_mm = tk.DoubleVar(value=20.0)   # マーカー実寸(mm)
 		self.ankle_pose_series_path = tk.StringVar(value="")   # 事前計算済み姿勢時系列(任意, npz/csv)
 		# RealSense D405 ライブ撮影設定 (友人 make_date_movie_D405.py の設定を既定値化)
 		self.ankle_rs_resolution = tk.StringVar(value="1280x720@15")   # 解像度@fps
@@ -3285,26 +3280,10 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Label(af, text="ArUco辞書:").grid(row=0, column=0, sticky="w")
 		ttk.Combobox(af, textvariable=self.ankle_aruco_dict_var, width=18, state="readonly",
 		             values=list(self._ANKLE_ARUCO_DICT_CHOICES)).grid(row=0, column=1, sticky="w", padx=(4, 12))
-		ttk.Label(af, text="マーカー実寸 ノギス (mm):").grid(row=0, column=2, sticky="w")
-		ttk.Entry(af, textvariable=self.ankle_marker_size_true_mm, width=7).grid(row=0, column=3, sticky="w", padx=(4, 12))
-		ttk.Label(af, text="補正後・計算に使う (mm):").grid(row=0, column=4, sticky="w")
-		_ent_eff = ttk.Entry(af, textvariable=self.ankle_marker_size_mm, width=7)
-		_ent_eff.grid(row=0, column=5, sticky="w", padx=(4, 8))
-		# 補正後を手で書き換えたら手動にする（自動の値はメモに残る）
-		_ent_eff.bind("<KeyRelease>", lambda e: self._ankle_size_mark_manual(e))
-		ttk.Button(af, text="深度から推定…", command=self._ankle_open_size_estimate_dialog
-		           ).grid(row=0, column=6, sticky="w", padx=(0, 12))
-		_note_fr = ttk.Frame(af)
-		_note_fr.grid(row=1, column=4, columnspan=4, sticky="w")
-		self._ankle_size_note_lbl = ttk.Label(_note_fr, textvariable=self.ankle_marker_size_note,
-		                                      foreground="#005580", font=(self.ui_font_family, 9))
-		self._ankle_size_note_lbl.pack(side=tk.LEFT)
-		self._ankle_size_auto_btn = ttk.Button(_note_fr, text="自動に戻す",
-		                                       command=lambda: self._ankle_size_set_auto(True))
+		ttk.Label(af, text="マーカー実寸 (mm):").grid(row=0, column=2, sticky="w")
+		ttk.Entry(af, textvariable=self.ankle_marker_size_mm, width=8).grid(row=0, column=3, sticky="w", padx=(4, 12))
 		# 実寸を変えたら、③の「キャリブに使った実寸との食い違い」の表示を更新する
 		self.ankle_marker_size_mm.trace_add("write", lambda *_: self._ankle_schedule_calib_size_check())
-		self.ankle_marker_size_true_mm.trace_add("write", lambda *_: self._ankle_schedule_size_refresh())
-		self.ankle_depth_path.trace_add("write", lambda *_: self._ankle_schedule_size_refresh())
 		ttk.Checkbutton(af, text="深度スケールを自動補正",
 		                variable=self.ankle_depth_scale_autofix
 		                ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -3869,7 +3848,7 @@ class MainMenuGUI(_BaseWindow):
 		if not isinstance(b, dict) or b.get("marker_to_bone_T") is None:
 			return ("none", None, None)
 		try:
-			cur = float(self._ankle_marker_true_mm())
+			cur = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			cur = None
 		cs = b.get("marker_to_bone_size_mm")
@@ -3894,10 +3873,6 @@ class MainMenuGUI(_BaseWindow):
 			try:
 				if getattr(self, "_ankle_bones_listbox", None) is not None:
 					self._ankle_refresh_bone_listbox()
-			except Exception:
-				pass
-			try:
-				self._ankle_update_detection_status()   # ④の欄の「実寸」の行
 			except Exception:
 				pass
 		try:
@@ -4082,8 +4057,6 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_camera_intrinsics": (self.ankle_camera_intrinsics_path, str),
 			"ankle_aruco_dict": (self.ankle_aruco_dict_var, str),
 			"ankle_marker_size_mm": (self.ankle_marker_size_mm, float),
-			"ankle_marker_size_true_mm": (self.ankle_marker_size_true_mm, float),
-			"ankle_marker_size_auto": (self.ankle_marker_size_auto, bool),
 			"ankle_pose_series": (self.ankle_pose_series_path, str),
 			"ankle_heatmap_prox": (self.ankle_heatmap_prox_var, str),
 			"ankle_heatmap_dist": (self.ankle_heatmap_dist_var, str),
@@ -4165,16 +4138,6 @@ class MainMenuGUI(_BaseWindow):
 					var.set(str(v))
 			except Exception:
 				pass
-		# 2026-10-09 より前のタブ: 実寸（ノギス）は、それまでの実寸の値。補正後は自動
-		# （深度の推定が無い録画では 補正後 = 実寸 なので、開いただけでは何も変わらない）
-		if "ankle_marker_size_true_mm" not in snap:
-			try:
-				self.ankle_marker_size_true_mm.set(float(snap.get("ankle_marker_size_mm",
-				                                                  self.ankle_marker_size_mm.get())))
-			except Exception:
-				pass
-		if "ankle_marker_size_auto" not in snap:
-			self.ankle_marker_size_auto.set(True)
 		bones = snap.get("_bones", None)
 		# 骨リストを共有しているタブなら、共有の中身を使う
 		_gid = self._ankle_tab_group(self._ankle_active_tab_dict())
@@ -4195,10 +4158,6 @@ class MainMenuGUI(_BaseWindow):
 		if self.ankle_bones and self._ankle_selected_bone >= len(self.ankle_bones):
 			self._ankle_selected_bone = 0
 		self._ankle_refresh_bone_listbox()
-		try:
-			self._ankle_size_refresh_auto()
-		except Exception as e:
-			print(f"[マーカー実寸] 自動の値の更新に失敗: {e}")
 
 	def _ankle_rebuild_tabbar(self) -> None:
 		fr = self._ankle_tabbar_frame
@@ -4988,8 +4947,7 @@ class MainMenuGUI(_BaseWindow):
 			txt = f"解析済み {n}枚・{csize:g}mm"
 			try:
 				if abs(float(row["size"].get()) - csize) > 1e-6:
-					# 可視化・接触は②の実寸に合わせて使うので、④をやり直さなくてよい
-					return txt + "（表示は②の実寸に合わせます）", "#005580"
+					return txt + "（実寸が違う）", "#b35900"
 			except Exception:
 				pass
 			return txt, "#1b5e20"
@@ -5010,25 +4968,13 @@ class MainMenuGUI(_BaseWindow):
 			if not (0.0 < v < 1000.0):
 				return                                  # 入力途中・不正な値は書かない
 			tab = row["tab"]
-			# 2026-10-09: この欄は「実寸（ノギス）」。補正後が自動のタブは、推定が無ければ実寸と同じ値になる。
-			sn = tab.setdefault("snapshot", {})
-			sn["ankle_marker_size_true_mm"] = v
-			auto = bool(sn.get("ankle_marker_size_auto", True))
-			if auto:
-				try:
-					_src = str(sn.get("ankle_depth", "") or sn.get("ankle_video", "") or "")
-					_c = self._ankle_pose_cache.get(str(tab.get("name", ""))) or {}
-					_e = self._ankle_depth_size_get(str(_c.get("source", "") or _src)) or {}
-					sn["ankle_marker_size_mm"] = (round(float(_e["all"]["median"]), 2) if _e.get("all") else v)
-				except Exception:
-					sn["ankle_marker_size_mm"] = v
+			tab.setdefault("snapshot", {})["ankle_marker_size_mm"] = v
 			if tab is self._ankle_active_tab_dict():
 				try:
-					if abs(float(self.ankle_marker_size_true_mm.get()) - v) > 1e-12:
-						self.ankle_marker_size_true_mm.set(v)    # 開いているタブは②の入力欄そのもの
+					if abs(float(self.ankle_marker_size_mm.get()) - v) > 1e-12:
+						self.ankle_marker_size_mm.set(v)    # 開いているタブは②の入力欄そのもの
 				except Exception:
-					self.ankle_marker_size_true_mm.set(v)
-				self._ankle_size_refresh_auto()
+					self.ankle_marker_size_mm.set(v)
 			self._schedule_state_autosave("ankle")
 
 		def recolor(row):
@@ -5271,9 +5217,7 @@ class MainMenuGUI(_BaseWindow):
 				parts = []          # [(処理の名前, 結果dict)]
 				try:
 					self.on_ankle_tab_select(idx)
-					# 欄の値は実寸（ノギス）。補正後は 自動なら深度の推定（無ければ実寸）、手動ならそのまま
-					self.ankle_marker_size_true_mm.set(float(size))
-					self._ankle_size_refresh_auto()
+					self.ankle_marker_size_mm.set(float(size))
 					if do_detect:
 						parts.append(("④検出", self._ankle_detect_markers_impl(
 							batch=True, title_prefix=f"[{k + 1}/{n}] {name} ― ")))
@@ -7347,7 +7291,7 @@ class MainMenuGUI(_BaseWindow):
 		if expected_id < 0:
 			raise ValueError("骨のArUco IDが未設定")
 		try:
-			marker_size_mm = float(self._ankle_marker_true_mm())
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			marker_size_mm = 20.0
 		if marker_size_mm <= 0:
@@ -7748,7 +7692,7 @@ class MainMenuGUI(_BaseWindow):
 		if aid < 0:
 			raise ValueError("骨のArUco IDが未設定")
 		try:
-			marker_mm = float(self._ankle_marker_true_mm())
+			marker_mm = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			marker_mm = 15.0
 		if marker_mm <= 0:
@@ -7864,7 +7808,7 @@ class MainMenuGUI(_BaseWindow):
 		# 保存（使ったマーカー実寸と方式も残す。②と食い違ったら③と可視化の前に知らせる）
 		b["marker_to_bone_T"] = T_list
 		try:
-			b["marker_to_bone_size_mm"] = float(self._ankle_marker_true_mm())
+			b["marker_to_bone_size_mm"] = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			b.pop("marker_to_bone_size_mm", None)
 		b["marker_to_bone_method"] = "auto_v2" if use_v2 else "auto"
@@ -7890,7 +7834,7 @@ class MainMenuGUI(_BaseWindow):
 			# スキャン上の黒枠の実寸 (スケールの取り違えをここで見つけられる)
 			sm = stats.get("scan_marker") or {}
 			try:
-				mk_set = float(self._ankle_marker_true_mm())
+				mk_set = float(self.ankle_marker_size_mm.get())
 			except Exception:
 				mk_set = 0.0
 			if sm.get("mm") and mk_set > 0:
@@ -7941,7 +7885,7 @@ class MainMenuGUI(_BaseWindow):
 		try:
 			calib_path = self._ankle_get_calib_model_path(b)
 			mesh, texture = self._ankle_load_mesh_and_texture(calib_path)
-			marker_size_mm = float(self._ankle_marker_true_mm())
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
 			T_arr = np.asarray(T_list, dtype=float)
 			# 4隅の3D位置を obj_pts + T から生成
 			obj_pts = np.asarray(self._ankle_marker_obj_points(marker_size_mm), dtype=float)
@@ -7973,7 +7917,7 @@ class MainMenuGUI(_BaseWindow):
 				"キャリブ用モデル or 骨モデルが未設定です。③で選択してください。")
 			return
 		try:
-			marker_size_mm = float(self._ankle_marker_true_mm())
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			marker_size_mm = 20.0
 		if marker_size_mm <= 0:
@@ -9008,14 +8952,7 @@ class MainMenuGUI(_BaseWindow):
 			done = len(store.get(int(mid), {}).get("pnp", [])) if store else 0
 			comparing = (cmp_limit > 0 and done < cmp_limit)
 
-			# 深度による実寸の測定（2026-10-09）: 15回に1回は融合を計算して実寸を測る。
-			# 実寸の測定だけを行うとき（_ankle_size_measure_all）は毎回。
-			_sc = getattr(self, "_ankle_size_calls", None)
-			if _sc is None:
-				_sc = self._ankle_size_calls = {}
-			_sc[int(mid)] = _sc.get(int(mid), 0) + 1
-			size_sample = bool(getattr(self, "_ankle_size_measure_all", False)) or (_sc[int(mid)] % 15 == 1)
-			need_fusion = (method == "fusion") or comparing or size_sample
+			need_fusion = (method == "fusion") or comparing
 			need_corners = (method == "depth-corners") or comparing
 
 			T_fuse, ok_fuse, info_fuse = None, False, {}
@@ -9027,17 +8964,6 @@ class MainMenuGUI(_BaseWindow):
 				T_fuse, ok_fuse, info_fuse = self._ankle_pose_from_rgb_depth_fusion(
 					img_pts, obj_pts, depth_arr, K, dist, depth_scale_mm, expand=_expand)
 			use_fusion = (ok_fuse and info_fuse.get("fit_rmse_mm", 999.0) < 3.0)
-			# 深度で測った実寸を貯める（平面がきれいに当たったものだけ）
-			try:
-				_ms = info_fuse.get("measured_marker_mm") if ok_fuse else None
-				if (_ms and float(info_fuse.get("fit_rmse_mm", 999.0)) < 1.0
-				        and float(info_fuse.get("marker_edge_spread_mm", 99.0)) < 1.0):
-					_ss = getattr(self, "_ankle_size_samples", None)
-					if _ss is None:
-						_ss = self._ankle_size_samples = {}
-					_ss.setdefault(int(mid), []).append(float(_ms))
-			except Exception:
-				pass
 
 			T_depth, ok_depth, info_depth = None, False, {}
 			depth_Z_median = 0.0
@@ -9279,8 +9205,6 @@ class MainMenuGUI(_BaseWindow):
 							      f"align.process() が正しく機能していない可能性")
 						# デバッグ画像出力 (color, colored depth) — 日本語パス対応の _ankle_imwrite を使用
 						try:
-							if getattr(self, "_ankle_skip_debug_images", False):
-								raise RuntimeError("__skip__")
 							debug_dir = Path(bag_path).parent / "debug_frame0"
 							debug_dir.mkdir(parents=True, exist_ok=True)
 							saved = []
@@ -9323,10 +9247,7 @@ class MainMenuGUI(_BaseWindow):
 							else:
 								print(f"[深度診断] ⚠️ デバッグ画像を1つも保存できませんでした: {debug_dir}")
 						except Exception as e_img:
-							if str(e_img) == "__skip__":
-								print("[深度診断] 実寸の測定だけなので、診断画像は書きません")
-							else:
-								print(f"[深度診断] デバッグ画像保存失敗: {e_img}")
+							print(f"[深度診断] デバッグ画像保存失敗: {e_img}")
 					except Exception as e:
 						print(f"[深度診断] 診断出力失敗: {e}")
 
@@ -9712,597 +9633,12 @@ class MainMenuGUI(_BaseWindow):
 		else:
 			self._ankle_pose_cache[key] = cache
 
-	# ==================================================================
-	# 深度からマーカー実寸を推定する（2026-10-09）
-	# ==================================================================
-	# 平面マーカーの PnP は実寸に比例して距離がずれる。印刷寸法やカメラの内部パラメータの
-	# わずかなずれ（261007 のブタ膝で約1.5%）でも、骨どうしが 1mm 近く離れて見える。
-	# ④の融合（_ankle_pose_from_rgb_depth_fusion）は、視線と深度の平面の交点から
-	# マーカーの角の3D位置を出すので、その辺の長さ = 深度から見た実寸になる。
-	# これを多数のコマで集め、中央値を②の候補にする。接触は「確かめ」に使う
-	# （軸力のかけ始めなど、どこを接触とみなすかで値が変わるため）。
-	# 結果は④の結果とは別に cache/ankle_depth_size.json（録画ファイル名ごと）へ保存する。
-
-	def _ankle_depth_size_path(self):
-		return Path(__file__).parent / "cache" / "ankle_depth_size.json"
-
-	def _ankle_depth_size_all(self) -> dict:
-		d = getattr(self, "_ankle_depth_size_mem", None)
-		if d is None:
-			d = {}
-			try:
-				p = self._ankle_depth_size_path()
-				if p.exists():
-					with open(p, "r", encoding="utf-8") as f:
-						d = json.load(f) or {}
-			except Exception as e:
-				print(f"[深度による実寸] 読み込みに失敗: {e}")
-				d = {}
-			self._ankle_depth_size_mem = d
-		return d
-
-	def _ankle_depth_size_get(self, source: str):
-		if not source:
-			return None
-		return self._ankle_depth_size_all().get(Path(str(source)).name)
-
-	@staticmethod
-	def _ankle_depth_size_summary(samples: dict) -> dict:
-		import numpy as np
-		out = {"ids": {}}
-		pooled = []
-		for aid, v in (samples or {}).items():
-			a = np.asarray(v, dtype=float)
-			a = a[np.isfinite(a)]
-			if a.size == 0:
-				continue
-			pooled.extend(a.tolist())
-			out["ids"][str(int(aid))] = {"median": float(np.median(a)), "p25": float(np.percentile(a, 25)),
-			                             "p75": float(np.percentile(a, 75)), "n": int(a.size)}
-		if pooled:
-			a = np.asarray(pooled)
-			out["all"] = {"median": float(np.median(a)), "p25": float(np.percentile(a, 25)),
-			              "p75": float(np.percentile(a, 75)), "n": int(a.size)}
-		return out
-
-	def _ankle_depth_size_store(self, source: str, samples: dict):
-		"""深度で測った実寸を保存する（一時ファイル → 差し替え）。測れていなければ何もしない。"""
-		import datetime as _dt
-		import os as _os
-		if not source:
-			return None
-		summ = self._ankle_depth_size_summary(samples)
-		if not summ.get("all"):
-			print("[深度による実寸] 測れたコマがありません（深度が無い・平面が当たらない など）")
-			return None
-		summ["source"] = str(source)
-		summ["time"] = _dt.datetime.now().isoformat(timespec="seconds")
-		d = dict(self._ankle_depth_size_all())
-		d[Path(str(source)).name] = summ
-		p = self._ankle_depth_size_path()
-		p.parent.mkdir(parents=True, exist_ok=True)
-		tmp = p.with_suffix(".json.tmp")
-		with open(tmp, "w", encoding="utf-8") as f:
-			json.dump(d, f, ensure_ascii=False, indent=1)
-		_os.replace(tmp, p)
-		self._ankle_depth_size_mem = d
-		a = summ["all"]
-		print(f"[深度による実寸] {Path(str(source)).name}: {a['median']:.2f} mm "
-		      f"（25〜75% {a['p25']:.2f}〜{a['p75']:.2f}, {a['n']}回） "
-		      + " / ".join(f"ID{k} {v['median']:.2f}" for k, v in sorted(summ['ids'].items(), key=lambda kv: int(kv[0]))))
-		return summ
-
-	def _ankle_depth_size_measure(self, source: str, stride: int = 15):
-		"""録画を間引いて読み、深度で実寸だけを測る。④の結果・録画フォルダには何も書かない。"""
-		ids = set()
-		for b in self.ankle_bones:
-			try:
-				ids.add(int(b.get("aruco_id", -1)))
-			except Exception:
-				pass
-		ids.discard(-1)
-		if not ids:
-			raise RuntimeError("骨リストに ArUco ID がありません")
-		if Path(source).suffix.lower() not in (".db3", ".bag"):
-			raise RuntimeError("深度の入った録画（.db3 / .bag）が必要です")
-		if not Path(source).exists():
-			raise RuntimeError(f"録画が見つかりません: {source}")
-		keep = {k: getattr(self, k, None) for k in ("_ankle_method_compare", "_ankle_pose_source_counts",
-		                                              "_ankle_depth_diag_shown")}
-		self._ankle_size_samples = {}
-		self._ankle_size_calls = {}
-		self._ankle_size_measure_all = True
-		self._ankle_skip_debug_images = True
-		update_cb, close_cb, cancel_cb = self._ankle_open_progress("深度で実寸を測っています（④の結果は変えません）")
-		try:
-			self._ankle_method_compare = {}
-			self._ankle_pose_source_counts = {}
-			self._ankle_depth_diag_shown = set()
-			self._ankle_detect_from_bag(source, str(self.ankle_aruco_dict_var.get()),
-			                            float(self.ankle_marker_size_mm.get()), ids, int(stride),
-			                            update_cb, cancel_cb)
-			if cancel_cb():
-				return None
-			return self._ankle_depth_size_store(source, self._ankle_size_samples)
-		finally:
-			self._ankle_size_measure_all = False
-			self._ankle_skip_debug_images = False
-			for k, v in keep.items():
-				setattr(self, k, v)
-			try:
-				close_cb()
-			except Exception:
-				pass
-
-	def _ankle_contact_check(self, cache, bone_a: dict, bone_b: dict, t0=None, t1=None,
-	                         sizes=None, n_frames: int = 40) -> dict:
-		"""2つの骨の最小すき間（符号付き・めり込みがマイナス）を、指定した区間のコマで測る。
-
-		cache は④の結果そのもの（実寸を合わせる前）。sizes の各実寸で測り、
-		すき間の中央値が 0 になる実寸も求める。
-		"""
-		import numpy as np
-		Pa = np.asarray(cache["bones"][int(bone_a["aruco_id"])]["poses"], dtype=float)
-		Pb = np.asarray(cache["bones"][int(bone_b["aruco_id"])]["poses"], dtype=float)
-		La = np.asarray(bone_a["marker_to_bone_T"], dtype=float)
-		Lb = np.asarray(bone_b["marker_to_bone_T"], dtype=float)
-		base = float(cache.get("marker_size_mm"))
-		ts = np.asarray(cache.get("timestamps", np.arange(len(Pa)) / 30.0), dtype=float)
-		ts = ts - ts[0]
-		ok = (np.all(np.isfinite(Pa.reshape(len(Pa), -1)), axis=1)
-		      & np.all(np.isfinite(Pb.reshape(len(Pb), -1)), axis=1))
-		if t0 is not None:
-			ok &= ts >= float(t0)
-		if t1 is not None:
-			ok &= ts <= float(t1)
-		idx = np.where(ok)[0]
-		if idx.size == 0:
-			raise RuntimeError("その区間に、両方の骨が検出されたコマがありません")
-		idx = idx[np.linspace(0, idx.size - 1, min(int(n_frames), idx.size)).astype(int)]
-		A = pv.read(bone_a["model_path"]).extract_surface(algorithm="dataset_surface").triangulate()
-		ptsB = np.asarray(pv.read(bone_b["model_path"]).points, dtype=float)
-		iLa, iLb = np.linalg.inv(La), np.linalg.inv(Lb)
-
-		def rel(i, k):
-			Ta = Pa[i].copy(); Tb = Pb[i].copy()
-			Ta[:3, 3] *= k; Tb[:3, 3] *= k
-			return np.linalg.inv(Ta @ iLa) @ (Tb @ iLb)
-
-		# 骨 A の近くにある骨 B の点だけを使う（区間の中ほどのコマで 8mm 以内）
-		from scipy.spatial import cKDTree
-		M = rel(idx[len(idx) // 2], 1.0)
-		d0, _ = cKDTree(np.asarray(A.points)).query((M[:3, :3] @ ptsB.T).T + M[:3, 3])
-		near = ptsB[d0 < 8.0]
-		if len(near) == 0:
-			near = ptsB[np.argsort(d0)[:2000]]
-		if len(near) > 3000:
-			near = near[np.random.default_rng(0).choice(len(near), 3000, replace=False)]
-
-		def gaps(size):
-			k = float(size) / base
-			out = []
-			for i in idx:
-				M = rel(i, k)
-				q = pv.PolyData((M[:3, :3] @ near.T).T + M[:3, 3])
-				out.append(float(np.min(q.compute_implicit_distance(A)["implicit_distance"])))
-			return np.asarray(out)
-
-		res = {"frames": int(idx.size), "t0": float(ts[idx[0]]), "t1": float(ts[idx[-1]]), "by_size": {}}
-		for sz in (sizes or []):
-			g = gaps(sz)
-			res["by_size"][float(sz)] = {"median": float(np.median(g)), "p5": float(np.percentile(g, 5)),
-			                             "p95": float(np.percentile(g, 95))}
-		# すき間の中央値が 0 になる実寸（割線法。すき間は実寸にほぼ比例して変わる）
-		try:
-			s0, s1 = base * 0.98, base * 1.0
-			g0, g1 = float(np.median(gaps(s0))), float(np.median(gaps(s1)))
-			for _ in range(4):
-				if abs(g1 - g0) < 1e-9:
-					break
-				s2 = s1 - g1 * (s1 - s0) / (g1 - g0)
-				s2 = float(min(max(s2, base * 0.85), base * 1.15))
-				s0, g0 = s1, g1
-				s1, g1 = s2, float(np.median(gaps(s2)))
-				if abs(g1) < 0.02:
-					break
-			res["zero_size"] = float(s1)
-		except Exception as e:
-			print(f"[接触で確かめる] 0 になる実寸を求められませんでした: {e}")
-		return res
-
-	def _ankle_open_size_estimate_dialog(self) -> None:
-		"""深度から実寸を推定し、②に入れる窓。接触でも確かめられる。"""
-		cache = self._ankle_get_current_cache()
-		cur_tab = self._ankle_active_tab_dict()
-		snap_src = (self.ankle_depth_path.get().strip() or self.ankle_video_path.get().strip())
-		source = str((cache or {}).get("source", "") or snap_src)
-		win = tk.Toplevel(self)
-		win.title("深度からマーカー実寸を推定")
-		win.transient(self)
-		win.geometry("820x760")
-		pad = {"padx": 10, "pady": 4}
-
-		ttk.Label(win, text=("深度カメラで測ったマーカーの大きさの中央値を、②の実寸の候補にします。"
-		                     "PnP の距離は実寸に比例するので、実寸が 1% ずれると骨どうしの位置も約 1% ずれます。"
-		                     "同じ日・同じ標本の試験には、同じ値を入れてください。"),
-		          wraplength=790, justify="left").pack(anchor="w", **pad)
-		ttk.Label(win, text=f"録画: {Path(source).name if source else '（未指定）'}", foreground="#005580"
-		          ).pack(anchor="w", padx=10)
-
-		est_box = ttk.LabelFrame(win, text="深度による推定")
-		est_box.pack(fill=tk.X, **pad)
-		est_var = tk.StringVar(win, value="")
-		ttk.Label(est_box, textvariable=est_var, justify="left", font=("Consolas", 10)).pack(anchor="w", padx=8, pady=4)
-		val_var = tk.StringVar(win, value="")
-
-		def show_est():
-			e = self._ankle_depth_size_get(source)
-			if not e or not e.get("all"):
-				est_var.set("まだ測っていません。下の「録画から測る」を押してください\n"
-				            "（これから④を実行するタブでは、④の中で自動的に測ります）")
-				return
-			lines = []
-			names = {int(b.get("aruco_id", -1)): str(b.get("name", "")) for b in self.ankle_bones}
-			for k, v in sorted(e["ids"].items(), key=lambda kv: int(kv[0])):
-				lines.append(f"  ID{k:>2} {names.get(int(k), ''):<6} {v['median']:6.2f} mm  （25〜75% {v['p25']:.2f}〜{v['p75']:.2f}, {v['n']}回）")
-			a = e["all"]
-			lines.append(f"  全体          {a['median']:6.2f} mm  （25〜75% {a['p25']:.2f}〜{a['p75']:.2f}, {a['n']}回）")
-			lines.append(f"  測った日時: {e.get('time', '')}")
-			meds = [v["median"] for v in e["ids"].values()]
-			if len(meds) >= 2 and max(meds) - min(meds) > 0.3:
-				lines.append("  ※ マーカーごとの差が 0.3mm を超えています。印刷のずれか、深度の当たり方の差です")
-			est_var.set("\n".join(lines))
-			val_var.set(f"{a['median']:.2f}")
-
-		def measure():
-			if not source:
-				messagebox.showwarning("深度から推定", "②に録画が入っていません。", parent=win)
-				return
-			try:
-				r = self._ankle_depth_size_measure(source)
-			except Exception as e:
-				messagebox.showerror("深度から推定", f"測れませんでした:\n{e}", parent=win)
-				return
-			if r is None:
-				messagebox.showinfo("深度から推定", "中止したか、測れたコマがありませんでした。", parent=win)
-			show_est()
-			self._ankle_size_refresh_auto()
-			self._ankle_update_detection_status()
-
-		ttk.Button(est_box, text="録画から測る（15コマおき・1〜3分。④の結果は変えません）", command=measure
-		           ).pack(anchor="w", padx=8, pady=(0, 6))
-
-		# --- 入れる先 ---
-		app_box = ttk.LabelFrame(win, text="②の「補正後」に入れる（同じフォルダのタブを最初から選んでいます。自動のタブは、録画ごとの推定が自動で入ります）")
-		app_box.pack(fill=tk.BOTH, expand=False, **pad)
-		row0 = ttk.Frame(app_box)
-		row0.pack(fill=tk.X, padx=8, pady=4)
-		ttk.Label(row0, text="入れる実寸 (mm):").pack(side=tk.LEFT)
-		ttk.Entry(row0, textvariable=val_var, width=8).pack(side=tk.LEFT, padx=4)
-		lst = tk.Frame(app_box)
-		lst.pack(fill=tk.X, padx=8)
-		cv = tk.Canvas(lst, height=150, highlightthickness=0)
-		sb = ttk.Scrollbar(lst, orient=tk.VERTICAL, command=cv.yview)
-		inner = ttk.Frame(cv)
-		inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-		cv.create_window((0, 0), window=inner, anchor="nw")
-		cv.configure(yscrollcommand=sb.set)
-		cv.pack(side=tk.LEFT, fill=tk.X, expand=True)
-		sb.pack(side=tk.RIGHT, fill=tk.Y)
-		folder = str((cur_tab or {}).get("folder", "") or "")
-		checks = []
-		for t in self._ankle_tabs:
-			same = (t is cur_tab) or (folder and str(t.get("folder", "") or "") == folder)
-			if not same and t is not cur_tab:
-				continue
-			v = tk.BooleanVar(win, value=True)
-			if t is cur_tab:
-				try:
-					sz = float(self.ankle_marker_size_mm.get())
-				except Exception:
-					sz = float("nan")
-			else:
-				sz = float((t.get("snapshot") or {}).get("ankle_marker_size_mm", float("nan")))
-			ttk.Checkbutton(inner, variable=v, text=f"{t.get('name', '')}　（いまの補正後: {sz:g} mm）"
-			                + ("　← 開いているタブ" if t is cur_tab else "")).pack(anchor="w")
-			checks.append((t, v))
-
-		def apply():
-			try:
-				v = float(val_var.get())
-			except Exception:
-				messagebox.showwarning("深度から推定", "実寸の数値を入れてください。", parent=win)
-				return
-			if not (1.0 < v < 500.0):
-				messagebox.showwarning("深度から推定", "実寸の値が大きすぎるか小さすぎます。", parent=win)
-				return
-			n = 0
-			for t, var in checks:
-				if not var.get():
-					continue
-				sn = t.setdefault("snapshot", {})
-				sn["ankle_marker_size_mm"] = v
-				sn["ankle_marker_size_auto"] = False           # 手で決めた値なので手動にする
-				sn.setdefault("ankle_marker_size_true_mm", sn.get("ankle_marker_size_true_mm", v))
-				if t is self._ankle_active_tab_dict():
-					self.ankle_marker_size_auto.set(False)
-					self.ankle_marker_size_mm.set(v)
-				n += 1
-			self._ankle_size_refresh_auto()
-			self._schedule_state_autosave("ankle")
-			self._ankle_update_detection_status()
-			messagebox.showinfo("深度から推定", f"{n} 個のタブの「補正後」に {v:g} mm を入れました（手動）。\n"
-			                    "④をやり直さなくても、可視化に反映されます。\n"
-			                    "各タブで「自動に戻す」を押すと、そのタブの録画の深度の推定に戻ります。", parent=win)
-
-		_bf = ttk.Frame(app_box)
-		_bf.pack(anchor="w", padx=8, pady=6)
-		ttk.Button(_bf, text="チェックしたタブの「補正後」に入れる（手動）", command=apply).pack(side=tk.LEFT)
-		ttk.Button(_bf, text="全タブの実寸の一覧を CSV に書き出す",
-		           command=lambda: self._ankle_size_export_csv(win)).pack(side=tk.LEFT, padx=(8, 0))
-
-		# --- 接触で確かめる ---
-		chk = ttk.LabelFrame(win, text="接触で確かめる（軸力が一定の区間を秒で指定してください）")
-		chk.pack(fill=tk.X, **pad)
-		r1 = ttk.Frame(chk)
-		r1.pack(fill=tk.X, padx=8, pady=4)
-		cal = [b for b in self.ankle_bones if b.get("marker_to_bone_T") is not None and b.get("model_path")]
-		names = [str(b.get("name", "")) for b in cal]
-		va = tk.StringVar(win, value=names[0] if names else "")
-		vb = tk.StringVar(win, value=names[1] if len(names) > 1 else "")
-		ttk.Label(r1, text="骨").pack(side=tk.LEFT)
-		ttk.Combobox(r1, textvariable=va, values=names, width=10, state="readonly").pack(side=tk.LEFT, padx=2)
-		ttk.Label(r1, text="と").pack(side=tk.LEFT)
-		ttk.Combobox(r1, textvariable=vb, values=names, width=10, state="readonly").pack(side=tk.LEFT, padx=2)
-		ttk.Label(r1, text="　区間").pack(side=tk.LEFT)
-		vt0 = tk.StringVar(win, value="")
-		vt1 = tk.StringVar(win, value="")
-		ttk.Entry(r1, textvariable=vt0, width=6).pack(side=tk.LEFT, padx=2)
-		ttk.Label(r1, text="〜").pack(side=tk.LEFT)
-		ttk.Entry(r1, textvariable=vt1, width=6).pack(side=tk.LEFT, padx=2)
-		ttk.Label(r1, text="秒（空欄 = 最初から / 最後まで）").pack(side=tk.LEFT)
-		res_var = tk.StringVar(win, value="")
-		ttk.Label(chk, textvariable=res_var, justify="left", font=("Consolas", 10), wraplength=780
-		          ).pack(anchor="w", padx=8, pady=4)
-
-		def check():
-			if not cache:
-				messagebox.showwarning("接触で確かめる", "④の結果がありません。", parent=win)
-				return
-			if str(self.ankle_workflow_mode.get()) != "self_pose":
-				messagebox.showwarning("接触で確かめる", "キャリブ（マーカー→骨）を使う方式のときだけ使えます。", parent=win)
-				return
-			try:
-				ba = cal[names.index(va.get())]
-				bb = cal[names.index(vb.get())]
-			except Exception:
-				messagebox.showwarning("接触で確かめる", "骨を2つ選んでください。", parent=win)
-				return
-			if ba is bb:
-				messagebox.showwarning("接触で確かめる", "違う骨を2つ選んでください。", parent=win)
-				return
-			try:
-				t0 = float(vt0.get()) if vt0.get().strip() else None
-				t1 = float(vt1.get()) if vt1.get().strip() else None
-			except ValueError:
-				messagebox.showwarning("接触で確かめる", "区間は秒の数値で入れてください。", parent=win)
-				return
-			sizes = []
-			for x in (self.ankle_marker_size_mm.get(), val_var.get(), cache.get("marker_size_mm")):
-				try:
-					x = round(float(x), 3)
-					if x > 0 and x not in sizes:
-						sizes.append(x)
-				except Exception:
-					pass
-			res_var.set("計算しています…（数十秒かかります）")
-			win.update_idletasks()
-			try:
-				r = self._ankle_contact_check(cache, ba, bb, t0, t1, sizes=sizes)
-			except Exception as e:
-				res_var.set(f"計算できませんでした: {e}")
-				return
-			lines = [f"{ba.get('name')} と {bb.get('name')}: {r['t0']:.1f}〜{r['t1']:.1f} 秒の {r['frames']} コマ"
-			         "（最小すき間・マイナスはめり込み）"]
-			for sz, g in r["by_size"].items():
-				lines.append(f"  実寸 {sz:6.2f} mm: 中央値 {g['median']:+.2f} mm（5〜95% {g['p5']:+.2f}〜{g['p95']:+.2f}）")
-			if r.get("zero_size"):
-				lines.append(f"  すき間の中央値が 0 になる実寸: {r['zero_size']:.2f} mm")
-			lines.append("  ※ 軸力で軟骨がつぶれる分、実際には少しめり込むのが自然です。深度の推定と近ければ、その値で問題ありません")
-			res_var.set("\n".join(lines))
-
-		ttk.Button(chk, text="確かめる", command=check).pack(anchor="w", padx=8, pady=(0, 6))
-		ttk.Button(win, text="閉じる", command=win.destroy).pack(pady=6)
-		show_est()
-
-	def _ankle_marker_true_mm(self) -> float:
-		"""実寸（ノギス）。印刷・自動キャリブ（スキャン上のマーカー）・キャリブの記録に使う。"""
-		try:
-			v = float(self.ankle_marker_size_true_mm.get())
-			if v > 0:
-				return v
-		except Exception:
-			pass
-		return float(self.ankle_marker_size_mm.get())
-
-	def _ankle_size_source(self) -> str:
-		cache = self._ankle_get_current_cache()
-		src = str((cache or {}).get("source", "") or "")
-		if not src:
-			try:
-				src = self.ankle_depth_path.get().strip() or self.ankle_video_path.get().strip()
-			except Exception:
-				src = ""
-		return src
-
-	def _ankle_schedule_size_refresh(self) -> None:
-		job = getattr(self, "_ankle_size_refresh_job", None)
-		if job is not None:
-			try:
-				self.after_cancel(job)
-			except Exception:
-				pass
-		try:
-			self._ankle_size_refresh_job = self.after(300, self._ankle_size_refresh_auto)
-		except Exception:
-			self._ankle_size_refresh_job = None
-
-	def _ankle_size_refresh_auto(self) -> None:
-		"""補正後の値を決め直し、メモを更新する。
-
-		自動: 深度の推定があればその中央値、無ければ 実寸（ノギス）。
-		手動: 値はそのまま。自動ならいくつになるかをメモに出す。
-		"""
-		self._ankle_size_refresh_job = None
-		est = None
-		try:
-			e = self._ankle_depth_size_get(self._ankle_size_source())
-			if e and e.get("all"):
-				est = e["all"]
-		except Exception:
-			est = None
-		true_mm = self._ankle_marker_true_mm()
-		auto_val = round(float(est["median"]), 2) if est else round(float(true_mm), 3)
-		if est:
-			est_txt = f"深度の推定 {est['median']:.2f} mm（25〜75% {est['p25']:.2f}〜{est['p75']:.2f}, {est['n']}回）"
-		else:
-			est_txt = "深度の推定なし（④を実行するか「深度から推定…」で測れます）→ 実寸と同じ"
-		if bool(self.ankle_marker_size_auto.get()):
-			try:
-				cur = float(self.ankle_marker_size_mm.get())
-			except Exception:
-				cur = None
-			if cur is None or abs(cur - auto_val) > 1e-9:
-				self.ankle_marker_size_mm.set(auto_val)
-			self.ankle_marker_size_note.set(f"自動: {est_txt}")
-			try:
-				self._ankle_size_auto_btn.pack_forget()
-			except Exception:
-				pass
-		else:
-			self.ankle_marker_size_note.set(f"手動（自動なら {auto_val:g} mm" + ("・深度の推定" if est else "・実寸と同じ") + "）")
-			try:
-				self._ankle_size_auto_btn.pack(side=tk.LEFT, padx=(8, 0))
-			except Exception:
-				pass
-
-	def _ankle_size_mark_manual(self, event=None) -> None:
-		"""補正後の欄を手で書き換えたとき。"""
-		if event is not None and getattr(event, "keysym", "") in ("Tab", "Shift_L", "Shift_R", "Control_L",
-		                                                          "Control_R", "Left", "Right", "Home", "End"):
-			return
-		if bool(self.ankle_marker_size_auto.get()):
-			self.ankle_marker_size_auto.set(False)
-			print("[マーカー実寸] 補正後を手で変えたので「手動」にしました（「自動に戻す」で戻せます）")
-		self._ankle_schedule_size_refresh()
-		self._schedule_state_autosave("ankle")
-
-	def _ankle_size_set_auto(self, on: bool) -> None:
-		self.ankle_marker_size_auto.set(bool(on))
-		self._ankle_size_refresh_auto()
-		self._schedule_state_autosave("ankle")
-
-	def _ankle_size_export_csv(self, parent=None) -> None:
-		"""全タブの 実寸 / 補正後 / 自動か / 深度の推定 を CSV に書き出す。"""
-		import csv
-		fp = filedialog.asksaveasfilename(parent=parent or self, title="マーカー実寸の一覧を保存",
-		                                  defaultextension=".csv", initialfile="marker_size_list.csv",
-		                                  filetypes=[("CSV", "*.csv"), ("すべてのファイル", "*.*")])
-		if not fp:
-			return
-		try:
-			self._ankle_tabs[self._ankle_active_tab]["snapshot"] = self._ankle_snapshot_current()
-		except Exception:
-			pass
-		rows = []
-		for t in self._ankle_tabs:
-			sn = t.get("snapshot") or {}
-			src = str(sn.get("ankle_depth", "") or sn.get("ankle_video", "") or "")
-			cache = self._ankle_pose_cache.get(t.get("name", "")) or {}
-			src = str(cache.get("source", "") or src)
-			e = self._ankle_depth_size_get(src) or {}
-			a = e.get("all") or {}
-			ids = e.get("ids") or {}
-			rows.append([t.get("name", ""), str(t.get("folder", "") or ""), Path(src).name if src else "",
-			             sn.get("ankle_marker_size_true_mm", sn.get("ankle_marker_size_mm", "")),
-			             sn.get("ankle_marker_size_mm", ""),
-			             ("自動" if sn.get("ankle_marker_size_auto", True) else "手動"),
-			             (f"{a['median']:.3f}" if a else ""), (f"{a['p25']:.3f}" if a else ""),
-			             (f"{a['p75']:.3f}" if a else ""), (a.get("n", "") if a else ""),
-			             " / ".join(f"ID{k} {v['median']:.3f}" for k, v in sorted(ids.items(), key=lambda kv: int(kv[0]))),
-			             cache.get("marker_size_mm", ""), e.get("time", "")])
-		with open(fp, "w", newline="", encoding="utf-8-sig") as f:
-			w = csv.writer(f)
-			w.writerow(["タブ", "フォルダ", "録画", "実寸(ノギス)mm", "補正後mm", "補正後の決め方",
-			            "深度の推定 中央値mm", "25%", "75%", "回数", "IDごと", "④を計算した実寸mm", "測った日時"])
-			w.writerows(rows)
-		messagebox.showinfo("マーカー実寸の一覧", f"{len(rows)} 個のタブを書き出しました:\n{fp}", parent=parent or self)
-
-	def _ankle_cache_size_ratio(self, cache) -> tuple:
-		"""(倍率, ④を計算したときの実寸, いまの②の実寸)。どちらかが分からなければ倍率 1。"""
-		try:
-			cur = float(self.ankle_marker_size_mm.get())
-		except Exception:
-			cur = None
-		try:
-			old = float((cache or {}).get("marker_size_mm"))
-		except Exception:
-			old = None
-		if not cur or not old or cur <= 0 or old <= 0:
-			return 1.0, old, cur
-		return cur / old, old, cur
-
-	def _ankle_cache_for_current_size(self, cache):
-		"""④の結果を、いまの②の実寸に合わせた写しにして返す（保存してある④の結果は変えない）。
-
-		平面マーカーの PnP では、実寸を k 倍すると 位置（並進）だけが k 倍になり、向きは変わらない
-		（カメラの中心から相似に拡大しても、写る像は同じため）。だから②の実寸を変えても④をやり直す
-		必要はない。2026-10-09 より前は④を計算したときの実寸のまま使っていて、②を変えても④を
-		再実行しないと反映されなかった（コンソールに警告が出るだけだった）。
-		"""
-		if not cache:
-			return cache
-		r, old, cur = self._ankle_cache_size_ratio(cache)
-		if abs(r - 1.0) < 1e-9:
-			return cache
-		import numpy as np
-		out = dict(cache)
-		out["bones"] = {}
-		for aid, b in (cache.get("bones") or {}).items():
-			nb = dict(b)
-			try:
-				P = np.array(b["poses"], dtype=float, copy=True)
-				P[:, :3, 3] *= r
-				nb["poses"] = P
-			except Exception as e:
-				print(f"[ankle姿勢] ID={aid} の実寸合わせに失敗: {e}")
-			out["bones"][aid] = nb
-		out["marker_size_mm"] = cur
-		out["marker_size_mm_detected"] = old
-		print(f"[ankle姿勢] ④の結果（実寸 {old:g} mm で計算）を、②の実寸 {cur:g} mm に合わせて使います"
-		      f"（位置を {r:.4f} 倍。④の再実行は不要）")
-		return out
-
 	def _ankle_cache_status_text(self, cache) -> str:
 		if not cache:
 			return "(未実行)"
 		N = int(cache.get("frame_count", 0))
 		bones = cache.get("bones", {}) or {}
 		lines = [f"検出完了: {N}フレーム / ソース={Path(str(cache.get('source',''))).name}"]
-		try:
-			_r, _old, _cur = self._ankle_cache_size_ratio(cache)
-			if _old and _cur and abs(_r - 1.0) > 1e-9:
-				lines.append(f"  実寸: ④は {_old:g} mm で計算 → 可視化は②の {_cur:g} mm に合わせます（④の再実行は不要）")
-		except Exception:
-			pass
-		try:
-			_est = self._ankle_depth_size_get(str(cache.get("source", "")))
-			if _est and _est.get("all"):
-				_a = _est["all"]
-				lines.append(f"  深度による実寸の推定: {_a['median']:.2f} mm（{_a['p25']:.2f}〜{_a['p75']:.2f}, {_a['n']}回）"
-				             f" → ②の「深度から推定…」で入れられます")
-		except Exception:
-			pass
 		for aid, b in sorted(bones.items()):
 			det = b.get("detected", None)
 			if det is None or len(det) == 0:
@@ -10352,8 +9688,6 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_depth_diag_shown = set()
 		self._ankle_pose_source_counts = {}
 		self._ankle_method_compare = {}
-		self._ankle_size_samples = {}      # 深度で測った実寸（ID ごと）
-		self._ankle_size_calls = {}
 		# 骨リストからArUco IDを収集
 		target_ids = set()
 		for b in self.ankle_bones:
@@ -10475,19 +9809,8 @@ class MainMenuGUI(_BaseWindow):
 					"    [注意] rgbd-fusion の採用率が低いです。マーカー面の深度が"
 					"欠けている可能性があります (映り込み・距離・角度を確認してください)")
 
-		# 深度で測った実寸を、④の結果とは別のファイルに残す
-		try:
-			self._ankle_depth_size_store(str(cache.get("source", "")),
-			                             getattr(self, "_ankle_size_samples", {}) or {})
-		except Exception as e:
-			print(f"[深度による実寸] 保存に失敗: {e}")
-
 		# キャッシュ保存 + ステータス更新
 		self._ankle_set_current_cache(cache)
-		try:
-			self._ankle_size_refresh_auto()       # 補正後が「自動」なら深度の推定に合わせる
-		except Exception as e:
-			print(f"[マーカー実寸] 自動の値の更新に失敗: {e}")
 		self._ankle_autosave_pose_cache()      # 再起動しても引き継げるよう自動保存
 		self._ankle_update_detection_status()
 		msg = self._ankle_cache_status_text(cache)
@@ -10576,7 +9899,7 @@ class MainMenuGUI(_BaseWindow):
 				for key, n, cache in restored:
 					src = Path(str(cache.get("source", ""))).name
 					print(f"    {key}: {n} フレーム  (元データ: {src})")
-				print("  ※ ②のマーカー実寸は、④をやり直さなくても可視化に反映されます。ArUco辞書・ID・録画を変えた場合は ④ を再実行してください")
+				print("  ※ ②の設定を変えた場合は ④ を再実行してください")
 				print("=" * 70)
 			self._ankle_warn_if_cache_stale()
 		except Exception as e:
@@ -10593,9 +9916,7 @@ class MainMenuGUI(_BaseWindow):
 				cur_size = float(self.ankle_marker_size_mm.get())
 				old_size = float(cache.get("marker_size_mm", cur_size))
 				if abs(cur_size - old_size) > 1e-6:
-					# 2026-10-09 から可視化で②に合わせて使うので、やり直しは不要（知らせるだけ）
-					print(f"[ankle姿勢] [情報] ④は実寸 {old_size:g} mm で計算 → 可視化は②の {cur_size:g} mm に"
-					      f"合わせます（④の再実行は不要）")
+					issues.append(f"マーカー実寸 {old_size} mm → 現在 {cur_size} mm")
 			except Exception:
 				pass
 			try:
@@ -10856,7 +10177,7 @@ class MainMenuGUI(_BaseWindow):
 		import numpy as np
 		if self._ankle_joint_frame_Cj is None:
 			messagebox.showwarning("Cj分析", "先に関節座標系 Cj を確定してください。"); return
-		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		cache = self._ankle_get_current_cache()
 		if not cache:
 			messagebox.showwarning("Cj分析",
 				"姿勢時系列がありません。⓪で本試験録画 → ④でArUco検出+PnP実行 してください。")
@@ -10997,7 +10318,7 @@ class MainMenuGUI(_BaseWindow):
 		用途: スキャナ無しでの追跡動作確認。マーカーがカメラ座標系でどう動いたかが見える。
 		"""
 		import numpy as np
-		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		cache = self._ankle_get_current_cache()
 		if not cache:
 			messagebox.showwarning("マーカー軌跡",
 				"姿勢時系列がありません。先に「ArUco検出+PnP実行」または「姿勢時系列を読込」してください。")
@@ -11137,7 +10458,7 @@ class MainMenuGUI(_BaseWindow):
 			messagebox.showinfo("マーカーPDF", "有効なArUco IDがありません。")
 			return
 		try:
-			marker_size_mm = float(self._ankle_marker_true_mm())
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			marker_size_mm = 20.0
 		self._ankle_marker_pdf_dialog(items, self.ankle_aruco_dict_var.get(), marker_size_mm)
@@ -11340,7 +10661,7 @@ class MainMenuGUI(_BaseWindow):
 			return
 		aruco_dict_name = self.ankle_aruco_dict_var.get()
 		try:
-			marker_size_mm = float(self._ankle_marker_true_mm())
+			marker_size_mm = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			marker_size_mm = 20.0
 		out_dir = filedialog.askdirectory(title="マーカー画像の保存先を選択")
@@ -15095,7 +14416,7 @@ class MainMenuGUI(_BaseWindow):
 		"""
 		import numpy as np
 		# --- 1. 前提チェック ---
-		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		cache = self._ankle_get_current_cache()
 		if not cache:
 			if heatmap_only:
 				return {"status": "error", "msg": "④の結果（姿勢時系列）がありません。先に④を実行してください"}
