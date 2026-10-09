@@ -14,6 +14,7 @@ GUI は起動しないので状態ファイルには触らない（`hw_final.py`
 | `hw_queue.py` | フレーム取得方式（wait_for_frames / frame_queue / callback）の取りこぼしを比較 | **必要** |
 | `hw_final.py` | 現行方式とRAM録画を同条件で比較（`... hw_final.py <秒数> [A\|B\|both]`） | **必要** |
 | `t_ring.py` | RAM録画のリングを、ディスクに妨害を掛けながら長時間検証 | 不要 |
+| `quietzone.py` | マーカー周囲の白余白の幅を振り、検出率・角誤差・距離の偏りを合成で測る（`... quietzone.py <距離mm> grey/dark/clutter <最大傾き°> <試行数>`） | 不要 |
 | `patch_lib.py` | `FRS-SIMULATOR.py` を安全に編集するヘルパー（CRLF維持・一意アンカー必須） | — |
 
 ## patch_lib の使い方

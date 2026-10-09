@@ -1,0 +1,3754 @@
+{
+  "tabs": [
+    {
+      "name": "260828",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/ankle_d405_20260828_180045_color.mp4",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/ankle_d405_20260828_180045.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_50",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "640x480@15",
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 64,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "femur",
+            "aruco_id": 0,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "pelvis",
+            "aruco_id": 2,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_pelvis_hd/pelvis.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.43459638271699513,
+                -0.8176368349053583,
+                -0.3776188426644657,
+                -3.320294706828456
+              ],
+              [
+                0.8989908142890062,
+                -0.3685849377811745,
+                -0.2365600546686545,
+                34.86182570828562
+              ],
+              [
+                0.05423559673583596,
+                -0.4422840149121321,
+                0.8952336846879212,
+                522.1206280961217
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": true
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260829",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "C:/Users/yutas/Desktop/ankle simulator用ファイル/269829_テスト/ankle_d405_20260829_131222_color.mp4",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/269829_テスト/ankle_d405_20260829_131222.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 64,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "femur",
+            "aruco_id": 0,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "pelvis",
+            "aruco_id": 2,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_pelvis_hd/pelvis.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.43459638271699513,
+                -0.8176368349053583,
+                -0.3776188426644657,
+                -3.320294706828456
+              ],
+              [
+                0.8989908142890062,
+                -0.3685849377811745,
+                -0.2365600546686545,
+                34.86182570828562
+              ],
+              [
+                0.05423559673583596,
+                -0.4422840149121321,
+                0.8952336846879212,
+                522.1206280961217
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": true
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260829_2",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260829_2/ankle_d405_20260829_131939_color.mp4",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260829_2/ankle_d405_20260829_131939.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "femur",
+            "aruco_id": 0,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "pelvis",
+            "aruco_id": 2,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_pelvis_hd/pelvis.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.43459638271699513,
+                -0.8176368349053583,
+                -0.3776188426644657,
+                -3.320294706828456
+              ],
+              [
+                0.8989908142890062,
+                -0.3685849377811745,
+                -0.2365600546686545,
+                34.86182570828562
+              ],
+              [
+                0.05423559673583596,
+                -0.4422840149121321,
+                0.8952336846879212,
+                522.1206280961217
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": true
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260903_ArUco精度検証_Z軸＿正（遠くへ）",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/ankle_d405_20260903_154303.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260903_ArUco精度検証_X軸_正（下へ）",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/X軸_正（下へ）/ankle_d405_20260903_171720.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260903_ArUco精度検証_Y軸_負（左へ）",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260903_ArUco精度検証_U軸_負",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/U軸/ankle_d405_20260903_220013.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260903_ArUco精度検証_V軸_負",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260903_テスト_ArUco精度検証/V軸/ankle_d405_20260903_220459.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260903_ArUco精度検証_W軸_負",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260904_テスト_消してもいい/ankle_d405_20260904_141205.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260904_ArUCo精度検証_U軸",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260904_ArUco精度検証/ankle_d405_20260904_211339.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260904_ArUCo精度検証_V軸",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260904_ArUco精度検証/V/ankle_d405_20260904_211536.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260904_ArUCo精度検証_W軸",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260904_ArUco精度検証/W/ankle_d405_20260904_211759.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から_X",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/X/ankle_d405_20260907_134453.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から_Y",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/Y/ankle_d405_20260907_134913.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から_Z",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/Z/ankle_d405_20260907_135335.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から_U",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/U/ankle_d405_20260907_135724.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から_V",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/V/ankle_d405_20260907_135938.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_斜め45°から_W",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/W/ankle_d405_20260907_140058.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 20.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 0
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_正面から_X",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_10×10/X/ankle_d405_20260907_151046.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_正面から_Y",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_10×10/Y/ankle_d405_20260907_151137.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_正面から_Z",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_10×10/Z/ankle_d405_20260907_151330.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_10×10_斜めから_X",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/60907_ArUco精度検証_10×10_斜めから/X/ankle_d405_20260907_151835.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_10×10_斜めから_Y",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/60907_ArUco精度検証_10×10_斜めから/Y/ankle_d405_20260907_152003.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUco精度検証_10×10_斜めから_Z",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/60907_ArUco精度検証_10×10_斜めから/Z/ankle_d405_20260907_152215.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_正面から_U",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_10×10/U/ankle_d405_20260907_153023.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_正面から_V",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_10×10/V/ankle_d405_20260907_153140.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_正面から_W",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_10×10/W/ankle_d405_20260907_153316.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_斜めから_U",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/60907_ArUco精度検証_10×10_斜めから/U/ankle_d405_20260907_155611.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_斜めから_V",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/60907_ArUco精度検証_10×10_斜めから/V/ankle_d405_20260907_160025.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260907_ArUCo精度検証_10*10cm_斜めから_W",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/60907_ArUco精度検証_10×10_斜めから/W/ankle_d405_20260907_160336.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 10.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_X",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/ankle_d405_20260908_153311.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_Y",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/Y/ankle_d405_20260908_153817.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_Z",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/Z/ankle_d405_20260908_154020.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_U",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/U/ankle_d405_20260908_162120.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_V",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/V/ankle_d405_20260908_155000.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_W",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/W/ankle_d405_20260908_155157.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_斜めから_U",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15_斜めから/ankle_d405_20260908_172333.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_斜めから_V",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15_斜めから/V/ankle_d405_20260908_172518.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_斜めから_W",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15_斜めから/W/ankle_d405_20260908_172808.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_斜めから_X",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15_斜めから/X/ankle_d405_20260908_173116.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_斜めから_Y",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15_斜めから/Y/ankle_d405_20260908_173216.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    },
+    {
+      "name": "260908_ArUco精度検証_15*15cm_斜めから_Z",
+      "snapshot": {
+        "ankle_initial_scan": "",
+        "ankle_video": "",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15_斜めから/Z/ankle_d405_20260908_173332.db3",
+        "ankle_camera_intrinsics": "",
+        "ankle_aruco_dict": "DICT_4X4_100",
+        "ankle_marker_size_mm": 15.0,
+        "ankle_pose_series": "",
+        "ankle_heatmap_prox": "1. femur",
+        "ankle_heatmap_dist": "2. pelvis",
+        "ankle_reg_ransac_distance": 1.0,
+        "ankle_reg_ransac_max_iter": 1000,
+        "ankle_reg_ransac_confidence": 0.99,
+        "ankle_reg_icp_threshold": 5.0,
+        "ankle_reg_icp_max_iter": 2000,
+        "ankle_reg_sample_points": 100000,
+        "ankle_reg_voxel_size": 0.0,
+        "ankle_reg_preview_var": true,
+        "ankle_ref_frame": 1,
+        "ankle_detect_stride": 1,
+        "ankle_rs_resolution": "1280x720@30",
+        "ankle_rs_color_format": "YUYV (軽い・推奨)",
+        "ankle_rs_preview_every": 3,
+        "ankle_rs_record_mp4": true,
+        "ankle_rs_settle_frames": 15,
+        "ankle_rs_high_priority": true,
+        "ankle_rs_ram_record": true,
+        "ankle_rs_ram_seconds": 8,
+        "ankle_rs_discard_frames": 64,
+        "ankle_rs_manual_exposure": false,
+        "ankle_rs_exposure_val": 5000,
+        "ankle_rs_color_manual_exposure": true,
+        "ankle_rs_color_exposure_us": 5000,
+        "ankle_rs_color_gain": 96,
+        "ankle_workflow_mode": "self_pose",
+        "ankle_self_pose_world": "camera_ref",
+        "_bones": [
+          {
+            "name": "直動",
+            "aruco_id": 1,
+            "model_path": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260828_テスト/260828_femur_hd/femur.obj",
+            "post_scan_path": "",
+            "color": "#c0c0c0",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": [
+              [
+                -0.8447252032514162,
+                0.048460950826002144,
+                0.5330017516264777,
+                -92.22226256991476
+              ],
+              [
+                0.002883253855259949,
+                -0.9954656451399898,
+                0.09507805316281086,
+                94.88796472359371
+              ],
+              [
+                0.5351925054025511,
+                0.08185160713794164,
+                0.8407551941973813,
+                590.7176988336912
+              ],
+              [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            ],
+            "reg_T": null,
+            "fixed": false
+          },
+          {
+            "name": "回転",
+            "aruco_id": 2,
+            "model_path": "",
+            "calib_model_path": "",
+            "post_scan_path": "",
+            "color": "#ADD8E6",
+            "method": "ransac",
+            "enable_scaling": false,
+            "marker_to_bone_T": null,
+            "reg_T": null,
+            "fixed": false
+          }
+        ],
+        "_selected_bone": 1
+      }
+    }
+  ],
+  "active": 41
+}
