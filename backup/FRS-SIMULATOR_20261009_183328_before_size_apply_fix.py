@@ -3292,10 +3292,8 @@ class MainMenuGUI(_BaseWindow):
 		_ent_eff.grid(row=0, column=5, sticky="w", padx=(4, 8))
 		# 補正後を手で書き換えたら手動にする（自動の値はメモに残る）
 		_ent_eff.bind("<KeyRelease>", lambda e: self._ankle_size_mark_manual(e))
-		_szb = ttk.Frame(af)
-		_szb.grid(row=0, column=6, sticky="w", padx=(0, 12))
-		ttk.Button(_szb, text="深度から推定…", command=self._ankle_open_size_estimate_dialog).pack(side=tk.LEFT)
-		ttk.Button(_szb, text="他のタブと同期…", command=self._ankle_open_size_sync_dialog).pack(side=tk.LEFT, padx=(4, 0))
+		ttk.Button(af, text="深度から推定…", command=self._ankle_open_size_estimate_dialog
+		           ).grid(row=0, column=6, sticky="w", padx=(0, 12))
 		_note_fr = ttk.Frame(af)
 		_note_fr.grid(row=1, column=4, columnspan=4, sticky="w")
 		self._ankle_size_note_lbl = ttk.Label(_note_fr, textvariable=self.ankle_marker_size_note,
@@ -4865,8 +4863,8 @@ class MainMenuGUI(_BaseWindow):
 			"あとで「シミュレーション実行」を押すと計算せずにすぐ表示されます。\n"
 			"・録画ファイルは各タブの②に入っているもの（.db3 など）をそのまま使います（ファイル選択は出ません）。\n"
 			"・ArUco辞書・フレーム間引き・骨リストなど、マーカー実寸以外の設定は各タブのものを使います。\n"
-			"・実寸の欄（一括指定を含む）は、②の「マーカー実寸 ノギス」です。変えるとその場で各タブに入ります。"
-			"「補正後・計算に使う」は、自動のタブでは深度の推定（無ければ実寸と同じ値）、手動のタブではそのままです。\n"
+			"・マーカー実寸の欄（一括指定を含む）を変えると、その場で各タブの②マーカー実寸に入ります"
+			"（解析しなくても反映。④の検出とマーカー-骨キャリブはこの値を使います）。\n"
 			"・結果は1タブ終わるごとに保存されます。途中でやめるときは進捗ウィンドウの「キャンセル」を押してください。")
 		          ).pack(side="top", anchor="w", padx=10, pady=(10, 4))
 
@@ -4903,7 +4901,7 @@ class MainMenuGUI(_BaseWindow):
 
 		ctl2 = ttk.Frame(win)
 		ctl2.pack(side="top", fill="x", padx=10, pady=(2, 6))
-		ttk.Label(ctl2, text="マーカー実寸（ノギス）を一括指定:").pack(side="left")
+		ttk.Label(ctl2, text="マーカー実寸を一括指定:").pack(side="left")
 		bulk_var = tk.StringVar(value="")
 		ttk.Entry(ctl2, textvariable=bulk_var, width=8).pack(side="left", padx=(4, 2))
 		ttk.Label(ctl2, text="mm").pack(side="left")
@@ -4964,7 +4962,7 @@ class MainMenuGUI(_BaseWindow):
 		cv.bind("<Enter>", _bind_wheel)
 		cv.bind("<Leave>", _unbind_wheel)
 
-		heads = ("", "タブ名", "フォルダ", "実寸 ノギス(mm)", "録画ファイル（②）", "いまの結果")
+		heads = ("", "タブ名", "フォルダ", "マーカー実寸(mm)", "録画ファイル（②）", "いまの結果")
 		for c, h in enumerate(heads):
 			ttk.Label(inner, text=h, font=(self.ui_font_family, 9, "bold")
 			          ).grid(row=0, column=c, sticky="w", padx=4, pady=(0, 4))
@@ -5057,8 +5055,7 @@ class MainMenuGUI(_BaseWindow):
 			can_run = bool(src_ok or self._ankle_pose_cache.get(name))
 			row = {"i": i, "tab": tab, "name": name, "folder": folder, "src_ok": src_ok, "can": can_run,
 			       "chk": tk.BooleanVar(value=False),
-			       "size": tk.StringVar(value=_fmt_size(snap.get("ankle_marker_size_true_mm",
-			                                                     snap.get("ankle_marker_size_mm", 20.0)))),
+			       "size": tk.StringVar(value=_fmt_size(snap.get("ankle_marker_size_mm", 20.0))),
 			       "res_var": tk.StringVar(value=""), "state": None}
 			c0 = ttk.Checkbutton(inner, variable=row["chk"], command=update_count,
 			                     state=("normal" if can_run else "disabled"))
@@ -9922,12 +9919,12 @@ class MainMenuGUI(_BaseWindow):
 		win = tk.Toplevel(self)
 		win.title("深度からマーカー実寸を推定")
 		win.transient(self)
-		win.geometry("820x560")
+		win.geometry("820x760")
 		pad = {"padx": 10, "pady": 4}
 
 		ttk.Label(win, text=("深度カメラで測ったマーカーの大きさの中央値を、②の実寸の候補にします。"
 		                     "PnP の距離は実寸に比例するので、実寸が 1% ずれると骨どうしの位置も約 1% ずれます。"
-		                     "同じ日・同じ標本の試験には、同じ値を入れてください（②の「他のタブと同期…」）。"),
+		                     "同じ日・同じ標本の試験には、同じ値を入れてください。"),
 		          wraplength=790, justify="left").pack(anchor="w", **pad)
 		ttk.Label(win, text=f"録画: {Path(source).name if source else '（未指定）'}", foreground="#005580"
 		          ).pack(anchor="w", padx=10)
@@ -9975,13 +9972,74 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(est_box, text="録画から測る（15コマおき・1〜3分。④の結果は変えません）", command=measure
 		           ).pack(anchor="w", padx=8, pady=(0, 6))
 
-		# 「補正後に入れる」の欄は 2026-10-09 に外した（②の「他のタブと同期…」と役割が重なるため）。
-		_bf = ttk.Frame(win)
-		_bf.pack(fill=tk.X, padx=10, pady=4)
+		# --- 入れる先 ---
+		app_box = ttk.LabelFrame(win, text="②の「補正後」に入れる（同じフォルダのタブを最初から選んでいます。自動のタブは、録画ごとの推定が自動で入ります）")
+		app_box.pack(fill=tk.BOTH, expand=False, **pad)
+		row0 = ttk.Frame(app_box)
+		row0.pack(fill=tk.X, padx=8, pady=4)
+		ttk.Label(row0, text="入れる実寸 (mm):").pack(side=tk.LEFT)
+		ttk.Entry(row0, textvariable=val_var, width=8).pack(side=tk.LEFT, padx=4)
+		lst = tk.Frame(app_box)
+		lst.pack(fill=tk.X, padx=8)
+		cv = tk.Canvas(lst, height=150, highlightthickness=0)
+		sb = ttk.Scrollbar(lst, orient=tk.VERTICAL, command=cv.yview)
+		inner = ttk.Frame(cv)
+		inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+		cv.create_window((0, 0), window=inner, anchor="nw")
+		cv.configure(yscrollcommand=sb.set)
+		cv.pack(side=tk.LEFT, fill=tk.X, expand=True)
+		sb.pack(side=tk.RIGHT, fill=tk.Y)
+		folder = str((cur_tab or {}).get("folder", "") or "")
+		checks = []
+		for t in self._ankle_tabs:
+			same = (t is cur_tab) or (folder and str(t.get("folder", "") or "") == folder)
+			if not same and t is not cur_tab:
+				continue
+			v = tk.BooleanVar(win, value=True)
+			if t is cur_tab:
+				try:
+					sz = float(self.ankle_marker_size_mm.get())
+				except Exception:
+					sz = float("nan")
+			else:
+				sz = float((t.get("snapshot") or {}).get("ankle_marker_size_mm", float("nan")))
+			ttk.Checkbutton(inner, variable=v, text=f"{t.get('name', '')}　（いまの補正後: {sz:g} mm）"
+			                + ("　← 開いているタブ" if t is cur_tab else "")).pack(anchor="w")
+			checks.append((t, v))
+
+		def apply():
+			try:
+				v = float(val_var.get())
+			except Exception:
+				messagebox.showwarning("深度から推定", "実寸の数値を入れてください。", parent=win)
+				return
+			if not (1.0 < v < 500.0):
+				messagebox.showwarning("深度から推定", "実寸の値が大きすぎるか小さすぎます。", parent=win)
+				return
+			n = 0
+			for t, var in checks:
+				if not var.get():
+					continue
+				sn = t.setdefault("snapshot", {})
+				sn["ankle_marker_size_mm"] = v
+				sn["ankle_marker_size_auto"] = False           # 手で決めた値なので手動にする
+				sn.setdefault("ankle_marker_size_true_mm", sn.get("ankle_marker_size_true_mm", v))
+				if t is self._ankle_active_tab_dict():
+					self.ankle_marker_size_auto.set(False)
+					self.ankle_marker_size_mm.set(v)
+				n += 1
+			self._ankle_size_refresh_auto()
+			self._schedule_state_autosave("ankle")
+			self._ankle_update_detection_status()
+			messagebox.showinfo("深度から推定", f"{n} 個のタブの「補正後」に {v:g} mm を入れました（手動）。\n"
+			                    "④をやり直さなくても、可視化に反映されます。\n"
+			                    "各タブで「自動に戻す」を押すと、そのタブの録画の深度の推定に戻ります。", parent=win)
+
+		_bf = ttk.Frame(app_box)
+		_bf.pack(anchor="w", padx=8, pady=6)
+		ttk.Button(_bf, text="チェックしたタブの「補正後」に入れる（手動）", command=apply).pack(side=tk.LEFT)
 		ttk.Button(_bf, text="全タブの実寸の一覧を CSV に書き出す",
-		           command=lambda: self._ankle_size_export_csv(win)).pack(side=tk.LEFT)
-		ttk.Label(_bf, text="ほかのタブの「補正後」をそろえるときは、②の「他のタブと同期…」を使います",
-		          foreground="#555555").pack(side=tk.LEFT, padx=(10, 0))
+		           command=lambda: self._ankle_size_export_csv(win)).pack(side=tk.LEFT, padx=(8, 0))
 
 		# --- 接触で確かめる ---
 		chk = ttk.LabelFrame(win, text="接触で確かめる（軸力が一定の区間を秒で指定してください）")
@@ -10143,122 +10201,6 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_marker_size_auto.set(bool(on))
 		self._ankle_size_refresh_auto()
 		self._schedule_state_autosave("ankle")
-
-	def _ankle_size_apply_to_tabs(self, tabs, v: float) -> int:
-		"""タブの「補正後・計算に使う」に v を入れて手動にする。実寸（ノギス）は変えない。
-
-		まだ開いていない古いタブには実寸（ノギス）の項目が無いので、補正後を書き換える前に
-		それまでの値を実寸（ノギス）として残す（2026-10-09 の不具合: 推定値が実寸にも入っていた）。
-		「深度から推定…」の窓と「他のタブと同期…」の両方がこの関数を使う。
-		"""
-		v = float(v)
-		n = 0
-		active = self._ankle_active_tab_dict()
-		for t in tabs:
-			sn = t.setdefault("snapshot", {})
-			if "ankle_marker_size_true_mm" not in sn:
-				try:
-					sn["ankle_marker_size_true_mm"] = float(sn.get("ankle_marker_size_mm", v))
-				except Exception:
-					sn["ankle_marker_size_true_mm"] = v
-			sn["ankle_marker_size_mm"] = v
-			sn["ankle_marker_size_auto"] = False
-			if t is active:
-				self.ankle_marker_size_auto.set(False)
-				if abs(float(self.ankle_marker_size_mm.get()) - v) > 1e-12:
-					self.ankle_marker_size_mm.set(v)
-			n += 1
-		self._ankle_size_refresh_auto()
-		self._schedule_state_autosave("ankle")
-		self._ankle_update_detection_status()
-		return n
-
-	def _ankle_open_size_sync_dialog(self) -> None:
-		"""いまのタブの「補正後」を、チェックしたタブに入れる（同期）。同じフォルダのタブを最初から選ぶ。"""
-		try:
-			v = float(self.ankle_marker_size_mm.get())
-		except Exception:
-			messagebox.showwarning("他のタブと同期", "「補正後・計算に使う」に数値を入れてください。", parent=self)
-			return
-		if not (1.0 < v < 500.0):
-			messagebox.showwarning("他のタブと同期", "「補正後」の値が大きすぎるか小さすぎます。", parent=self)
-			return
-		cur = self._ankle_active_tab_dict()
-		try:
-			self._ankle_tabs[self._ankle_active_tab]["snapshot"] = self._ankle_snapshot_current()
-		except Exception:
-			pass
-		folder = str((cur or {}).get("folder", "") or "")
-		win = tk.Toplevel(self)
-		win.title("補正後の値を他のタブと同期")
-		win.transient(self)
-		win.geometry("720x560")
-		ttk.Label(win, text=(f"いまのタブ「{(cur or {}).get('name', '')}」の「補正後・計算に使う」= {v:g} mm を、"
-		                     "チェックしたタブの「補正後」に入れます。入れたタブは「手動」になります"
-		                     "（実寸 ノギス は変えません。各タブの「自動に戻す」で戻せます）。"),
-		          wraplength=690, justify="left").pack(anchor="w", padx=10, pady=(10, 4))
-		ctl = ttk.Frame(win)
-		ctl.pack(fill=tk.X, padx=10)
-		lst = tk.Frame(win)
-		lst.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
-		cv = tk.Canvas(lst, highlightthickness=0)
-		sb = ttk.Scrollbar(lst, orient=tk.VERTICAL, command=cv.yview)
-		inner = ttk.Frame(cv)
-		inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-		cv.create_window((0, 0), window=inner, anchor="nw")
-		cv.configure(yscrollcommand=sb.set)
-		cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-		sb.pack(side=tk.RIGHT, fill=tk.Y)
-		checks = []
-
-		def _label(t):
-			sn = t.get("snapshot") or {}
-			try:
-				eff = float(sn.get("ankle_marker_size_mm"))
-				tru = float(sn.get("ankle_marker_size_true_mm", eff))
-			except Exception:
-				return str(t.get("name", ""))
-			how = "自動" if sn.get("ankle_marker_size_auto", True) else "手動"
-			return f"{t.get('name', '')}　（補正後 {eff:g} mm・{how} / 実寸 {tru:g} mm）"
-
-		same = [t for t in self._ankle_tabs if t is not cur and folder and str(t.get("folder", "") or "") == folder]
-		others = [t for t in self._ankle_tabs if t is not cur and t not in same]
-		ttk.Label(inner, text=(f"同じフォルダ「{folder}」" if folder else "同じフォルダ（フォルダ未設定）"),
-		          font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(2, 2))
-		if not same:
-			ttk.Label(inner, text="　（ほかのタブはありません）", foreground="#666666").pack(anchor="w")
-		for t in same:
-			var = tk.BooleanVar(win, value=True)
-			ttk.Checkbutton(inner, variable=var, text=_label(t)).pack(anchor="w")
-			checks.append((t, var, True))
-		ttk.Label(inner, text="ほかのフォルダ", font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(10, 2))
-		for t in others:
-			var = tk.BooleanVar(win, value=False)
-			f_ = str(t.get("folder", "") or "")
-			ttk.Checkbutton(inner, variable=var, text=_label(t) + (f"　［{f_}］" if f_ else "")).pack(anchor="w")
-			checks.append((t, var, False))
-
-		def _set(which, on):
-			for t, var, is_same in checks:
-				if which == "all" or (which == "same" and is_same):
-					var.set(on)
-		ttk.Button(ctl, text="同じフォルダをすべてチェック", command=lambda: _set("same", True)).pack(side=tk.LEFT)
-		ttk.Button(ctl, text="すべて外す", command=lambda: _set("all", False)).pack(side=tk.LEFT, padx=6)
-
-		def do_sync():
-			targets = [t for t, var, _ in checks if var.get()]
-			if not targets:
-				messagebox.showinfo("他のタブと同期", "タブがチェックされていません。", parent=win)
-				return
-			n = self._ankle_size_apply_to_tabs(targets, v)
-			messagebox.showinfo("他のタブと同期", f"{n} 個のタブの「補正後」に {v:g} mm を入れました（手動）。\n"
-			                    "④をやり直さなくても、可視化に反映されます。", parent=win)
-			win.destroy()
-
-		bf = ttk.Frame(win)
-		bf.pack(fill=tk.X, padx=10, pady=8)
-		ttk.Button(bf, text=f"チェックしたタブの「補正後」に {v:g} mm を入れる", command=do_sync).pack(side=tk.LEFT)
-		ttk.Button(bf, text="やめる", command=win.destroy).pack(side=tk.RIGHT)
 
 	def _ankle_size_export_csv(self, parent=None) -> None:
 		"""全タブの 実寸 / 補正後 / 自動か / 深度の推定 を CSV に書き出す。"""

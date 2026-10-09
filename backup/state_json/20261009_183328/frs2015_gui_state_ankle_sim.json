@@ -4299,7 +4299,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置 20Nまで/ankle_d405_20260929_141132.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -4527,9 +4527,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 4,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 4
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -4542,7 +4540,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置 50Nまで/ankle_d405_20260929_162147.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -4770,9 +4768,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 0,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 0
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -4785,7 +4781,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置 100Nまで/ankle_d405_20260929_163232.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -5013,9 +5009,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -5028,7 +5022,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置しながら屈曲　20N/ankle_d405_20260929_174423.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -5256,9 +5250,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -5271,7 +5263,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置しながら屈曲　50N/ankle_d405_20260929_174841.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -5499,9 +5491,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 1,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 1
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -5514,7 +5504,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置しながら屈曲　70N/ankle_d405_20260929_181025.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -5742,9 +5732,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -5757,9 +5745,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/足底設置しながら屈曲　100N/ankle_d405_20260929_180257.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -6000,9 +5986,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/heal strike 20N/ankle_d405_20260929_184824.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": true,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -6243,7 +6227,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/heal strike 50N/ankle_d405_20260929_183412.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -6471,9 +6455,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -6486,7 +6468,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/heal strike 70N/ankle_d405_20260929_183701.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -6714,9 +6696,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験",
       "bone_group": "g631c661f"
@@ -6729,9 +6709,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/足底クランプ実験（僕の実験）/heal stirke 100N/ankle_d405_20260929_184441.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -6972,9 +6950,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 intact 0DF-IE/ankle_d405_20260930_022510.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7082,9 +7058,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 intact 0DF-IE（再度）/ankle_d405_20260930_023026.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7192,9 +7166,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 intact 0DF-IE（再再度）/ankle_d405_20260930_023743.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7302,9 +7274,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 intact -15DF-IE/ankle_d405_20260930_030921.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7409,12 +7379,10 @@
       "snapshot": {
         "ankle_initial_scan": "",
         "ankle_video": "",
-        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 intact  30DF-IE/ankle_d405_20260930_032135.db3",
+        "ankle_depth": "",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7522,7 +7490,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 0DF load200/ankle_d405_20260930_034510.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7618,9 +7586,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -7629,12 +7595,10 @@
       "snapshot": {
         "ankle_initial_scan": "",
         "ankle_video": "",
-        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF 0DF-IE/ankle_d405_20260930_052651.db3",
+        "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF DF-IE/ankle_d405_20260930_052651.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7742,7 +7706,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF -15DF-IE/ankle_d405_20260930_053521.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7838,9 +7802,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -7852,9 +7814,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF 30DF-IE/ankle_d405_20260930_054125.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -7962,9 +7922,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 0PMF load200/ankle_d405_20260930_055254.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8072,9 +8030,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PLF 0DF-IE/ankle_d405_20260930_100301.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8182,7 +8138,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PLF -15DF-IE/ankle_d405_20260930_102806.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8278,9 +8234,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -8292,7 +8246,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 0PLF load200/ankle_d405_20260930_110525.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8388,9 +8342,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -8402,9 +8354,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF fix 0DF-IE/ankle_d405_20260930_112637.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8512,7 +8462,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF fix -15DF-IE/ankle_d405_20260930_113402.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8608,9 +8558,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -8622,7 +8570,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF fix 30DF-IE/ankle_d405_20260930_115547.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8718,9 +8666,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -8732,7 +8678,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 PMF fix -15DF-IE（再度）/ankle_d405_20260930_120411.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8828,9 +8774,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -8842,7 +8786,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 0PMF fix load200/ankle_d405_20260930_121356.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -8938,9 +8882,7 @@
           }
         ],
         "_ligaments": [],
-        "_selected_bone": 2,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false
+        "_selected_bone": 2
       },
       "folder": "260928-30_医大での足cadaver試験"
     },
@@ -8952,9 +8894,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260929_札幌医大試験/仁木先生の試験/niki 2872 0PMF fix load200（再度）/ankle_d405_20260930_122324.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.92,
-        "ankle_marker_size_true_mm": 15.0,
-        "ankle_marker_size_auto": false,
+        "ankle_marker_size_mm": 15.0,
         "ankle_pose_series": "",
         "ankle_heatmap_prox": "1. femur",
         "ankle_heatmap_dist": "2. pelvis",
@@ -9721,7 +9661,7 @@
         "ankle_depth": "C:/Users/yutas/Desktop/ankle simulator用ファイル/261007_ブタ膝ACL切除前後のアルコマーカーによる可視化試験/261007_FE_軸力100/ankle_d405_20261007_172912.db3",
         "ankle_camera_intrinsics": "",
         "ankle_aruco_dict": "DICT_4X4_100",
-        "ankle_marker_size_mm": 14.7,
+        "ankle_marker_size_mm": 14.76,
         "ankle_marker_size_true_mm": 15.0,
         "ankle_marker_size_auto": false,
         "ankle_pose_series": "",
@@ -10728,7 +10668,7 @@
       "bone_group": "g8a86693d"
     }
   ],
-  "active": 86,
+  "active": 81,
   "smooth_cutoff_hz": 0.2,
   "calib_v2": true,
   "folders": [
