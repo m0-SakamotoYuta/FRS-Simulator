@@ -3426,7 +3426,10 @@ class MainMenuGUI(_BaseWindow):
 		row += 1
 		ttk.Label(editor, text="骨モデル (可視化用フル):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
 		model_var = tk.StringVar(value="")
-		ttk.Entry(editor, textvariable=model_var, state="readonly", width=40).grid(row=row, column=1, sticky="ew", pady=2)
+		_e_model = ttk.Entry(editor, textvariable=model_var, state="readonly", width=40)
+		_e_model.grid(row=row, column=1, sticky="ew", pady=2)
+		self._register_dnd(_e_model, on_path=lambda p: self._ankle_set_bone_file_from_drop(
+			"model_path", p, "骨モデル"))
 		ttk.Button(editor, text="参照", width=5,
 		           command=lambda: self._ankle_pick_bone_file("model_path", "骨モデル(可視化用フル)を選択", "model")
 		           ).grid(row=row, column=2, sticky="w", padx=4)
@@ -3436,8 +3439,10 @@ class MainMenuGUI(_BaseWindow):
 		row += 1
 		ttk.Label(editor, text="キャリブ用モデル (省略可):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
 		calib_model_var = tk.StringVar(value="")
-		ttk.Entry(editor, textvariable=calib_model_var, state="readonly", width=40
-		          ).grid(row=row, column=1, sticky="ew", pady=2)
+		_e_calib = ttk.Entry(editor, textvariable=calib_model_var, state="readonly", width=40)
+		_e_calib.grid(row=row, column=1, sticky="ew", pady=2)
+		self._register_dnd(_e_calib, on_path=lambda p: self._ankle_set_bone_file_from_drop(
+			"calib_model_path", p, "キャリブ用モデル"))
 		ttk.Button(editor, text="参照", width=5,
 		           command=lambda: self._ankle_pick_bone_file("calib_model_path",
 		                                                       "キャリブ用モデル(ArUco部分切り出し)を選択", "model")
@@ -3459,8 +3464,10 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Label(post_row_frame, text="初期スキャン側 骨領域 (位置合わせ先):"
 		          ).grid(row=0, column=0, sticky="w", padx=(8, 4), pady=2)
 		post_var = tk.StringVar(value="")
-		ttk.Entry(post_row_frame, textvariable=post_var, state="readonly", width=40
-		          ).grid(row=0, column=1, sticky="ew", pady=2)
+		_e_post = ttk.Entry(post_row_frame, textvariable=post_var, state="readonly", width=40)
+		_e_post.grid(row=0, column=1, sticky="ew", pady=2)
+		self._register_dnd(_e_post, on_path=lambda p: self._ankle_set_bone_file_from_drop(
+			"post_scan_path", p, "初期スキャン側 骨領域"))
 		ttk.Button(post_row_frame, text="参照", width=5,
 		           command=lambda: self._ankle_pick_bone_file("post_scan_path", "初期スキャン側の骨領域を選択", "model")
 		           ).grid(row=0, column=2, sticky="w", padx=4)
@@ -3696,7 +3703,9 @@ class MainMenuGUI(_BaseWindow):
 		rlg.grid(row=6, column=0, sticky="we", padx=12, pady=(0, 6))
 		ttk.Checkbutton(rlg, text="ロボットの datalog を表示", variable=self.ankle_robot_log_show
 		                ).grid(row=0, column=0, sticky="w")
-		ttk.Entry(rlg, textvariable=self.ankle_robot_log_path, width=60).grid(row=0, column=1, sticky="w", padx=(6, 4))
+		_e_log = ttk.Entry(rlg, textvariable=self.ankle_robot_log_path, width=60)
+		_e_log.grid(row=0, column=1, sticky="w", padx=(6, 4))
+		self._register_dnd(_e_log, self.ankle_robot_log_path)
 		ttk.Button(rlg, text="参照…", command=lambda: self._ankle_choose(
 			self.ankle_robot_log_path, "ロボットの datalog（KKR/CSV）を選択", "robotlog")).grid(row=0, column=2, padx=2)
 		ttk.Button(rlg, text="自動で探す", command=self._ankle_robot_log_autofind_ui).grid(row=0, column=3, padx=2)
@@ -4051,6 +4060,21 @@ class MainMenuGUI(_BaseWindow):
 			b[key] = path
 			self._ankle_load_editor_from_bone()
 			self._schedule_state_autosave("ankle")
+
+	def _ankle_set_bone_file_from_drop(self, key: str, path: str, label: str) -> None:
+		"""③の欄にファイルをドロップしたとき: 「参照」と同じく、選択中の骨に保存する。"""
+		b = self._ankle_current_bone()
+		if b is None:
+			messagebox.showinfo("骨選択", "先に③の骨リストで骨を選んでから、ファイルをドロップしてください。", parent=self)
+			return
+		if Path(path).suffix.lower() not in (".obj", ".stl", ".ply"):
+			messagebox.showwarning(label, f"3Dモデル（.obj / .stl / .ply）をドロップしてください。\n{Path(path).name}",
+			                       parent=self)
+			return
+		b[key] = path
+		self._ankle_load_editor_from_bone()
+		self._schedule_state_autosave("ankle")
+		print(f"[DnD] {b.get('name', '')} の{label}: {path}")
 
 	def _ankle_choose_bone_color(self) -> None:
 		b = self._ankle_current_bone()
@@ -6490,8 +6514,15 @@ class MainMenuGUI(_BaseWindow):
 
 		def status_text():
 			k = len(picked)
+			skipped = [i for i, q in enumerate(picked) if q is None]
 			if k < 4:
-				return f"次にクリック: {k + 1}（{self._ANKLE_CORNER_LABELS[k]}）　[U] 1つ戻す"
+				s_ = f"次にクリック: {k + 1}（{self._ANKLE_CORNER_LABELS[k]}）　[U] 1つ戻す"
+				if not skipped:
+					s_ += "　[S] この角を飛ばす（写っていないとき・1つまで）"
+				return s_
+			if skipped:
+				return (f"3点そろいました（{skipped[0] + 1} {self._ANKLE_CORNER_LABELS[skipped[0]]} は飛ばした → "
+				        "残りの3点から求めます）→ ウィンドウを閉じてください　[U] 1つ戻す")
 			return "4点そろいました → ウィンドウを閉じてください　[U] 1つ戻す"
 
 		def refresh():
@@ -6534,6 +6565,23 @@ class MainMenuGUI(_BaseWindow):
 					pass
 			refresh()
 
+		def skip():
+			"""いまの角を飛ばす（スキャンに写っていないとき）。飛ばせるのは1つだけ。
+			マーカーの姿勢は、一直線に並ばない3点の対応で1通りに決まるので、3点で求められる。"""
+			if len(picked) >= 4 or any(q is None for q in picked):
+				return
+			k = len(picked) + 1
+			picked.append(None)
+			try:
+				b_ = np.array(mesh.bounds).reshape(3, 2)
+				anchor = b_[:, 0]
+			except Exception:
+				anchor = np.zeros(3)
+			p.add_text(f"{k}（{self._ANKLE_CORNER_LABELS[k - 1]}）は飛ばしました", position="upper_right",
+			           font_size=12, color="darkorange", name=f"ankle_pick_lb{k}", **_ff)
+			actors.append((f"ankle_pick_pt{k}", f"ankle_pick_lb{k}"))
+			refresh()
+
 		p.add_text(f"{title}\n4隅を順番に右クリック（または P キー）→ ウィンドウを閉じる",
 		           position="upper_left", font_size=11, color="black", **_ff)
 		try:
@@ -6548,9 +6596,15 @@ class MainMenuGUI(_BaseWindow):
 				p.add_key_event(key, undo)
 			except Exception:
 				pass
+		for key in ("s", "S"):
+			try:
+				p.add_key_event(key, skip)
+			except Exception:
+				pass
 		refresh()
 		p.show()
-		return np.array(picked) if picked else np.zeros((0, 3))
+		# 飛ばした角は None のまま返す（呼び出し側が残りの点で重ね合わせる）
+		return list(picked)
 
 	# ---- ankle: 状態永続化 ----
 	def _ankle_state_file_path(self) -> Path:
@@ -7337,8 +7391,10 @@ class MainMenuGUI(_BaseWindow):
 				plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True)
 		else:
 			plotter.add_mesh(mesh, color="lightgray", opacity=0.55, smooth_shading=True)
-		# ピック点 (赤球+ラベル)
+		# ピック点 (赤球+ラベル)。飛ばした角 (None) は、下で推定位置を橙で出す
 		for i, pt in enumerate(picked):
+			if pt is None:
+				continue
 			plotter.add_mesh(pv.Sphere(radius=r_sphere, center=np.asarray(pt)), color="red")
 			plotter.add_point_labels([np.asarray(pt)], [str(i + 1)],
 			                          font_size=16, text_color="red",
@@ -7347,6 +7403,12 @@ class MainMenuGUI(_BaseWindow):
 		obj_pts = self._ankle_marker_obj_points(marker_size_mm)
 		homog = np.hstack([obj_pts, np.ones((4, 1))])
 		corners_L = (np.asarray(T, dtype=float) @ homog.T).T[:, :3]
+		for i, pt in enumerate(picked):
+			if pt is None and i < 4:
+				plotter.add_mesh(pv.Sphere(radius=r_sphere, center=corners_L[i]), color="orange")
+				plotter.add_point_labels([corners_L[i]], [f"{i + 1}(estimated)"],
+				                          font_size=16, text_color="darkorange",
+				                          show_points=False, always_visible=True)
 		loop = np.vstack([corners_L, corners_L[0:1]])
 		for i in range(4):
 			plotter.add_mesh(pv.Line(loop[i], loop[i + 1]), color="blue", line_width=4)
@@ -7360,8 +7422,9 @@ class MainMenuGUI(_BaseWindow):
 			                           scale='auto', tip_length=0.15, tip_radius=0.04, shaft_radius=0.015),
 			                 color=col)
 		plotter.add_text(
-			"骨モデル(灰) / ピック点(赤球+番号) / 復元マーカー4隅(青枠) / Mk座標軸(X=R, Y=G, Z=B)",
-			position="upper_left", font_size=10, color="black")
+			"骨モデル(灰) / ピック点(赤球+番号) / 飛ばした角の推定(橙) / 復元マーカー4隅(青枠) / Mk座標軸(X=R, Y=G, Z=B)",
+			position="upper_left", font_size=10, color="black",
+			**({"font_file": self._sim_ligament_font_file()} if self._sim_ligament_font_file() else {}))
 		plotter.show()
 
 	# ---- Stage 4 新機能: テクスチャ付き骨スキャンからArUcoを自動検出 → T_L←Mk ----
@@ -8116,24 +8179,26 @@ class MainMenuGUI(_BaseWindow):
 		picked = self._ankle_pick_marker_corners(
 			mesh, b, marker_size_mm, f"{name}: マーカー4隅（1左上→2右上→3右下→4左下）",
 			texture=texture)
-		if len(picked) < 4:
+		used = [i for i, q in enumerate(picked) if q is not None]
+		skipped = [i for i, q in enumerate(picked) if q is None]
+		if len(picked) < 4 or len(used) < 3:
 			messagebox.showwarning("マーカー-骨キャリブ",
-				f"4点必要ですが {len(picked)} 点しかクリックされていません。やり直してください。")
+				f"4つの角をクリックしてください（写っていない角は S キーで1つだけ飛ばせます）。\n"
+				f"いまは {len(used)} 点です。やり直してください。")
 			return
 
 		# マーカー座標系での既知4隅 (Stage 3と同じ順 TL,TR,BR,BL, Y下向き)
-		obj_pts_mk = self._ankle_marker_obj_points(marker_size_mm)  # (4,3) float32
+		obj_pts_mk = np.asarray(self._ankle_marker_obj_points(marker_size_mm), dtype=float)  # (4,3)
+		pts_used = np.asarray([picked[i] for i in used], dtype=float)
 
-		# Umeyama/Kabsch (obj_pts_mk → picked が T_L←Mk)
-		T = self._rigid_from_correspondences(
-			np.asarray(obj_pts_mk, dtype=float),
-			np.asarray(picked, dtype=float),
-			allow_scale=False)
+		# Umeyama/Kabsch (obj_pts_mk → picked が T_L←Mk)。1つ飛ばしたときは残りの3点で。
+		# 3点が一直線に並ばない限り（正方形の3つの角は並ばない）、姿勢は1通りに決まる。
+		T = self._rigid_from_correspondences(obj_pts_mk[used], pts_used, allow_scale=False)
 
-		# 残差 (品質指標)
-		homog = np.hstack([np.asarray(obj_pts_mk, dtype=float), np.ones((4, 1))])
+		# 残差 (品質指標)。クリックした点だけで測る
+		homog = np.hstack([obj_pts_mk, np.ones((4, 1))])
 		predicted_L = (T @ homog.T).T[:, :3]
-		residuals = np.linalg.norm(predicted_L - np.asarray(picked, dtype=float), axis=1)
+		residuals = np.linalg.norm(predicted_L[used] - pts_used, axis=1)
 		rmse = float(np.sqrt(np.mean(residuals ** 2)))
 		max_r = float(residuals.max())
 
@@ -8141,6 +8206,7 @@ class MainMenuGUI(_BaseWindow):
 		b["marker_to_bone_T"] = T.tolist()
 		b["marker_to_bone_size_mm"] = float(marker_size_mm)    # キャリブに使った実寸
 		b["marker_to_bone_method"] = "manual"
+		b["marker_to_bone_corners_used"] = len(used)           # 3 = 1つ飛ばした
 		self._ankle_refresh_bone_listbox()
 
 		# 品質メッセージ
@@ -8152,10 +8218,16 @@ class MainMenuGUI(_BaseWindow):
 			verdict = "許容範囲 (推奨: 再ピッキング)"
 		else:
 			verdict = "要再取得 (RMSEが大きすぎます)"
+		skip_note = ""
+		if skipped:
+			k_ = skipped[0]
+			skip_note = (f"\n※ {k_ + 1}（{self._ANKLE_CORNER_LABELS[k_]}）は飛ばし、残りの3点から求めました。"
+			             "確認画面で、推定した角の位置（橙）が模様の角に合っているか確かめてください。\n"
+			             "　3点のときは残差が小さく出やすいので、残差だけで良し悪しを決めないでください。\n")
 		msg = (f"[{name}] マーカー-骨変換 T_L←Mk を保存しました。\n\n"
-		       f"4隅の残差 RMSE = {rmse:.3f} mm\n"
+		       f"{len(used)}隅の残差 RMSE = {rmse:.3f} mm\n"
 		       f"最大残差     = {max_r:.3f} mm\n"
-		       f"評価         = {verdict}\n\n"
+		       f"評価         = {verdict}\n{skip_note}\n"
 		       f"次のダイアログで確認画面を表示します。")
 		messagebox.showinfo(f"{name} キャリブ完了", msg)
 
@@ -26011,12 +26083,14 @@ class MainMenuGUI(_BaseWindow):
 				raw = raw[2:]
 		return raw
 
-	def _register_dnd(self, widget, textvariable: tk.StringVar) -> None:
+	def _register_dnd(self, widget, textvariable: tk.StringVar = None, on_path=None) -> None:
 		"""ウィジェットにドラッグ&ドロップを登録する。
 
 		macOS/Windows/Linux 差異への対応:
 		  - <<Drop>> と <<Drop:DND_Files>> の両方をバインド（Aqua では後者しか発火しない事例がある）
 		  - 初回登録時のみ失敗をコンソール表示（以降は静かにスキップ）
+		on_path を渡すと、textvariable に入れる代わりに on_path(パス) を呼ぶ
+		（ankle ③の骨モデルの欄のように、選択中の骨へ保存したい場合。2026-10-11）。
 		"""
 		if not _HAS_DND:
 			return
@@ -26025,7 +26099,12 @@ class MainMenuGUI(_BaseWindow):
 			def on_drop(event):
 				path = self._parse_dnd_path(event.data)
 				if path and os.path.exists(path):
-					textvariable.set(path)
+					if callable(on_path):
+						on_path(path)
+					elif textvariable is not None:
+						textvariable.set(path)
+				elif path:
+					print(f"[DnD] ファイルが見つからないので入れませんでした: {path}")
 			widget.dnd_bind("<<Drop>>", on_drop)
 			widget.dnd_bind("<<Drop:DND_Files>>", on_drop)
 		except Exception as e:
