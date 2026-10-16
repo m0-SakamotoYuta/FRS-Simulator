@@ -147,15 +147,28 @@ rows[tidx(TAB)].invoke(); rows[tidx(TAB2)].invoke(); pump(app)
 btn = [w for w in walk(win) if w.winfo_class() == "Button" and "チェックしたタブを解析" in str(w.cget("text"))][0]
 dialogs.clear()
 t0 = time.time()
+_idx_before = app._ankle_hm_index()
 btn.invoke(); pump(app, 5)
+_idx_after = app._ankle_hm_index()
 print(f"   画面から実行: {time.time() - t0:.0f}秒  ダイアログ {[d[0] for d in dialogs]}")
 summary = [d for d in dialogs if d[0] in ("showinfo", "showwarning")]
 print("   結果まとめ:", summary[-1][1][1].replace("\n", " / ") if summary else "")
-labels = {str(w.cget("text")) for w in walk(win) if w.winfo_class() == "TLabel"}
-r1 = [x for x in labels if "接触 保存済み" in x]
-r2 = [x for x in labels if "接触 計算済み" in x or "接触なし" in x]
-check(bool(r1), f"1タブ目は「接触 保存済み」（計算を省いた） {r1}")
-check(bool(r2), f"2タブ目は計算した {r2}")
+# 2026-10-14: 一覧は「④」と「接触の計算」の2欄。終わると接触の欄は「計算済み（日時）」。
+# 計算を省いたかどうかは結果のまとめ（showinfo）に出る
+def _lbl_text(w):
+	tv = str(w.cget("textvariable"))
+	return str(w.tk.globalgetvar(tv)) if tv else str(w.cget("text"))
+labels = [_lbl_text(w) for w in walk(win) if w.winfo_class() == "TLabel"]
+done = [x for x in labels if x.startswith("計算済み")]
+check(len(done) >= 2, f"2タブとも一覧の接触の欄が「計算済み」 {done}")
+# 計算を省いたタブは index の記録（日時）がそのまま、計算したタブは新しくなる
+def _t(d, k):          # 2026-10-15 から タブごとに記録のリスト（先頭が新しく使ったもの）
+	es = d.get(k) or []
+	return es[0].get("time") if es else None
+_b1, _a1 = _t(_idx_before, TAB), _t(_idx_after, TAB)
+_b2, _a2 = _t(_idx_before, TAB2), _t(_idx_after, TAB2)
+check(_b1 is not None and _a1 == _b1, f"{TAB} は保存済みの結果を使った（記録の日時がそのまま {_b1} → {_a1}）")
+check(_a2 is not None and _a2 != _b2, f"{TAB2} は計算した（記録の日時が新しくなる {_b2} → {_a2}）")
 win.destroy(); pump(app)
 app.destroy()
 print("RESULT:", "ALL PASS" if not fails else f"{len(fails)} FAIL: {fails}")

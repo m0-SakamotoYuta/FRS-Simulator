@@ -707,6 +707,7 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_hm_neg_mm = tk.DoubleVar(value=2.0)
 		self.ankle_hm_pos_mm = tk.DoubleVar(value=2.0)
 		self.ankle_hm_preset = tk.StringVar(value="デフォルト")
+		self.ankle_hm_show = tk.BooleanVar(value=True)    # 可視化でヒートマップを見せるか（2026-10-13）
 		# 方眼紙と移動量（2026-10-09）
 		self.ankle_grid_show = tk.BooleanVar(value=True)
 		self.ankle_grid_minor_mm = tk.DoubleVar(value=1.0)
@@ -714,6 +715,23 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_grid_size_mm = tk.DoubleVar(value=120.0)
 		self.ankle_disp_show = tk.BooleanVar(value=True)
 		self.ankle_disp_bone = tk.StringVar(value="（自動）")
+		# 関節面だけの表示・2点の距離の変化（2026-10-14）
+		self.ankle_joint_only = tk.BooleanVar(value=False)
+		# 表示変更用モデルで表示するか（2026-10-15。骨リストの display_model_path。計算には使わない）
+		self.ankle_alt_model = tk.BooleanVar(value=False)
+		# 可視化の右上の数字（骨A→B の相対姿勢）を出すか（2026-10-15）
+		self.ankle_overlay_show = tk.BooleanVar(value=True)
+		# 軸力（Fpd）が目標に達した時点を 0 として、可視化と右のグラフを始める（2026-10-15。既定 ON）
+		self.ankle_start_at_load = tk.BooleanVar(value=True)
+		# 右のグラフのうち datalog 以外（lig = 靭帯の長さ / pat_t = 膝蓋骨の移動 / pat_r = 膝蓋骨の回転）。2026-10-15
+		self.ankle_side_charts = tk.StringVar(value="lig")
+		# 右のグラフの並び順（キーをカンマで。無いものは決まった順で後ろに。2026-10-15）
+		self.ankle_chart_order = tk.StringVar(value="")
+		self.ankle_pairs_show = tk.BooleanVar(value=True)
+		# 骨とマーカーの大きさの合わせ方・キャリブの精密化（2026-10-14）
+		self.ankle_scale_mode = tk.StringVar(value="depth")          # depth: 補正後（深度）/ scan: スキャンの縮尺を直す
+		self.ankle_scan_scale_common = tk.BooleanVar(value=True)     # 骨リストで共通の縮尺
+		self.ankle_calib_refine = tk.BooleanVar(value=True)          # 手動4点のあと精密化する
 		# ロボットの datalog（2026-10-09）
 		self.ankle_robot_log_path = tk.StringVar(value="")
 		self.ankle_robot_log_show = tk.BooleanVar(value=True)
@@ -722,6 +740,8 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_robot_log_auto = tk.BooleanVar(value=True)       # 開くたびに自動で時刻を合わせる
 		self.ankle_marker_size_auto = tk.BooleanVar(value=True)     # 補正後を自動で更新するか
 		self.ankle_marker_size_note = tk.StringVar(value="")        # 自動の値のメモ（表示用）
+		# 補正後の由来（手動のとき）: 例「中央値 14.73 mm（19タブの深度推定・10/15）」。手で書き換えたら消える
+		self.ankle_marker_size_basis = tk.StringVar(value="")
 		self.ankle_pose_series_path = tk.StringVar(value="")   # 事前計算済み姿勢時系列(任意, npz/csv)
 		# RealSense D405 ライブ撮影設定 (友人 make_date_movie_D405.py の設定を既定値化)
 		self.ankle_rs_resolution = tk.StringVar(value="1280x720@15")   # 解像度@fps
@@ -3107,7 +3127,7 @@ class MainMenuGUI(_BaseWindow):
 		                variable=self.ankle_self_pose_world
 		                ).grid(row=0, column=2, sticky="w")
 		ttk.Label(mode_frame,
-		          text="🟢 新プラン: ①+③位置合わせは不要。各骨モデルに「🔍 スキャンから自動キャリブ」または手動キャリブで T_L←Mk が必要。組立スキャン省略で工数減。\n"
+		          text="🟢 新プラン: ①+③位置合わせは不要。各骨モデルに手動キャリブ（手動4点＋精密化・推奨）で T_L←Mk が必要。組立スキャン省略で工数減。\n"
 		               "⚪ 原プラン: ①+③位置合わせが必要。マーカー-骨キャリブは不要 (剛結合仮定)。\n"
 		               "⚡ 簡易版: 3Dスキャン不要。クランプにArUco貼付→ロボットML/AP/PDで軸方向を計測→関節座標系Cjを校正→骨マーカー動揺をCj系で出力。",
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
@@ -3215,6 +3235,8 @@ class MainMenuGUI(_BaseWindow):
 		           ).grid(row=0, column=0, padx=(0, 8))
 		ttk.Button(rf2, text="プレビュー+録画 (.db3保存)", command=self.on_ankle_rs_capture
 		           ).grid(row=0, column=1, padx=(0, 8))
+		ttk.Button(rf2, text="座標系だけの映像を書き出す（白背景）", command=self.on_ankle_export_axes_video
+		           ).grid(row=0, column=2, padx=(0, 8))
 		ttk.Label(rs_frame, textvariable=self.ankle_rs_status,
 		          foreground="#005580", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=4, column=0, sticky="w", padx=12, pady=(0, 2))
@@ -3320,6 +3342,10 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_size_note_lbl.pack(side=tk.LEFT)
 		self._ankle_size_auto_btn = ttk.Button(_note_fr, text="自動に戻す",
 		                                       command=lambda: self._ankle_size_set_auto(True))
+		# この値なら接触（ヒートマップ）は計算済み（押すとその値に戻せる。2026-10-15）
+		self._ankle_hm_sizes_fr = ttk.Frame(af)
+		self._ankle_hm_sizes_fr.grid(row=2, column=4, columnspan=4, sticky="w")
+		self.ankle_marker_size_mm.trace_add("write", lambda *_: self._ankle_schedule_hm_sizes())
 		# 実寸を変えたら、③の「キャリブに使った実寸との食い違い」の表示を更新する
 		self.ankle_marker_size_mm.trace_add("write", lambda *_: self._ankle_schedule_calib_size_check())
 		self.ankle_marker_size_true_mm.trace_add("write", lambda *_: self._ankle_schedule_size_refresh())
@@ -3329,8 +3355,8 @@ class MainMenuGUI(_BaseWindow):
 		                ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 		ttk.Label(af, text="※ SDKが報告する depth_scale が実データと10倍等ズレる場合、"
 		               "ArUcoの実寸基準と照合して自動補正します。",
-		          foreground="gray", font=(self.ui_font_family, 8), wraplength=700, justify="left"
-		          ).grid(row=2, column=0, columnspan=4, sticky="w", padx=(20, 0))
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=330, justify="left"
+		          ).grid(row=2, column=0, columnspan=4, sticky="nw", padx=(20, 0))
 		ttk.Label(af, text="姿勢推定手法:").grid(row=3, column=0, sticky="w", pady=(8, 0))
 		ttk.Combobox(af, textvariable=self.ankle_pose_method, width=30, state="readonly",
 		             values=["rgb  ★推奨 (最も安定)",
@@ -3354,6 +3380,23 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Spinbox(af, from_=1.0, to=5.0, increment=0.1,
 		            textvariable=self.ankle_plane_expand, width=6
 		            ).grid(row=5, column=2, sticky="w", pady=(6, 0))
+		# 骨とマーカーの大きさの合わせ方（2026-10-14）
+		sclf = ttk.LabelFrame(meas_frame, text="骨とマーカーの大きさの合わせ方（骨どうしのすき間に効きます）")
+		sclf.grid(row=5, column=0, columnspan=3, sticky="we", padx=12, pady=(4, 6))
+		ttk.Radiobutton(sclf, text="深度で測った「補正後」を使う（推奨）", value="depth", variable=self.ankle_scale_mode,
+		                command=self._ankle_refresh_scan_scale_lbl).grid(row=0, column=0, sticky="w", padx=6)
+		ttk.Radiobutton(sclf, text="スキャンの縮尺を直す（実寸はノギスのまま。ふつうは不要）", value="scan", variable=self.ankle_scale_mode,
+		                command=self._ankle_refresh_scan_scale_lbl).grid(row=0, column=1, sticky="w", padx=6)
+		ttk.Checkbutton(sclf, text="骨リストで共通の縮尺にする（推奨）", variable=self.ankle_scan_scale_common
+		                ).grid(row=0, column=2, sticky="w", padx=6)
+		self._ankle_scan_scale_lbl = ttk.Label(sclf, text="", font=(self.ui_font_family, 9))
+		self._ankle_scan_scale_lbl.grid(row=1, column=0, columnspan=3, sticky="w", padx=6)
+		ttk.Label(sclf, text=("※ 3D スキャンの中のマーカーを、テクスチャの「白のにじみ」（白が黒の側へ約 0.15〜0.2mm 広がる）も"
+		                      "一緒に推定して測ると、大きさは 15mm とほぼ同じ（縮尺 ≈1.00）でした。スキャンの大きさは正しいので、"
+		                      "ふつうは「補正後」を使ってください。2026-10-14 の最初の版は、にじみを縮尺と取り違えて「約 1.3% 小さい」"
+		                      "と誤って測っていました（その値は使いません。③の精密化をやり直すと、にじみを入れて測り直します）。"),
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=740, justify="left"
+		          ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 2))
 		self._add_file_row(meas_frame, 4, "姿勢時系列 (事前計算済, 任意)", self.ankle_pose_series_path,
 		                   lambda: self._ankle_choose(self.ankle_pose_series_path, "姿勢時系列ファイル(npz/csv)を選択", "pose"))
 
@@ -3383,7 +3426,9 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Button(btnrow2, text="名前変更", width=9, command=self.on_ankle_bone_rename).grid(row=0, column=2, padx=1)
 		btnrow3 = ttk.Frame(left)
 		btnrow3.grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
-		ttk.Button(btnrow3, text="🔒 固定/解除", width=15, command=self.on_ankle_bone_toggle_fixed).grid(row=0, column=0, padx=1)
+		self._ankle_fix_btn = ttk.Button(btnrow3, text="この骨を固定する", width=22,
+		                                 command=self.on_ankle_bone_toggle_fixed)
+		self._ankle_fix_btn.grid(row=0, column=0, padx=1)
 		# 骨リストを他のタブ（フォルダ内など）と共有する
 		btnrow4 = ttk.Frame(left)
 		btnrow4.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -3455,6 +3500,59 @@ class MainMenuGUI(_BaseWindow):
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
 
+		# 関節面モデル（2026-10-14）: フルモデルから関節面だけを切り抜いたもの。可視化の「関節面だけ表示」で使う
+		row += 1
+		ttk.Label(editor, text="関節面モデル (省略可):").grid(row=row, column=0, sticky="w", padx=(8, 4), pady=2)
+		joint_model_var = tk.StringVar(value="")
+		_e_joint = ttk.Entry(editor, textvariable=joint_model_var, state="readonly", width=40)
+		_e_joint.grid(row=row, column=1, sticky="ew", pady=2)
+		self._register_dnd(_e_joint, on_path=lambda p: self._ankle_set_bone_file_from_drop(
+			"joint_model_path", p, "関節面モデル"))
+		_jf = ttk.Frame(editor)
+		_jf.grid(row=row, column=2, sticky="w", padx=4)
+		ttk.Button(_jf, text="参照", width=5,
+		           command=lambda: self._ankle_pick_bone_file("joint_model_path", "関節面モデル（フルモデルから関節面を切り抜いたもの）を選択", "model")
+		           ).pack(side="left")
+		ttk.Button(_jf, text="外す", width=5,
+		           command=lambda: self._ankle_apply_editor_field("joint_model_path", None)).pack(side="left", padx=(2, 0))
+		self._ankle_bone_editor_widgets["joint_model_var"] = joint_model_var
+		row += 1
+		ttk.Label(editor,
+		          text="※ 関節面モデルは、上の骨モデル（可視化用フル）から関節面だけを切り抜いたもの（座標はフルと同じであること）。"
+		               "可視化の再生コントロールの「関節面だけ表示」で、この骨は関節面だけになります（関節面モデルの無い骨は隠れます）。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
+		# 表示変更用モデル（2026-10-15・臨時）: 計算に使ったモデルの、ヒートマップに関係ない所だけを直したもの。
+		# 表示だけに使う（接触の計算・保存結果の鍵には使わない）ので、計算し直さずに差し替えて見られる
+		row += 1
+		ttk.Label(editor, text="ヒートマップ計算後の，表示変更用モデル（省略可・ヒートマップに関係ない所だけ直したもの・臨時）",
+		          ).grid(row=row, column=0, columnspan=3, sticky="w", padx=(8, 4), pady=(4, 0))
+		row += 1
+		display_model_var = tk.StringVar(value="")
+		_e_disp = ttk.Entry(editor, textvariable=display_model_var, state="readonly", width=40)
+		_e_disp.grid(row=row, column=1, sticky="ew", pady=2)
+		self._register_dnd(_e_disp, on_path=lambda p: self._ankle_set_bone_file_from_drop(
+			"display_model_path", p, "表示変更用モデル"))
+		_df = ttk.Frame(editor)
+		_df.grid(row=row, column=2, sticky="w", padx=4)
+		ttk.Button(_df, text="参照", width=5,
+		           command=lambda: self._ankle_pick_bone_file(
+			           "display_model_path", "表示変更用モデル（計算に使ったモデルの、ヒートマップに関係ない所だけ直したもの）を選択",
+			           "model")).pack(side="left")
+		ttk.Button(_df, text="外す", width=5,
+		           command=lambda: self._ankle_apply_editor_field("display_model_path", None)).pack(side="left", padx=(2, 0))
+		self._ankle_bone_editor_widgets["display_model_var"] = display_model_var
+		row += 1
+		ttk.Label(editor,
+		          text="※ 接触（ヒートマップ）の計算に使ったモデルを、座標系はそのままで、ヒートマップに関係しない所だけ"
+		               "直したモデルを入れます（ボーンセメントや ArUco マーカーを消す、側面の穴を埋める など）。"
+		               "表示だけに使い、接触の計算には使わないので、計算し直さずに、計算済みのヒートマップをそのまま重ねて"
+		               "表示できます。関節面の近く（ヒートマップの色が付く所）は変えないでください。"
+		               "可視化の再生コントロールの「骨のモデル」で、計算に使ったモデルと切り替えられます。",
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
+		          ).grid(row=row, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
 		# --- 位置合わせ関連 (原プランのみで使用、他モードではグレーアウト) ---
 		row += 1
 		post_row_frame = ttk.Frame(editor)
@@ -3505,12 +3603,15 @@ class MainMenuGUI(_BaseWindow):
 		row += 1
 		opsf = ttk.Frame(editor)
 		opsf.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
-		ttk.Button(opsf, text="🔍 スキャンから自動キャリブ",
-		           command=self.on_ankle_auto_calibrate_from_mesh).grid(row=0, column=0, padx=(0, 4))
-		ttk.Checkbutton(opsf, text="多視点平均＋板面補正",
-		                variable=self.ankle_calib_v2).grid(row=1, column=0, sticky="w", pady=(2, 0))
-		ttk.Button(opsf, text="マーカー-骨キャリブ (手動4点)",
-		           command=self.on_ankle_calibrate_marker_to_bone).grid(row=0, column=1, padx=(0, 4))
+		# 手動4点＋精密化を推奨・左に。自動キャリブは合わないことがあるので非推奨・右に（2026-10-14）
+		ttk.Button(opsf, text="✅ マーカー-骨キャリブ（手動4点＋精密化・推奨）",
+		           command=self.on_ankle_calibrate_marker_to_bone).grid(row=0, column=0, padx=(0, 4))
+		ttk.Button(opsf, text="スキャンから自動キャリブ（非推奨）",
+		           command=self.on_ankle_auto_calibrate_from_mesh).grid(row=0, column=1, padx=(0, 4))
+		ttk.Checkbutton(opsf, text="多視点平均＋板面補正（自動キャリブ用）",
+		                variable=self.ankle_calib_v2).grid(row=1, column=1, sticky="w", pady=(2, 0))
+		ttk.Label(opsf, text="手動4点はだいたいでOK（あとで板面と模様で自動的に合わせ直します）",
+		          foreground="gray", font=(self.ui_font_family, 8)).grid(row=1, column=0, sticky="w", pady=(2, 0))
 		self._ankle_register_bone_btn = ttk.Button(opsf, text="初期スキャンへ位置合わせ",
 		           command=self.on_ankle_register_bone)
 		self._ankle_register_bone_btn.grid(row=0, column=2, padx=(0, 4))
@@ -3525,6 +3626,99 @@ class MainMenuGUI(_BaseWindow):
 		           command=lambda: self._ankle_apply_editor_field("reg_T", None))
 		self._ankle_clear_reg_btn.grid(row=0, column=1, padx=(0, 4))
 		self._ankle_reg_widgets.append(self._ankle_clear_reg_btn)
+		row += 1
+		opsf3 = ttk.Frame(editor)
+		opsf3.grid(row=row, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+		ttk.Checkbutton(opsf3, text="手動4点のあと、板面と模様で精密化する（推奨）", variable=self.ankle_calib_refine
+		                ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+		ttk.Button(opsf3, text="保存済みのキャリブを精密化（全部の骨）…", command=self.on_ankle_refine_saved_calibs
+		           ).grid(row=0, column=1, padx=(0, 4))
+		ttk.Button(opsf3, text="精密化の前に戻す", command=self.on_ankle_undo_refine).grid(row=0, column=2, padx=(0, 4))
+		ttk.Label(opsf3, text=("※ 精密化 = 傾きと奥行きをスキャンの板の形に、面の中の位置と回転をマーカーの模様全体に合わせ直す。"
+		                       "クリックの誤差とテクスチャの歪みが減ります。スキャンの中のマーカーの大きさ（スキャンの縮尺）も測ります。"),
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=740, justify="left"
+		          ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+		# 骨片つきでスキャンした骨を、骨片と重なる部分だけ削る（2026-10-13）
+		row += 1
+		trf = ttk.LabelFrame(editor, text="骨片つきでスキャンしてしまったとき（骨片なしのスキャンを忘れたとき用）")
+		trf.grid(row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 6))
+		trim_on_var = tk.BooleanVar(value=False)
+		trim_margin_var = tk.DoubleVar(value=self._ANKLE_TRIM_DEFAULT_MARGIN)
+		trim_cap_var = tk.BooleanVar(value=True)
+		ttk.Checkbutton(trf, text="この骨から、重なっている骨片の部分を削る", variable=trim_on_var,
+		                command=self._ankle_trim_toggle).grid(row=0, column=0, sticky="w", padx=(6, 8), pady=(2, 0))
+		trim_by_lbl = ttk.Label(trf, text="骨片: （未選択）")
+		trim_by_lbl.grid(row=0, column=1, sticky="w")
+		ttk.Button(trf, text="骨片を選ぶ…", command=self._ankle_trim_choose).grid(row=0, column=2, sticky="w", padx=6)
+		trr = ttk.Frame(trf)
+		trr.grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 0))
+		ttk.Label(trr, text="余裕").pack(side="left")
+
+		def _on_trim_margin(*_a):
+			if (self._ankle_bone_editor_widgets or {}).get("_trim_loading"):
+				return
+			try:
+				v = float(trim_margin_var.get())
+			except (tk.TclError, ValueError):
+				return
+			if v > 0:
+				self._ankle_trim_set(margin_mm=v)
+		ttk.Spinbox(trr, from_=0.5, to=5.0, increment=0.5, textvariable=trim_margin_var, width=5,
+		            command=_on_trim_margin).pack(side="left", padx=(2, 2))
+		_sp_last = trr.winfo_children()[-1]
+		_sp_last.bind("<FocusOut>", _on_trim_margin)
+		_sp_last.bind("<Return>", _on_trim_margin)
+		ttk.Label(trr, text="mm").pack(side="left", padx=(0, 12))
+		ttk.Checkbutton(trr, text="削った穴に、骨片の割れ面でふたをする", variable=trim_cap_var,
+		                command=lambda: (None if (self._ankle_bone_editor_widgets or {}).get("_trim_loading")
+		                                 else self._ankle_trim_set(cap=bool(trim_cap_var.get())))
+		                ).pack(side="left")
+		ttk.Button(trr, text="削った結果を見る…", command=self._ankle_trim_preview).pack(side="left", padx=(12, 0))
+		trr2 = ttk.Frame(trf)
+		trr2.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 0))
+		trim_refine_var = tk.BooleanVar(value=True)
+		trim_clean_var = tk.DoubleVar(value=self._ANKLE_TRIM_DEFAULT_CLEAN)
+		ttk.Checkbutton(trr2, text="骨片の位置をスキャンに合わせて微調整し、その位置でも削る（外側の殻を消す）",
+		                variable=trim_refine_var,
+		                command=lambda: (None if (self._ankle_bone_editor_widgets or {}).get("_trim_loading")
+		                                 else self._ankle_trim_set(refine=bool(trim_refine_var.get())))
+		                ).pack(side="left")
+		ttk.Label(trr2, text="　細い切れ端を消す幅").pack(side="left")
+
+		def _on_trim_clean(*_a):
+			if (self._ankle_bone_editor_widgets or {}).get("_trim_loading"):
+				return
+			try:
+				v = float(trim_clean_var.get())
+			except (tk.TclError, ValueError):
+				return
+			if v >= 0:
+				self._ankle_trim_set(clean_mm=v)
+		_sp_clean = ttk.Spinbox(trr2, from_=0.0, to=5.0, increment=0.5, textvariable=trim_clean_var, width=5,
+		                        command=_on_trim_clean)
+		_sp_clean.pack(side="left", padx=(2, 2))
+		_sp_clean.bind("<FocusOut>", _on_trim_clean)
+		_sp_clean.bind("<Return>", _on_trim_clean)
+		ttk.Label(trr2, text="mm（0 = 消さない）").pack(side="left")
+		ttk.Label(trf, text=("※ 本来は、骨片を外した状態でこの骨をスキャンしてください。これは、骨片を付けたままスキャンして"
+		                     "しまい、骨片なしのスキャンを忘れたとき用です。可視化のたびに、その録画で この骨と骨片が"
+		                     "どちらも写っている最初のコマの位置で、骨片と重なる部分を削ります（元のファイルは変えません）。"
+		                     "骨片のマーカーが写っていない録画（intact など）では削りません。最初のコマで骨片がずれていると、"
+		                     "削る場所もずれます。「余裕」は、骨片の表面からこの距離以内の点も削る量です（マーカーの誤差の分）。"
+		                     "割れ面のふた＝骨片の割れた面を写し取ったもので、骨片が動くと すき間がヒートマップに出ます。"
+		                     "「微調整」＝マーカーから求めた骨片の位置がスキャンの中の骨片とずれていると、脛骨の外側に殻が"
+		                     "残るので、骨片をスキャンに小さく合わせ直した位置でも削ります（良くなったときだけ。骨片の表示と"
+		                     "動きは変えません）。「細い切れ端」＝骨片の近くに残るリボン状の切れ端を、この幅で消します。"
+		                     "削ると接触の計算は別の結果として計算し直しになります。"),
+		          foreground="gray", font=(self.ui_font_family, 8), wraplength=740, justify="left"
+		          ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 4))
+		self._ankle_bone_editor_widgets["trim_on_var"] = trim_on_var
+		self._ankle_bone_editor_widgets["trim_margin_var"] = trim_margin_var
+		self._ankle_bone_editor_widgets["trim_cap_var"] = trim_cap_var
+		self._ankle_bone_editor_widgets["trim_by_lbl"] = trim_by_lbl
+		self._ankle_bone_editor_widgets["trim_refine_var"] = trim_refine_var
+		self._ankle_bone_editor_widgets["trim_clean_var"] = trim_clean_var
 
 		# 位置合わせパラメータ (タブ共通、原プランのみで使用)
 		param_frame = ttk.LabelFrame(bones_frame, text="位置合わせパラメータ (原プランのみ・全骨共有)",
@@ -3670,6 +3864,10 @@ class MainMenuGUI(_BaseWindow):
 		                     "−側より深いめり込みは濃い赤のまま。可視化ウィンドウの再生コントロールでも変えられます。"),
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(2, 0))
+		ttk.Checkbutton(hmr, text="ヒートマップを表示（接触を計算済みのとき。再生コントロールでも切り替えられ、前回の選択を覚えます）",
+		                variable=self.ankle_hm_show).grid(row=2, column=0, columnspan=8, sticky="w", pady=(2, 0))
+		ttk.Checkbutton(hmr, text="関節面だけ表示（③で関節面モデルを入れた骨だけを関節面で表示し、ほかの骨は隠す。再生コントロールでも切り替え）",
+		                variable=self.ankle_joint_only).grid(row=3, column=0, columnspan=8, sticky="w", pady=(2, 0))
 
 		# 方眼紙と移動量（2026-10-09）
 		grd = ttk.Frame(vis_frame)
@@ -3697,6 +3895,22 @@ class MainMenuGUI(_BaseWindow):
 		                     "方眼紙の向き（横・縦・奥行き）で示します。「移動の基準をいまのコマにする」で基準を変えられます。"),
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=1, column=0, columnspan=10, sticky="w", pady=(2, 0))
+		self._ankle_grid_fix_lbl = ttk.Label(grd, text="", font=(self.ui_font_family, 9), wraplength=760,
+		                                     justify="left")
+		self._ankle_grid_fix_lbl.grid(row=2, column=0, columnspan=10, sticky="w", pady=(2, 0))
+
+		# 2点の距離の変化（2026-10-14）
+		prs = ttk.LabelFrame(grd, text="2点の距離の変化（例: 脛骨の点A と 骨片の点B。最初のコマを 0 として、距離がどれだけ変わったか）")
+		prs.grid(row=3, column=0, columnspan=10, sticky="we", pady=(6, 0))
+		_pr0 = ttk.Frame(prs)
+		_pr0.pack(fill="x", padx=6, pady=(2, 2))
+		ttk.Checkbutton(_pr0, text="可視化に表示する（点・線・左上の数値・右下のグラフ）", variable=self.ankle_pairs_show
+		                ).pack(side="left")
+		ttk.Button(_pr0, text="＋ 2点を追加…", command=self._ankle_pair_add).pack(side="left", padx=(12, 0))
+		self._ankle_pairs_frame = ttk.Frame(prs)
+		self._ankle_pairs_frame.pack(fill="x", padx=6)
+		ttk.Label(prs, text='※ 2点はできるだけ近くに置いてください（それぞれ関節面の近くで、割れ目をはさんで向かい合う所）。距離は、2点を結ぶ向きの動きにはそのまま反応しますが、それに垂直な横ずれにはほとんど反応しません（例: 2点が 10 mm 離れていると、0.5 mm の横ずれでも距離は 0.01 mm しか変わりません。2点が近いほど、どの向きのずれも距離の変化に出ます）。', foreground="gray", font=(self.ui_font_family, 8), wraplength=740,
+		          justify="left").pack(fill="x", padx=6, pady=(2, 4))
 
 		# ロボットの datalog（2026-10-09）
 		rlg = ttk.Frame(vis_frame)
@@ -3727,6 +3941,13 @@ class MainMenuGUI(_BaseWindow):
 		                "ロボットの変位（ML/AP/PD）は治具・ポッティングのたわみを含むので、骨の動きは方眼紙と移動量で見てください。"),
 		          foreground="gray", font=(self.ui_font_family, 8), wraplength=760, justify="left"
 		          ).grid(row=8, column=0, sticky="w", padx=12, pady=(0, 6))
+
+		# 靭帯の長さを比べる（2026-10-15）
+		_lcf = ttk.Frame(vis_frame)
+		_lcf.grid(row=9, column=0, sticky="w", padx=12, pady=(0, 6))
+		ttk.Button(_lcf, text="靭帯の長さを比べる…", command=self._ankle_open_lig_compare).pack(side="left")
+		ttk.Label(_lcf, text="（例: ACL の長さを、切除前と ACL切 の試験で重ねる。ACL切では「ACL があった所」の長さ）",
+		          foreground="gray", font=(self.ui_font_family, 8)).pack(side="left", padx=(6, 0))
 
 		opt2 = ttk.Frame(vis_frame)
 		opt2.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 6))
@@ -3864,7 +4085,8 @@ class MainMenuGUI(_BaseWindow):
 			aid = b.get("aruco_id", "?")
 			mk = "M" if b.get("marker_to_bone_T") is not None else "-"
 			rg = "R" if b.get("reg_T") is not None else "-"
-			lock = "🔒 " if b.get("fixed") else "   "
+			# 🔒（絵文字）は Tk の Listbox で表示されないことがあるので、文字で出す
+			lock = "【固定】" if b.get("fixed") else ""
 			st, cs, cur = self._ankle_calib_size_state(b)
 			flag = f"  ⚠実寸{cs:g}≠{cur:g}" if st == "mismatch_auto" else ""
 			lb.insert(tk.END, f"{lock}{i+1}. {name} [ID={aid}] {mk}{rg}{flag}")
@@ -3883,6 +4105,41 @@ class MainMenuGUI(_BaseWindow):
 				pass
 		self._ankle_load_editor_from_bone()
 		self._ankle_refresh_heatmap_combos()
+
+	def _ankle_refresh_fix_status(self) -> None:
+		"""③の固定ボタンの文字と、⑤の「いま固定している骨」を、いまの状態に合わせる。"""
+		bones = getattr(self, "ankle_bones", None) or []
+		i = int(getattr(self, "_ankle_selected_bone", -1) or 0)
+		btn = getattr(self, "_ankle_fix_btn", None)
+		if btn is not None:
+			try:
+				if 0 <= i < len(bones) and bones[i].get("fixed"):
+					btn.configure(text="固定を外す（いま固定中）")
+				else:
+					btn.configure(text="この骨を固定する")
+			except Exception:
+				pass
+		lbl = getattr(self, "_ankle_grid_fix_lbl", None)
+		if lbl is not None:
+			fx = [str(b.get("name", "")) for b in bones if b.get("fixed")]
+			try:
+				if fx:
+					lbl.configure(text=f"いま固定している骨: {fx[0]}（方眼紙はこの骨に対して動きません）",
+					              foreground="#1a4f8a")
+				else:
+					lbl.configure(text="⚠ ③で「固定」にしている骨がありません → 方眼紙と移動量は表示されません。"
+					                   "③で動かない骨（大腿骨など）を選んで「この骨を固定する」を押してください",
+					              foreground="#c62828")
+			except Exception:
+				pass
+		try:
+			self._ankle_refresh_pairs_ui()
+		except Exception as e:
+			print(f"[2点の距離] 欄の更新に失敗: {e}")
+		try:
+			self._ankle_refresh_scan_scale_lbl()
+		except Exception:
+			pass
 
 	def _ankle_refresh_heatmap_combos(self) -> None:
 		labels = [f"{i+1}. {b.get('name','')}" for i, b in enumerate(self.ankle_bones)]
@@ -3905,6 +4162,10 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_load_editor_from_bone()
 
 	def _ankle_load_editor_from_bone(self) -> None:
+		try:
+			self._ankle_refresh_fix_status()
+		except Exception:
+			pass
 		b = self._ankle_current_bone()
 		w = self._ankle_bone_editor_widgets
 		if not w:
@@ -3935,11 +4196,16 @@ class MainMenuGUI(_BaseWindow):
 			w["model_var"].set(b.get("model_path", "") or "")
 			if "calib_model_var" in w:
 				w["calib_model_var"].set(b.get("calib_model_path", "") or "")
+			if "joint_model_var" in w:
+				w["joint_model_var"].set(b.get("joint_model_path", "") or "")
+			if "display_model_var" in w:
+				w["display_model_var"].set(b.get("display_model_path", "") or "")
 			w["post_var"].set(b.get("post_scan_path", "") or "")
 			if "method_var" in w:
 				w["method_var"].set(str(b.get("method", "ransac")))
 			if "scaling_var" in w:
 				w["scaling_var"].set(bool(b.get("enable_scaling", False)))
+			self._ankle_refresh_trim_ui()
 			c = self._ankle_color_of(self._ankle_selected_bone)
 			w["color_btn"].configure(bg=c, activebackground=c)
 			mk_ok = b.get("marker_to_bone_T") is not None
@@ -4060,6 +4326,95 @@ class MainMenuGUI(_BaseWindow):
 			b[key] = path
 			self._ankle_load_editor_from_bone()
 			self._schedule_state_autosave("ankle")
+			if key == "joint_model_path":
+				self._ankle_check_joint_model(b)
+			if key == "display_model_path":
+				self._ankle_check_display_model(b)
+
+	def _ankle_check_display_model(self, b) -> None:
+		"""表示変更用モデルが、計算に使ったモデルと同じ座標か・関節面の近くが変わっていないかを確かめる（2026-10-15）。
+
+		- 同じ座標か: 表示変更用モデルの点のうち、元のモデルの表面から 0.05mm 以内にある割合（変えていない所）
+		- 関節面の近く: 関節面モデルがあれば、その点が表示変更用モデルの表面から どれだけ離れているか
+		"""
+		import numpy as np
+		name = str(b.get("name", ""))
+		try:
+			dm = pv.read(str(b.get("display_model_path", ""))).extract_surface().triangulate().clean()
+			fm = pv.read(str(b.get("model_path", ""))).extract_surface().triangulate().clean()
+		except Exception as e:
+			messagebox.showwarning("表示変更用モデル", f"読み込めませんでした:\n{e}", parent=self)
+			return
+		rng = np.random.default_rng(0)
+		try:
+			pts = np.asarray(dm.points, dtype=float)
+			if len(pts) > 8000:
+				pts = pts[rng.choice(len(pts), 8000, replace=False)]
+			d = np.abs(np.asarray(pv.PolyData(pts).compute_implicit_distance(fm)["implicit_distance"]))
+			same = float(np.mean(d < 0.05))
+			med = float(np.median(d))
+		except Exception as e:
+			print(f"[表示変更用モデル] 確認に失敗: {e}")
+			return
+		msg_j = ""
+		bad_j = False
+		jp = str(b.get("joint_model_path", "") or "")
+		if jp:
+			try:
+				jm = pv.read(jp).extract_surface().clean()
+				q = np.asarray(jm.points, dtype=float)
+				if len(q) > 5000:
+					q = q[rng.choice(len(q), 5000, replace=False)]
+				dj = np.abs(np.asarray(pv.PolyData(q).compute_implicit_distance(dm)["implicit_distance"]))
+				p95j = float(np.percentile(dj, 95))
+				msg_j = f" / 関節面モデルの点から表示変更用モデルの表面まで 95% {p95j:.3f} mm"
+				bad_j = p95j > 0.1
+			except Exception as e:
+				print(f"[表示変更用モデル] 関節面との確認に失敗: {e}")
+		print(f"[表示変更用モデル] {name}: 元のモデルの表面に乗っている点 {same * 100:.0f}%（中央値 {med:.3f} mm）{msg_j}")
+		if med > 0.5 or same < 0.3:
+			messagebox.showwarning(
+				"表示変更用モデル",
+				f"「{name}」の表示変更用モデルが、計算に使ったモデルと同じ座標になっていない可能性があります"
+				f"（元の表面に乗っている点 {same * 100:.0f}%、距離の中央値 {med:.2f} mm）。\n\n"
+				"別の座標で保存されていると、ヒートマップの色が違う所に付きます。\n\n"
+				f"表示変更用モデル: {Path(str(b.get('display_model_path', ''))).name}\n"
+				f"計算に使ったモデル: {Path(str(b.get('model_path', ''))).name}", parent=self)
+		elif bad_j:
+			messagebox.showwarning(
+				"表示変更用モデル",
+				f"「{name}」の表示変更用モデルは、関節面の近くが元のモデルと違うようです{msg_j}。\n\n"
+				"関節面の近くを変えると、表示されるヒートマップは、計算したもの（元のモデル）とずれます。"
+				"関節面の近くは変えずに、ヒートマップに関係しない所だけを直してください。", parent=self)
+
+	def _ankle_check_joint_model(self, b) -> None:
+		"""関節面モデルが骨モデル（可視化用フル）の上に乗っているか（同じ座標で切り抜いたものか）を確かめる。"""
+		import numpy as np
+		try:
+			jm = pv.read(str(b.get("joint_model_path", "")))
+			fm = pv.read(str(b.get("model_path", "")))
+		except Exception as e:
+			messagebox.showwarning("関節面モデル", f"読み込めませんでした:\n{e}", parent=self)
+			return
+		try:
+			pts = np.asarray(jm.extract_surface().clean().points, dtype=float)
+			if len(pts) > 5000:
+				pts = pts[np.random.default_rng(0).choice(len(pts), 5000, replace=False)]
+			d = np.abs(np.asarray(pv.PolyData(pts).compute_implicit_distance(
+				fm.extract_surface().triangulate().clean())["implicit_distance"]))
+			med, p95 = float(np.median(d)), float(np.percentile(d, 95))
+		except Exception as e:
+			print(f"[関節面モデル] 確認に失敗: {e}")
+			return
+		print(f"[関節面モデル] {b.get('name', '')}: 骨モデルの表面からの距離 中央値 {med:.3f} mm / 95% {p95:.3f} mm")
+		if med > 0.5:
+			messagebox.showwarning(
+				"関節面モデル",
+				f"「{b.get('name', '')}」の関節面モデルが、骨モデル（可視化用フル）の表面からずれています"
+				f"（中央値 {med:.1f} mm）。\n\n骨モデルから切り抜いたものでないか、別の座標で保存されている"
+				f"可能性があります。このままだと、関節面が骨と違う所に表示されます。\n\n"
+				f"関節面モデル: {Path(str(b.get('joint_model_path', ''))).name}\n"
+				f"骨モデル: {Path(str(b.get('model_path', ''))).name}", parent=self)
 
 	def _ankle_set_bone_file_from_drop(self, key: str, path: str, label: str) -> None:
 		"""③の欄にファイルをドロップしたとき: 「参照」と同じく、選択中の骨に保存する。"""
@@ -4075,6 +4430,10 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_load_editor_from_bone()
 		self._schedule_state_autosave("ankle")
 		print(f"[DnD] {b.get('name', '')} の{label}: {path}")
+		if key == "joint_model_path":
+			self._ankle_check_joint_model(b)
+		if key == "display_model_path":
+			self._ankle_check_display_model(b)
 
 	def _ankle_choose_bone_color(self) -> None:
 		b = self._ankle_current_bone()
@@ -4180,7 +4539,10 @@ class MainMenuGUI(_BaseWindow):
 				b["fixed"] = False
 		# トグル
 		self.ankle_bones[i]["fixed"] = not current
+		print(f"[骨固定] {self.ankle_bones[i].get('name', '')}: {'固定しました' if not current else '固定を外しました'}")
 		self._ankle_refresh_bone_listbox()
+		self._ankle_refresh_fix_status()
+		self._schedule_state_autosave("ankle")
 		# 選択状態を維持
 		try:
 			lb = self._ankle_bones_listbox
@@ -4206,9 +4568,21 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_marker_size_mm": (self.ankle_marker_size_mm, float),
 			"ankle_marker_size_true_mm": (self.ankle_marker_size_true_mm, float),
 			"ankle_marker_size_auto": (self.ankle_marker_size_auto, bool),
+			"ankle_marker_size_basis": (self.ankle_marker_size_basis, str),
 			"ankle_hm_neg_mm": (self.ankle_hm_neg_mm, float),
 			"ankle_hm_pos_mm": (self.ankle_hm_pos_mm, float),
 			"ankle_hm_preset": (self.ankle_hm_preset, str),
+			"ankle_hm_show": (self.ankle_hm_show, bool),
+			"ankle_joint_only": (self.ankle_joint_only, bool),
+			"ankle_alt_model": (self.ankle_alt_model, bool),
+			"ankle_overlay_show": (self.ankle_overlay_show, bool),
+			"ankle_start_at_load": (self.ankle_start_at_load, bool),
+			"ankle_side_charts": (self.ankle_side_charts, str),
+			"ankle_chart_order": (self.ankle_chart_order, str),
+			"ankle_pairs_show": (self.ankle_pairs_show, bool),
+			"ankle_scale_mode": (self.ankle_scale_mode, str),
+			"ankle_scan_scale_common": (self.ankle_scan_scale_common, bool),
+			"ankle_calib_refine": (self.ankle_calib_refine, bool),
 			"ankle_grid_show": (self.ankle_grid_show, bool),
 			"ankle_grid_minor_mm": (self.ankle_grid_minor_mm, float),
 			"ankle_grid_major_mm": (self.ankle_grid_major_mm, float),
@@ -4255,6 +4629,47 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_self_pose_world": (self.ankle_self_pose_world, str),
 		}
 
+	# 骨リストを共有しているタブどうしで、同じにする表示の設定（2026-10-14）。
+	# 共有の中身 self._ankle_bone_groups[gid]["view"] に入れ、タブを開くときに上書きする。
+	# 方眼紙の向き（タブの "grid_plane"）も共有の "grid_plane" でそろえる。
+	_ANKLE_VIEW_SHARED_KEYS = (
+		"ankle_grid_show", "ankle_grid_minor_mm", "ankle_grid_major_mm", "ankle_grid_size_mm",
+		"ankle_disp_show", "ankle_disp_bone",
+		"ankle_hm_show", "ankle_hm_neg_mm", "ankle_hm_pos_mm", "ankle_hm_preset",
+		"ankle_joint_only", "ankle_pairs_show", "ankle_scale_mode", "ankle_scan_scale_common", "ankle_alt_model",
+		"ankle_overlay_show", "ankle_start_at_load", "ankle_side_charts", "ankle_chart_order")
+
+	def _ankle_view_write(self, tab_ref, values: dict) -> None:
+		"""表示の設定を、可視化を開いたときのタブに書く。骨リストを共有していれば、共有しているタブすべてに。"""
+		active = self._ankle_active_tab_dict()
+		gid = self._ankle_tab_group(tab_ref) if isinstance(tab_ref, dict) else None
+		if tab_ref is None or tab_ref is active or (gid and gid == self._ankle_tab_group(active)):
+			vs = self._ankle_state_vars()
+			for k, v in values.items():
+				if k in vs:
+					var, typ = vs[k]
+					try:
+						var.set(typ(v) if typ in (bool, int, float, str) else v)
+					except Exception:
+						pass
+		elif isinstance(tab_ref, dict):
+			tab_ref.setdefault("snapshot", {}).update(values)
+		if gid:
+			grp = self._ankle_bone_groups_dict()[gid]
+			grp.setdefault("view", {}).update({k: v for k, v in values.items() if k in self._ANKLE_VIEW_SHARED_KEYS})
+		self._schedule_state_autosave("ankle")
+
+	def _ankle_grid_plane_write(self, tab_ref, plane) -> None:
+		"""方眼紙の向きを保存する。骨リストを共有していれば、共有しているタブすべてに。"""
+		gid = self._ankle_tab_group(tab_ref) if isinstance(tab_ref, dict) else None
+		if gid:
+			self._ankle_bone_groups_dict()[gid]["grid_plane"] = copy.deepcopy(plane)
+			for i in self._ankle_group_members(gid):
+				self._ankle_tabs[i]["grid_plane"] = copy.deepcopy(plane)
+		elif isinstance(tab_ref, dict):
+			tab_ref["grid_plane"] = plane
+		self._schedule_state_autosave("ankle")
+
 	def _ankle_snapshot_current(self) -> dict:
 		snap = {}
 		for key, (var, _t) in self._ankle_state_vars().items():
@@ -4277,11 +4692,29 @@ class MainMenuGUI(_BaseWindow):
 			_grp["ligaments"][:] = snap["_ligaments"]
 			snap["_bones"] = _grp["bones"]
 			snap["_ligaments"] = _grp["ligaments"]
+			# 表示の設定も共有へ（いま開いているタブの値）
+			_grp["view"] = {k: snap[k] for k in self._ANKLE_VIEW_SHARED_KEYS if k in snap}
+			_tab = self._ankle_active_tab_dict()
+			if isinstance(_tab, dict) and _tab.get("grid_plane"):
+				_grp["grid_plane"] = copy.deepcopy(_tab["grid_plane"])
 		return snap
 
 	def _ankle_restore_snapshot(self, snap: dict) -> None:
 		if not isinstance(snap, dict):
 			return
+		# 骨リストを共有しているタブなら、表示の設定と方眼紙の向きは共有の値を使う
+		try:
+			_tab0 = self._ankle_active_tab_dict()
+			_gid0 = self._ankle_tab_group(_tab0)
+			_grp0 = self._ankle_bone_groups_dict().get(_gid0) if _gid0 else None
+			if _grp0 is not None:
+				if isinstance(_grp0.get("view"), dict) and _grp0["view"]:
+					snap = dict(snap)
+					snap.update(_grp0["view"])
+				if _grp0.get("grid_plane") and isinstance(_tab0, dict):
+					_tab0["grid_plane"] = copy.deepcopy(_grp0["grid_plane"])
+		except Exception as e:
+			print(f"[骨リストの共有] 表示の設定の読み込みに失敗: {e}")
 		default = self._ankle_default_snap if isinstance(getattr(self, "_ankle_default_snap", None), dict) else {}
 		for key, (var, typ) in self._ankle_state_vars().items():
 			if key in snap:
@@ -4311,6 +4744,8 @@ class MainMenuGUI(_BaseWindow):
 				pass
 		if "ankle_marker_size_auto" not in snap:
 			self.ankle_marker_size_auto.set(True)
+		if "ankle_marker_size_basis" not in snap:
+			self.ankle_marker_size_basis.set("")       # 前のタブの由来を引きずらない
 		bones = snap.get("_bones", None)
 		# 骨リストを共有しているタブなら、共有の中身を使う
 		_gid = self._ankle_tab_group(self._ankle_active_tab_dict())
@@ -4335,6 +4770,7 @@ class MainMenuGUI(_BaseWindow):
 			self._ankle_size_refresh_auto()
 		except Exception as e:
 			print(f"[マーカー実寸] 自動の値の更新に失敗: {e}")
+		self._ankle_schedule_hm_sizes()
 
 	def _ankle_rebuild_tabbar(self) -> None:
 		fr = self._ankle_tabbar_frame
@@ -4990,7 +5426,7 @@ class MainMenuGUI(_BaseWindow):
 		win.transient(self)
 		x = self.winfo_rootx() + 40
 		y = self.winfo_rooty() + 40
-		win.geometry(f"1180x700+{x}+{y}")
+		win.geometry(f"1440x700+{x}+{y}")
 		win.minsize(900, 460)
 
 		ttk.Label(win, justify="left", wraplength=1140, text=(
@@ -5049,8 +5485,10 @@ class MainMenuGUI(_BaseWindow):
 		btn_all.pack(side="left", padx=2)
 		btn_none = ttk.Button(ctl2, text="チェックをすべて外す")
 		btn_none.pack(side="left", padx=2)
-		btn_new = ttk.Button(ctl2, text="未解析だけチェック")
+		btn_new = ttk.Button(ctl2, text="④が未解析だけチェック")
 		btn_new.pack(side="left", padx=2)
+		btn_new_hm = ttk.Button(ctl2, text="接触が未計算だけチェック")
+		btn_new_hm.pack(side="left", padx=2)
 
 		# --- 下: 実行 ---
 		foot = ttk.Frame(win)
@@ -5098,7 +5536,8 @@ class MainMenuGUI(_BaseWindow):
 		cv.bind("<Enter>", _bind_wheel)
 		cv.bind("<Leave>", _unbind_wheel)
 
-		heads = ("", "タブ名", "フォルダ", "実寸 ノギス(mm)", "録画ファイル（②）", "いまの結果")
+		heads = ("順", "タブ名", "フォルダ", "実寸 ノギス(mm)", "補正後・計算に使う", "録画ファイル（②）",
+		         "④ ArUco検出+PnP", "接触の計算")
 		for c, h in enumerate(heads):
 			ttk.Label(inner, text=h, font=(self.ui_font_family, 9, "bold")
 			          ).grid(row=0, column=c, sticky="w", padx=4, pady=(0, 4))
@@ -5110,29 +5549,50 @@ class MainMenuGUI(_BaseWindow):
 				return "20"
 
 		rows = []
+		hm_legacy = self._ankle_hm_legacy_tabs()
 
 		def result_text(row):
-			"""いまのキャッシュから「いまの結果」欄の文字と色を作る。"""
+			"""いまのキャッシュから「④」欄の文字と色を作る（④の実寸が②と違っても、表示は②に合わせる）。"""
 			cache = self._ankle_pose_cache.get(row["name"])
 			if not cache:
-				return "未解析", "#666666"
+				return "未解析", "#c62828"
 			n = int(cache.get("frame_count", 0))
 			try:
 				csize = float(cache.get("marker_size_mm", 0.0))
 			except Exception:
 				csize = 0.0
-			txt = f"解析済み {n}枚・{csize:g}mm"
+			return f"済み {n}枚（{csize:g}mm）", "#1b5e20"
+
+		def hm_text(row):
 			try:
-				if abs(float(row["size"].get()) - csize) > 1e-6:
-					# 可視化・接触は②の実寸に合わせて使うので、④をやり直さなくてよい
-					return txt + "（表示は②の実寸に合わせます）", "#005580"
-			except Exception:
-				pass
-			return txt, "#1b5e20"
+				txt, col, done = self._ankle_hm_status_for_tab(row["tab"], hm_legacy)
+			except Exception as e:
+				txt, col, done = f"（調べられません: {e}）", "#888888", False
+			row["hm_done"] = done
+			return txt, col
+
+		# チェックを入れた順に解析する（2026-10-15）。順番はチェック欄の数字で見せる
+		check_seq = {"n": 0}
 
 		def update_count(*_):
-			n = sum(1 for r in rows if r["chk"].get())
-			count_var.set(f"チェック: {n} タブ")
+			for r in rows:                       # 変数だけ変わった行（一括のボタンなど）の順番をそろえる
+				if r["chk"].get() and r.get("order") is None:
+					check_seq["n"] += 1
+					r["order"] = check_seq["n"]
+				elif not r["chk"].get():
+					r["order"] = None
+			ordered = sorted((r for r in rows if r["chk"].get()), key=lambda r: r["order"])
+			rank = {id(r): k + 1 for k, r in enumerate(ordered)}
+			for r in rows:
+				try:
+					r["widgets"][0].configure(text=(str(rank[id(r)]) if id(r) in rank else ""))
+				except Exception:
+					pass
+			n = len(ordered)
+			count_var.set(f"チェック: {n} タブ（チェックを入れた順に解析します）")
+
+		def checked_in_order():
+			return sorted((r for r in rows if r["chk"].get()), key=lambda r: (r.get("order") or 0, r["i"]))
 
 		def write_size(row):
 			"""実寸欄の値を、そのタブの②マーカー実寸へそのまま書く（解析しなくても反映）。
@@ -5167,12 +5627,31 @@ class MainMenuGUI(_BaseWindow):
 				self._ankle_size_refresh_auto()
 			self._schedule_state_autosave("ankle")
 
+		def eff_text(row):
+			try:
+				tm = float(row["size"].get())
+			except Exception:
+				tm = None
+			v, kind, _b = self._ankle_tab_eff_size(row["tab"], tm)
+			if v is None:
+				return "—", "#888888"
+			return f"{v:g}（{kind}）", {"中央値": "#005580", "手動": "#333333"}.get(kind, "#666666")
+
 		def recolor(row):
+			try:
+				txt, col = eff_text(row)
+				row["eff_var"].set(txt)
+				row["eff_lbl"].configure(foreground=col)
+			except Exception:
+				pass
 			if row.get("state"):
 				return
 			txt, col = result_text(row)
 			row["res_var"].set(txt)
 			row["res_lbl"].configure(foreground=col)
+			txt, col = hm_text(row)
+			row["hm_var"].set(txt)
+			row["hm_lbl"].configure(foreground=col)
 
 		for i, tab in enumerate(self._ankle_tabs):
 			snap = tab.get("snapshot") or {}
@@ -5193,17 +5672,22 @@ class MainMenuGUI(_BaseWindow):
 			       "chk": tk.BooleanVar(value=False),
 			       "size": tk.StringVar(value=_fmt_size(snap.get("ankle_marker_size_true_mm",
 			                                                     snap.get("ankle_marker_size_mm", 20.0)))),
-			       "res_var": tk.StringVar(value=""), "state": None}
-			c0 = ttk.Checkbutton(inner, variable=row["chk"], command=update_count,
+			       "res_var": tk.StringVar(value=""), "hm_var": tk.StringVar(value=""), "state": None,
+			       "order": None, "eff_var": tk.StringVar(value="")}
+			c0 = ttk.Checkbutton(inner, variable=row["chk"], command=update_count, width=3,
 			                     state=("normal" if can_run else "disabled"))
-			c1 = ttk.Label(inner, text=name, width=52, anchor="w")
-			c2 = ttk.Label(inner, text=(folder or "（未分類）"), width=18, anchor="w",
+			c1 = ttk.Label(inner, text=name, width=34, anchor="w")
+			c2 = ttk.Label(inner, text=(folder or "（未分類）"), width=14, anchor="w",
 			               foreground=("#333333" if folder else "#888888"))
 			c3 = ttk.Entry(inner, textvariable=row["size"], width=8, justify="right")
-			c4 = ttk.Label(inner, text=src_txt, width=34, anchor="w", foreground=src_col)
-			c5 = ttk.Label(inner, textvariable=row["res_var"], width=30, anchor="w")
+			c3b = ttk.Label(inner, textvariable=row["eff_var"], width=14, anchor="w")
+			row["eff_lbl"] = c3b
+			c4 = ttk.Label(inner, text=src_txt, width=30, anchor="w", foreground=src_col)
+			c5 = ttk.Label(inner, textvariable=row["res_var"], width=26, anchor="w")
+			c6 = ttk.Label(inner, textvariable=row["hm_var"], width=40, anchor="w")
 			row["res_lbl"] = c5
-			row["widgets"] = (c0, c1, c2, c3, c4, c5)
+			row["hm_lbl"] = c6
+			row["widgets"] = (c0, c1, c2, c3, c3b, c4, c5, c6)
 			for c, w in enumerate(row["widgets"]):
 				w.grid(row=r_, column=c, sticky="w", padx=4, pady=1)
 			row["size"].trace_add("write", lambda *_, rw=row: recolor(rw))
@@ -5235,6 +5719,7 @@ class MainMenuGUI(_BaseWindow):
 		q_var.trace_add("write", refilter)
 
 		def set_checks(pred):
+			# 一括でチェックしたときは、すでにチェックしてある順のあとに、一覧の上から順に続ける
 			for row in rows:
 				row["chk"].set(bool(row["can"] and pred(row)))
 			update_count()
@@ -5243,6 +5728,8 @@ class MainMenuGUI(_BaseWindow):
 		btn_none.configure(command=lambda: set_checks(lambda r: False))
 		btn_new.configure(command=lambda: set_checks(
 			lambda r: visible(r) and not self._ankle_pose_cache.get(r["name"])))
+		btn_new_hm.configure(command=lambda: set_checks(
+			lambda r: visible(r) and not r.get("hm_done", False)))
 
 		def do_bulk(only_checked=True):
 			try:
@@ -5270,15 +5757,21 @@ class MainMenuGUI(_BaseWindow):
 		btn_bulk.configure(command=lambda: do_bulk(True))
 		btn_bulk_vis.configure(command=lambda: do_bulk(False))
 
-		def report(tab, state, text):
-			"""実行中の進み具合を一覧に出す（_ankle_run_batch から呼ばれる）。"""
+		def report(tab, state, text, which="pnp"):
+			"""実行中の進み具合を一覧に出す（_ankle_run_batch から呼ばれる）。which = pnp / hm（どちらの欄か）。
+			終わったら（ok）、両方の欄を いまの結果で書き直す。"""
 			for row in rows:
 				if row["tab"] is tab:
-					row["state"] = state
-					col = {"running": "#0d47a1", "ok": "#1b5e20", "error": "#c62828",
-					       "cancel": "#b35900", "skip": "#888888"}.get(state, "#333333")
-					row["res_var"].set(text)
-					row["res_lbl"].configure(foreground=col)
+					if state == "ok":
+						row["state"] = None
+						recolor(row)
+					else:
+						row["state"] = state
+						col = {"running": "#0d47a1", "ok": "#1b5e20", "error": "#c62828",
+						       "cancel": "#b35900", "skip": "#888888"}.get(state, "#333333")
+						var, lbl = (row["hm_var"], row["hm_lbl"]) if which == "hm" else (row["res_var"], row["res_lbl"])
+						var.set(text)
+						lbl.configure(foreground=col)
 					try:
 						cv.update_idletasks()
 						y0 = row["widgets"][0].winfo_y()
@@ -5296,9 +5789,7 @@ class MainMenuGUI(_BaseWindow):
 		def do_run():
 			jobs = []
 			bad = []
-			for row in rows:
-				if not row["chk"].get():
-					continue
+			for row in checked_in_order():
 				try:
 					v = float(row["size"].get())
 					if not (0.0 < v < 1000.0):
@@ -5329,13 +5820,53 @@ class MainMenuGUI(_BaseWindow):
 						f"録画ファイルが見つからないタブが {len(no_src)} 個あります（例: {no_src[0]}）。\n"
 						"④の検出はできないので、そのタブはエラーになります。\n"
 						"（接触の計算だけなら、「④ ArUco検出」のチェックを外してください）", parent=win)
-			n_done = sum(1 for tab, _v in jobs if self._ankle_pose_cache.get(str(tab.get("name", ""))))
+			done_tabs = [tab for tab, _v in jobs if self._ankle_pose_cache.get(str(tab.get("name", "")))]
+			n_done = len(done_tabs)
+			skip_det = set()
+			# ④が済んでいるタブの④のやり直しは、ふつうは不要（1タブ 10〜20 分かかり、結果を上書きする）。
+			# 接触だけを計算し直すつもりで④のチェックを外し忘れることがあった（2026-10-15）→ はっきり聞く
+			if do_det and n_done:
+				_ex = "、".join(str(t.get("name", "")) for t in done_tabs[:3]) + (" など" if n_done > 3 else "")
+				ans = messagebox.askyesnocancel(
+					"まとめて解析 ― ④のやり直しの確認",
+					f"⚠ 選んだ {len(jobs)} タブのうち {n_done} タブは、④（ArUco検出+PnP）がすでに済んでいます。\n"
+					f"（{_ex}）\n\n"
+					"④をやり直すと 1 タブ 10〜20 分かかり、④の結果は上書きされます。ふつうは不要です。\n"
+					+ ("接触（ヒートマップ）を計算し直すだけなら、④は要りません。\n" if do_con else "")
+					+ "\n"
+					"　はい　　　… ④が済んでいるタブも、④をやり直す\n"
+					"　いいえ　　… ④が済んでいるタブは④を飛ばす（まだのタブだけ④"
+					+ ("。接触はすべてのタブで計算" if do_con else "") + "）\n"
+					"　キャンセル … やめる（「やること」を選び直す）",
+					icon="warning", default="no", parent=win)
+				if ans is None:
+					return
+				if ans is False:
+					skip_det = {id(t) for t in done_tabs}
+					if not do_con and len(skip_det) == len(jobs):
+						messagebox.showinfo("まとめて解析", "選んだタブはすべて④が済んでいるので、することがありません。",
+						                    parent=win)
+						return
 			sizes = sorted({v for _t, v in jobs})
 			todo = "・".join(x for x, f in (("④ ArUco検出+PnP", do_det), ("接触領域の計算", do_con)) if f)
 			msg = f"{len(jobs)} タブで「{todo}」を順番に行います。"
-			msg += "\nマーカー実寸: " + ", ".join(f"{v:g}mm" for v in sizes)
-			if do_det and n_done:
-				msg += f"\n\nそのうち {n_done} タブは④の解析済みです。結果は上書きされます。"
+			msg += "\nマーカー実寸（ノギス）: " + ", ".join(f"{v:g}mm" for v in sizes)
+			# 計算に使うのは「補正後」（2026-10-15: ノギスだけ出していて紛らわしかった）
+			_eff = {}
+			for _t, _v in jobs:
+				_val, _kind, _basis = self._ankle_tab_eff_size(_t, _v)
+				_eff.setdefault((_val, _kind, _basis if _kind == "中央値" else ""), []).append(str(_t.get("name", "")))
+			msg += "\n計算に使う補正後:"
+			for (_val, _kind, _basis), _names in sorted(_eff.items(), key=lambda kv: -len(kv[1])):
+				_vt = f"{_val:g} mm" if _val is not None else "—"
+				_desc = (("中央値・" + _basis.split("（", 1)[1].rstrip("）")) if "（" in _basis else _basis) if _kind == "中央値" else _kind
+				msg += f"\n　・{_vt}（{_desc}）… {len(_names)} タブ"
+				if len(_eff) > 1 and len(_names) <= 3:
+					msg += "：" + "、".join(_names)
+			if do_det and n_done and not skip_det:
+				msg += f"\n\n⚠ そのうち {n_done} タブは④の解析済みです。④の結果は上書きされます。"
+			elif skip_det:
+				msg += f"\n\nそのうち {len(skip_det)} タブは④が済んでいるので、④を飛ばします。"
 			if do_con:
 				msg += ("\n\n接触の計算は 1 タブ数分〜十数分かかります（骨の数とフレーム数による）。"
 				        "\n同じ条件で計算済みのタブは、計算を省きます。")
@@ -5344,14 +5875,14 @@ class MainMenuGUI(_BaseWindow):
 				return
 			for row in rows:
 				row["state"] = None
-			for w in (btn_run, btn_close, btn_bulk, btn_bulk_vis, btn_all, btn_none, btn_new):
+			for w in (btn_run, btn_close, btn_bulk, btn_bulk_vis, btn_all, btn_none, btn_new, btn_new_hm):
 				w.configure(state="disabled")
 			win.protocol("WM_DELETE_WINDOW", lambda: None)
 			try:
 				results = self._ankle_run_batch(jobs, report=report, parent=win,
-				                                do_detect=do_det, do_contact=do_con)
+				                                do_detect=do_det, do_contact=do_con, skip_detect=skip_det)
 			finally:
-				for w in (btn_run, btn_close, btn_bulk, btn_bulk_vis, btn_all, btn_none, btn_new):
+				for w in (btn_run, btn_close, btn_bulk, btn_bulk_vis, btn_all, btn_none, btn_new, btn_new_hm):
 					try:
 						w.configure(state="normal")
 					except Exception:
@@ -5377,7 +5908,8 @@ class MainMenuGUI(_BaseWindow):
 		except Exception:
 			pass
 
-	def _ankle_run_batch(self, jobs, report=None, parent=None, do_detect=True, do_contact=False) -> list:
+	def _ankle_run_batch(self, jobs, report=None, parent=None, do_detect=True, do_contact=False,
+	                     skip_detect=None) -> list:
 		"""jobs = [(タブのdict, マーカー実寸mm), ...] を順番に ④ ArUco検出+PnP する。
 
 		各タブに切り替えてマーカー実寸を入れ、④の本体をダイアログなしで呼ぶ。
@@ -5403,7 +5935,7 @@ class MainMenuGUI(_BaseWindow):
 					results.append((name, "error", "タブが見つかりません", 0.0))
 					continue
 				if report:
-					report(tab, "running", f"実行中…（{k + 1}/{n}）")
+					report(tab, "running", f"実行中…（{k + 1}/{n}）", "pnp" if do_detect else "hm")
 				t0 = _time.time()
 				parts = []          # [(処理の名前, 結果dict)]
 				try:
@@ -5411,12 +5943,12 @@ class MainMenuGUI(_BaseWindow):
 					# 欄の値は実寸（ノギス）。補正後は 自動なら深度の推定（無ければ実寸）、手動ならそのまま
 					self.ankle_marker_size_true_mm.set(float(size))
 					self._ankle_size_refresh_auto()
-					if do_detect:
+					if do_detect and id(tab) not in (skip_detect or set()):     # skip_detect: ④を飛ばすタブ（id）
 						parts.append(("④検出", self._ankle_detect_markers_impl(
 							batch=True, title_prefix=f"[{k + 1}/{n}] {name} ― ")))
 					if do_contact and (not parts or parts[-1][1].get("status") == "ok"):
 						if report:
-							report(tab, "running", f"接触を計算中…（{k + 1}/{n}）")
+							report(tab, "running", f"計算中…（{k + 1}/{n}）", "hm")
 						r2 = self.on_ankle_animate(heatmap_only=True, title_prefix=f"[{k + 1}/{n}] {name} ― ")
 						if not isinstance(r2, dict):
 							r2 = {"status": "error", "msg": "接触の計算から結果が返りませんでした"}
@@ -5453,11 +5985,13 @@ class MainMenuGUI(_BaseWindow):
 									bits.append("接触 計算済み")
 						report(tab, "ok", "✓ " + "・".join(bits) + f"（{dt:.0f}秒）")
 					elif st == "cancel":
-						report(tab, "cancel", "キャンセル（結果は変えていません）")
+						_w = "hm" if any(l == "接触" and r.get("status") == "cancel" for l, r in parts) else "pnp"
+						report(tab, "cancel", "キャンセル（結果は変えていません）", _w)
 					else:
-						bad = [f"{lbl}: {(str(r.get('msg', '')).splitlines() or [''])[0]}"
+						bad = [(lbl, f"{lbl}: {(str(r.get('msg', '')).splitlines() or [''])[0]}")
 						       for lbl, r in parts if r.get("status") == "error"]
-						report(tab, "error", "✗ " + (bad[0] if bad else "エラー"))
+						report(tab, "error", "✗ " + (bad[0][1] if bad else "エラー"),
+						       "hm" if bad and bad[0][0] == "接触" else "pnp")
 				if st == "cancel" and k < n - 1:
 					rest = n - k - 1
 					if not messagebox.askyesno(
@@ -5467,7 +6001,7 @@ class MainMenuGUI(_BaseWindow):
 						for tab2, _s in jobs[k + 1:]:
 							results.append((str(tab2.get("name", "")), "skip", "中止したため未実行", 0.0))
 							if report:
-								report(tab2, "skip", "中止（未実行）")
+								report(tab2, "skip", "中止（未実行）", "hm" if not do_detect else "pnp")
 						break
 		finally:
 			# 元のタブへ戻す（途中のタブの入力は、切り替えのたびにスナップショットへ保存済み）
@@ -5556,6 +6090,10 @@ class MainMenuGUI(_BaseWindow):
 			snap = tab.setdefault("snapshot", {})
 			snap["_bones"] = copy.deepcopy(grp["bones"])
 			snap["_ligaments"] = copy.deepcopy(grp["ligaments"])
+			if isinstance(grp.get("view"), dict):
+				snap.update(copy.deepcopy(grp["view"]))
+			if grp.get("grid_plane"):
+				tab["grid_plane"] = copy.deepcopy(grp["grid_plane"])
 
 	def _ankle_cleanup_bone_groups(self) -> None:
 		"""メンバーが1タブ以下になった共有は解除する。どこからも使われない共有の記録も消す。"""
@@ -6437,6 +6975,7 @@ class MainMenuGUI(_BaseWindow):
 			"4. 4点置いたらウィンドウを閉じます\n\n"
 			"■ 便利な操作\n"
 			"・U キー: 最後に置いた点を1つ戻す\n"
+			"・S キー: スキャンに写っていない角を飛ばす（1つまで。残り3点で求めます）\n"
 			"・画面の右上に、この図と「次にクリックする角」が出ます\n\n"
 			"※ マーカーが斜めや逆さまに付いていても、模様の向きで数えれば正しく計算されます。")
 		          ).pack(anchor="w")
@@ -6445,12 +6984,17 @@ class MainMenuGUI(_BaseWindow):
 		def go():
 			result[0] = True
 			win.destroy()
+		ttk.Label(right, text="（× で閉じてもクリック画面に進みます。やめるときは「やめる」か Esc）",
+		          foreground="gray", font=(self.ui_font_family, 8)).pack(side="bottom", anchor="e")
 		tk.Button(bf, text="クリックを始める", padx=16, pady=4, bg="#2e7d32", fg="white",
 		          activebackground="#1b5e20", activeforeground="white",
 		          font=(self.ui_font_family, 11, "bold"), command=go).pack(side="right")
 		ttk.Button(bf, text="やめる", command=win.destroy).pack(side="right", padx=8)
 		win.bind("<Return>", lambda e: go())
 		win.bind("<Escape>", lambda e: win.destroy())
+		# × で閉じたときも次（クリック画面）へ進む。説明の窓なので「閉じたら始まる」のが自然
+		# （2026-10-12: × で閉じて「次の画面が出ない」と報告された）。やめるのは「やめる」か Esc。
+		win.protocol("WM_DELETE_WINDOW", go)
 		try:
 			win.grab_set()
 			win.focus_force()
@@ -6602,6 +7146,35 @@ class MainMenuGUI(_BaseWindow):
 			except Exception:
 				pass
 		refresh()
+		# 最初の描画のときに、窓を前面に出し、題名を日本語で付け直す（VTK の題名は ANSI で化ける）。
+		# メイン画面の後ろに開いて「出ない」ように見えるのを防ぐ。VTK の中なので Tk には触らない。
+		_front = {"done": False}
+
+		def _bring_front(*_a):
+			if _front["done"]:
+				return
+			_front["done"] = True
+			try:
+				import ctypes
+				import re as _re
+				m = _re.search(r"([0-9a-fA-F]{6,})", str(p.render_window.GetGenericWindowId()))
+				if m:
+					h = ctypes.c_void_p(int(m.group(1), 16))
+					u32 = ctypes.windll.user32
+					u32.ShowWindow(h, 9)                  # SW_RESTORE
+					u32.SetWindowPos(h, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0001 | 0x0002)   # 一瞬だけ最前面
+					u32.SetWindowPos(h, ctypes.c_void_p(-2), 0, 0, 0, 0, 0x0001 | 0x0002)   # 最前面を解除
+					u32.SetForegroundWindow(h)
+				self._sim_set_native_title(p, title)
+			except Exception as e:
+				print(f"[ankle pick] 窓を前面に出せませんでした: {e}")
+		try:
+			p.iren.add_observer("RenderEvent", _bring_front)
+		except Exception:
+			try:
+				p.render_window.AddObserver("EndEvent", _bring_front)
+			except Exception:
+				pass
 		p.show()
 		# 飛ばした角は None のまま返す（呼び出し側が残りの点で重ね合わせる）
 		return list(picked)
@@ -7287,7 +7860,8 @@ class MainMenuGUI(_BaseWindow):
 			"folder_filter": str(getattr(self, "_ankle_folder_filter", self._ANKLE_FOLDER_ALL)),
 			# 骨リストの共有（各タブのスナップショットにも同じ内容が入っている）
 			"bone_groups": {gid: {"name": g.get("name", ""), "bones": g.get("bones", []),
-			                      "ligaments": g.get("ligaments", [])}
+			                      "ligaments": g.get("ligaments", []),
+			                      "view": g.get("view", {}), "grid_plane": g.get("grid_plane")}
 			                for gid, g in self._ankle_bone_groups_dict().items()},
 		}
 		try:
@@ -7330,7 +7904,9 @@ class MainMenuGUI(_BaseWindow):
 					if isinstance(_g, dict) and isinstance(_g.get("bones"), list):
 						self._ankle_bone_groups[str(_gid)] = {
 							"name": str(_g.get("name", "")), "bones": _g["bones"],
-							"ligaments": _g["ligaments"] if isinstance(_g.get("ligaments"), list) else []}
+							"ligaments": _g["ligaments"] if isinstance(_g.get("ligaments"), list) else [],
+							"view": _g["view"] if isinstance(_g.get("view"), dict) else {},
+							"grid_plane": _g.get("grid_plane")}
 			for _t in self._ankle_tabs:
 				_gid = _t.get("bone_group") if isinstance(_t, dict) else None
 				if _gid in self._ankle_bone_groups:
@@ -7747,6 +8323,327 @@ class MainMenuGUI(_BaseWindow):
 			(np.trace(ref[:3, :3].T @ Ts[i][:3, :3]) - 1) / 2, -1, 1)))) for i in inl]
 		return ref, inl, d_in
 
+	# ==================================================================
+	# キャリブの精密化（板面合わせ＋模様合わせ）とスキャンの縮尺（2026-10-14）
+	# ==================================================================
+	# 手動4点は、クリックの誤差とテクスチャの歪みがそのまま入る。
+	#   1) 板面合わせ: 傾き・奥行きを、スキャンの板の形（平らさ σ≈0.04mm）に合わせる（_ankle_calib_plate_snap）
+	#   2) 模様合わせ: 板面に正対した平行投影でテクスチャを写し、その ID の理想の ArUco の模様を、画像全体の
+	#      ECC（アフィン）で重ねる。重なった4隅に 15mm の正方形を当てはめて、面の中の位置と回転を決める。
+	#      アフィンの縮尺 = スキャンの中のマーカーの大きさ ÷ 15mm = スキャンの縮尺 k（ゆがみ = 縦横の比）。
+	# 実測（261007、2026-10-14）: いまの手動キャリブから回転 0.2〜0.9°・位置 0.1〜0.4mm 動く。始めを ±1mm・±3°
+	# ずらしても骨の遠い所で 0.08〜0.8mm 以内に戻る。スキャンの縮尺 k は 大腿骨 0.988 / 脛骨 0.982
+	# （膝蓋骨は 1.011 だがゆがみ 1.06 で当てにならない）。
+	# 骨のすき間: 実寸 15.0（ノギス）のままだと 0.5〜1.1mm 離れる。キャリブを直しても変わらない。
+	# スキャンの縮尺（共通 0.985）でモデルを本当の大きさにすると、軸力 100N の4試験で大腿骨–脛骨の
+	# 中央値 −0.10〜+0.30mm に収まる（深度の補正後は −0.46〜−0.01mm）。→ すき間の正体は 3D スキャンが約 1.5% 小さいこと。
+	# 深度の「補正後」がうまく合っていたのは、傾いたコマで深度が小さく出る分（10〜20°: 15.06 / 30〜40°: 14.65）が
+	# 混ざって、たまたまスキャンの縮尺に近い値になっていたから（録画ごとの傾きの分布で変わる）。
+	_ANKLE_REFINE_MAX_SHIFT_MM = 2.0
+	_ANKLE_REFINE_MAX_ROT_DEG = 5.0
+	_ANKLE_REFINE_MIN_CC = 0.75
+	_ANKLE_SCAN_SCALE_MAX_ANISO = 1.03
+
+	def _ankle_calib_refine(self, mesh, texture, T0, aruco_id, dict_name, size_mm, W: int = 800):
+		"""手動キャリブ T0 を、板面合わせ＋模様合わせで精密化する。返り値 (T, info)。"""
+		import numpy as np
+		import cv2
+		size = float(size_mm)
+		info = {"plate": None, "pattern": {"ok": False, "reason": ""}, "used": "none"}
+		T = np.asarray(T0, dtype=float).copy()
+		T1, pinfo = self._ankle_calib_plate_snap(mesh, T, size)
+		info["plate"] = pinfo
+		if T1 is not None:
+			T = T1
+			info["used"] = "plate"
+		if texture is None:
+			info["pattern"]["reason"] = "テクスチャがありません"
+			return T, info
+		half = size
+
+		def _geo(Tc, side):
+			c = Tc[:3, 3].copy()
+			n = Tc[:3, 2] / np.linalg.norm(Tc[:3, 2]) * side
+			up = -Tc[:3, 1] / np.linalg.norm(Tc[:3, 1])
+			right = np.cross(-n, up)
+			right /= np.linalg.norm(right)
+			return c, right, up, (W / 2.0) / half, c + n * 200.0
+
+		def _to_px(P, c, right, up, k):
+			d = np.asarray(P, float) - c
+			return np.column_stack([W / 2.0 + d @ right * k, W / 2.0 - d @ up * k])
+
+		def _to_world(uv, c, right, up, k):
+			uv = np.asarray(uv, float)
+			return c + np.outer((uv[:, 0] - W / 2.0) / k, right) + np.outer(-(uv[:, 1] - W / 2.0) / k, up)
+
+		try:
+			dic = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, str(dict_name)))
+			ideal = cv2.aruco.generateImageMarker(dic, int(aruco_id), 600)
+		except Exception as e:
+			info["pattern"]["reason"] = f"理想の模様を作れません ({e})"
+			return T, info
+		obj = np.asarray(self._ankle_marker_obj_points(size), dtype=float)
+		# 白のにじみ（2026-10-14）: スキャンのテクスチャでは白が黒の側へ 0.15〜0.2mm 広がっている（261007）。
+		# にじみを入れない型で合わせると、黒い四角が細く見える分を「スキャンが小さい」と取り違え、縮尺が
+		# 約 1.3% 小さく出た。にじみは黒枠を細く・中の白いマスを太くし、縮尺は全部を中心へ寄せるので、
+		# 型の境を δ だけ黒の側へずらして一致が最大の δ を選ぶと、両方を分けて測れる（合成で確かめた）。
+		# 位置・向きへの影響は 0.03mm・0.05° 以内。
+		BLOOM_MM = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
+		SS = 4
+		best = None
+		for side in (1.0, -1.0):
+			c, right, up, k, pos = _geo(T, side)
+			try:
+				p = pv.Plotter(off_screen=True, window_size=(W, W))
+				p.set_background("white")
+				p.add_mesh(mesh, texture=texture, show_edges=False, lighting=False)
+				p.camera_position = [tuple(pos), tuple(c), tuple(up)]
+				p.enable_parallel_projection()
+				p.camera.parallel_scale = half
+				p.render()
+				img = cv2.cvtColor(p.screenshot(return_img=True), cv2.COLOR_RGB2GRAY)
+				p.close()
+			except Exception as e:
+				info["pattern"]["reason"] = f"描画に失敗 ({e})"
+				continue
+			Pw = (T[:3, :3] @ obj.T).T + T[:3, 3]
+			dst = _to_px(Pw, c, right, up, k).astype(np.float32)
+			Hm = cv2.getPerspectiveTransform(np.array([[-0.5, -0.5], [599.5, -0.5], [599.5, 599.5], [-0.5, 599.5]], np.float32), dst)   # 画素の端を4隅に（中心だと模様が半画素大きくなり、縮尺が 0.2% 小さく出た）
+			# 型の白黒の境までの符号つき距離（W の画素。白の中で +）を細かい画素で作っておく
+			big = cv2.warpPerspective(ideal, np.diag([SS, SS, 1.0]) @ Hm, (W * SS, W * SS), borderValue=255,
+			                          flags=cv2.INTER_NEAREST)
+			wht = (big > 127).astype(np.uint8)
+			sdpx = (cv2.distanceTransform(wht, cv2.DIST_L2, 5) - cv2.distanceTransform(1 - wht, cv2.DIST_L2, 5)) / SS
+			mask = np.zeros((W, W), np.uint8)
+			ctr = dst.mean(axis=0)
+			cv2.fillConvexPoly(mask, (ctr + (dst - ctr) * (size + 4.0) / size).astype(np.int32), 255)
+			img_f = img.astype(np.float32)
+			for bl in BLOOM_MM:
+				can = cv2.resize(np.clip(0.5 + sdpx + bl * k, 0.0, 1.0).astype(np.float32) * 255.0, (W, W),
+				                 interpolation=cv2.INTER_AREA)
+				warp = np.eye(2, 3, dtype=np.float32)
+				cc = None
+				try:
+					for sg in (4.0, 2.0, 1.0):
+						t_ = cv2.GaussianBlur(can, (0, 0), sg)
+						i_ = cv2.GaussianBlur(img_f, (0, 0), sg)
+						cc, warp = cv2.findTransformECC(t_, i_, warp, cv2.MOTION_AFFINE,
+						                                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6), mask, 5)
+				except cv2.error:
+					cc = None
+				if cc is None:
+					continue
+				if best is None or cc > best[0]:
+					best = (float(cc), side, warp.copy(), (c, right, up, k), dst, float(bl))
+		if best is None:
+			info["pattern"]["reason"] = info["pattern"]["reason"] or "模様が合いませんでした（テクスチャが写っていない向きなど）"
+			return T, info
+		cc, side, warp, geo, dst, bloom = best
+		A = np.vstack([warp, [0, 0, 1]])
+		moved = (A @ np.column_stack([dst, np.ones(4)]).T).T[:, :2]
+		Pnew = _to_world(moved, *geo)
+		T2 = self._rigid_from_correspondences(obj, Pnew, allow_scale=False)
+		sv = np.linalg.svd(warp[:, :2], compute_uv=False)
+		Rr = T[:3, :3].T @ T2[:3, :3]
+		rot = float(np.degrees(np.arccos(np.clip((np.trace(Rr) - 1) / 2, -1, 1))))
+		shift = float(np.linalg.norm(T2[:3, 3] - T[:3, 3]))
+		edges = [float(np.linalg.norm(Pnew[i] - Pnew[(i + 1) % 4])) for i in range(4)]
+		pat = {"ok": False, "cc": cc, "rot_deg": rot, "shift_mm": shift,
+		       "tex_scale": float(np.sqrt(abs(np.linalg.det(warp[:, :2])))), "aniso": float(sv[0] / sv[1]),
+		       "edges": edges, "bloom_mm": bloom, "reason": ""}
+		if cc < self._ANKLE_REFINE_MIN_CC:
+			pat["reason"] = f"模様の一致が低い（{cc:.2f}）"
+		elif shift > self._ANKLE_REFINE_MAX_SHIFT_MM or rot > self._ANKLE_REFINE_MAX_ROT_DEG:
+			pat["reason"] = f"動かす量が大きすぎる（{shift:.2f} mm・{rot:.2f}°）"
+		else:
+			pat["ok"] = True
+			T = T2
+			info["used"] = "plate+pattern" if info["used"] == "plate" else "pattern"
+		info["pattern"] = pat
+		return T, info
+
+	def _ankle_refine_summary(self, info) -> str:
+		pl, pt = info.get("plate") or {}, info.get("pattern") or {}
+		lines = []
+		if pl.get("ok"):
+			lines.append(f"板面合わせ: 傾き {pl.get('tilt', 0):.2f}°・奥行き {pl.get('offset', 0):+.2f} mm を直しました（板の平らさ σ {pl.get('flat', 0):.3f} mm）")
+		else:
+			lines.append(f"板面合わせ: 使いませんでした（{pl.get('reason', '')}）")
+		if pt.get("ok"):
+			lines.append(f"模様合わせ: 面の中で 回転 {pt['rot_deg']:.2f}°・位置 {pt['shift_mm']:.2f} mm を直しました（模様の一致 {pt['cc']:.2f}）")
+		else:
+			lines.append(f"模様合わせ: 使いませんでした（{pt.get('reason', '')}）")
+		if pt.get("tex_scale"):
+			lines.append(f"スキャンの中のマーカー: {np.mean(pt['edges']):.2f} mm 角（白のにじみ {pt.get('bloom_mm', 0):.2f} mm を差し引き）→ スキャンの縮尺 {pt['tex_scale']:.4f}"
+			             f"（縦横のゆがみ {pt['aniso']:.3f}{'・大きいので縮尺には使いません' if pt['aniso'] > self._ANKLE_SCAN_SCALE_MAX_ANISO else ''}）")
+		return "\n".join(lines)
+
+	def _ankle_store_scan_scale(self, b, info) -> None:
+		import datetime as _dt
+		pt = (info or {}).get("pattern") or {}
+		if pt.get("tex_scale") and pt.get("cc", 0) >= self._ANKLE_REFINE_MIN_CC:
+			b["scan_scale"] = {"k": float(pt["tex_scale"]), "aniso": float(pt["aniso"]), "cc": float(pt["cc"]),
+			                   "edges": [float(x) for x in pt["edges"]], "bloom_mm": float(pt.get("bloom_mm", 0.0)),
+			                   "time": _dt.datetime.now().isoformat(timespec="seconds")}
+
+	def _ankle_scale_mode_is_scan(self) -> bool:
+		try:
+			return str(self.ankle_scale_mode.get()) == "scan"
+		except Exception:
+			return False
+
+	def _ankle_scan_scale_common(self):
+		import numpy as np
+		ks = [float(b["scan_scale"]["k"]) for b in (self.ankle_bones or [])
+		      if self._ankle_scan_scale_valid(b.get("scan_scale"))
+		      and float(b["scan_scale"].get("aniso", 9)) <= self._ANKLE_SCAN_SCALE_MAX_ANISO]
+		return float(np.median(ks)) if ks else None
+
+	@staticmethod
+	def _ankle_scan_scale_valid(ss) -> bool:
+		"""にじみも一緒に推定して測った縮尺か（2026-10-14 の最初の版は、にじみを縮尺と取り違えていた）。"""
+		return isinstance(ss, dict) and "bloom_mm" in ss and "k" in ss
+
+	def _ankle_scan_scale_for(self, bone):
+		"""(k, マーカーの中心) か None。スキャンの縮尺を直すやり方のときだけ。"""
+		import numpy as np
+		if not self._ankle_scale_mode_is_scan() or not isinstance(bone, dict):
+			return None
+		if bone.get("marker_to_bone_T") is None:
+			return None
+		k = None
+		try:
+			if bool(self.ankle_scan_scale_common.get()):
+				k = self._ankle_scan_scale_common()
+			else:
+				ss = bone.get("scan_scale")
+				if self._ankle_scan_scale_valid(ss) and float(ss.get("aniso", 9)) <= self._ANKLE_SCAN_SCALE_MAX_ANISO:
+					k = float(ss["k"])
+				else:
+					k = self._ankle_scan_scale_common()
+		except Exception:
+			k = None
+		if not k or not (0.8 < k < 1.2):
+			return None
+		return k, np.asarray(bone["marker_to_bone_T"], dtype=float)[:3, 3]
+
+	def _ankle_apply_scan_scale_mesh(self, bone, mesh):
+		"""スキャンが k 倍に縮んでいる分、マーカーの中心まわりに 1/k 倍して本当の大きさにする。"""
+		import numpy as np
+		sc = self._ankle_scan_scale_for(bone)
+		if sc is None or mesh is None:
+			return mesh
+		k, c = sc
+		m = mesh.copy()
+		m.points = c + (np.asarray(m.points, dtype=float) - c) / k
+		return m
+
+	def _ankle_scan_point(self, bone, p, to_scaled: bool):
+		"""骨モデルの座標の点を、スキャンの縮尺を直した座標へ（to_scaled）/ から戻す。"""
+		import numpy as np
+		p = np.asarray(p, dtype=float)
+		sc = self._ankle_scan_scale_for(bone)
+		if sc is None:
+			return p
+		k, c = sc
+		return c + (p - c) / k if to_scaled else c + (p - c) * k
+
+	def _ankle_refresh_scan_scale_lbl(self) -> None:
+		lbl = getattr(self, "_ankle_scan_scale_lbl", None)
+		if lbl is None:
+			return
+		parts = []
+		for b in (self.ankle_bones or []):
+			ss = b.get("scan_scale")
+			if isinstance(ss, dict) and not self._ankle_scan_scale_valid(ss):
+				parts.append(f"{b.get('name', '')} 古い測り方（にじみを入れていない）・使わない")
+			elif isinstance(ss, dict):
+				bad = float(ss.get("aniso", 9)) > self._ANKLE_SCAN_SCALE_MAX_ANISO
+				parts.append(f"{b.get('name', '')} {float(ss['k']):.3f}（にじみ {float(ss.get('bloom_mm', 0)):.2f}mm）"
+				             f"{'（ゆがみ大・使わない）' if bad else ''}")
+		com = self._ankle_scan_scale_common()
+		if parts:
+			txt = "スキャンの縮尺: " + " / ".join(parts) + (f" → 共通 {com:.4f}" if com else "")
+			col = "#005580"
+		else:
+			txt = "スキャンの縮尺: まだ測っていません（③の「保存済みのキャリブを精密化」で測れます）"
+			col = "#c62828" if self._ankle_scale_mode_is_scan() else "gray"
+		try:
+			lbl.configure(text=txt, foreground=col)
+		except Exception:
+			pass
+
+	def on_ankle_refine_saved_calibs(self) -> None:
+		"""骨リストのキャリブを、クリックし直さずにまとめて精密化する（結果を見てから保存）。"""
+		import numpy as np
+		dict_name = str(self.ankle_aruco_dict_var.get())
+		size = float(self._ankle_marker_true_mm())
+		rows, plan = [], []
+		upd, close, cancel = self._ankle_open_progress("キャリブを精密化しています（板面合わせ＋模様合わせ）")
+		try:
+			targets = [b for b in self.ankle_bones if b.get("marker_to_bone_T") is not None]
+			for n_, b in enumerate(targets):
+				if cancel():
+					return
+				try:
+					upd(n_, n_, 0.0, extra_msg=f"{b.get('name', '')} を精密化しています…（{n_ + 1}/{len(targets)}）")
+				except Exception:
+					pass
+				name = str(b.get("name", ""))
+				try:
+					mesh, tex = self._ankle_load_mesh_and_texture(self._ankle_get_calib_model_path(b))
+					T0 = np.asarray(b.get("marker_to_bone_T_click") or b["marker_to_bone_T"], dtype=float)
+					T, info = self._ankle_calib_refine(mesh, tex, T0, int(b.get("aruco_id", -1)), dict_name, size)
+				except Exception as e:
+					rows.append(f"■ {name}: 失敗（{e}）")
+					continue
+				Tc = np.asarray(b["marker_to_bone_T"], dtype=float)
+				Rr = Tc[:3, :3].T @ T[:3, :3]
+				d_rot = float(np.degrees(np.arccos(np.clip((np.trace(Rr) - 1) / 2, -1, 1))))
+				d_pos = float(np.linalg.norm(T[:3, 3] - Tc[:3, 3]))
+				rows.append(f"■ {name}（いまの値から 回転 {d_rot:.2f}°・位置 {d_pos:.2f} mm）\n" + self._ankle_refine_summary(info))
+				plan.append((b, T, info))
+		finally:
+			try:
+				close()
+			except Exception:
+				pass
+		if not rows:
+			messagebox.showinfo("キャリブの精密化", "キャリブ済みの骨がありません。", parent=self)
+			return
+		msg = ("\n\n".join(rows) + "\n\nこの結果で保存しますか？（精密化の前の値は残るので「精密化の前に戻す」で戻せます。"
+		       "骨リストを共有しているタブにも入ります。接触の計算は計算し直しになります）")
+		if not plan or not messagebox.askyesno("キャリブの精密化", msg, parent=self):
+			return
+		for b, T, info in plan:
+			if b.get("marker_to_bone_T_before_refine") is None:
+				b["marker_to_bone_T_before_refine"] = b["marker_to_bone_T"]
+			if b.get("marker_to_bone_T_click") is None and str(b.get("marker_to_bone_method", "")).startswith("manual"):
+				b["marker_to_bone_T_click"] = b["marker_to_bone_T"]
+			b["marker_to_bone_T"] = np.asarray(T, dtype=float).tolist()
+			b["marker_to_bone_refine"] = info.get("used", "none")
+			self._ankle_store_scan_scale(b, info)
+		self._ankle_refresh_bone_listbox()
+		self._ankle_refresh_scan_scale_lbl()
+		self._schedule_state_autosave("ankle")
+		print("[キャリブの精密化] 保存しました: " + ", ".join(str(b.get("name", "")) for b, _, _ in plan))
+
+	def on_ankle_undo_refine(self) -> None:
+		"""精密化の前の値に戻す（骨リストすべて）。"""
+		bs = [b for b in self.ankle_bones if b.get("marker_to_bone_T_before_refine") is not None]
+		if not bs:
+			messagebox.showinfo("キャリブの精密化", "精密化の前の値が残っている骨はありません。", parent=self)
+			return
+		if not messagebox.askyesno("キャリブの精密化", "次の骨を、精密化の前のキャリブに戻しますか？\n"
+		                           + "、".join(str(b.get("name", "")) for b in bs), parent=self):
+			return
+		for b in bs:
+			b["marker_to_bone_T"] = b.pop("marker_to_bone_T_before_refine")
+			b.pop("marker_to_bone_refine", None)
+		self._ankle_refresh_bone_listbox()
+		self._schedule_state_autosave("ankle")
+
 	def _ankle_calib_plate_snap(self, mesh, T, marker_mm):
 		"""マーカー面の傾きと奥行きを、スキャンの板面に合わせ直す。
 
@@ -8033,7 +8930,7 @@ class MainMenuGUI(_BaseWindow):
 		except Exception as e:
 			close_cb()
 			messagebox.showerror("自動キャリブ 失敗", f"{name}: {e}\n\n"
-				"うまくいかない場合、手動「マーカー-骨キャリブ (手動4点)」を試してください。")
+				"うまくいかない場合、手動「マーカー-骨キャリブ（手動4点＋精密化・推奨）」を使ってください。")
 			return
 		close_cb()
 
@@ -8202,12 +9099,34 @@ class MainMenuGUI(_BaseWindow):
 		rmse = float(np.sqrt(np.mean(residuals ** 2)))
 		max_r = float(residuals.max())
 
+		# 精密化（板面合わせ＋模様合わせ。2026-10-14）
+		refine_txt = ""
+		T_click = T.copy()
+		try:
+			do_refine = bool(self.ankle_calib_refine.get())
+		except Exception:
+			do_refine = True
+		if do_refine:
+			try:
+				T_r, rinfo = self._ankle_calib_refine(mesh, texture, T, int(b.get("aruco_id", -1)),
+				                                      str(self.ankle_aruco_dict_var.get()), marker_size_mm)
+				refine_txt = "\n\n【精密化】\n" + self._ankle_refine_summary(rinfo)
+				if rinfo.get("used", "none") != "none":
+					T = T_r
+				self._ankle_store_scan_scale(b, rinfo)
+				b["marker_to_bone_refine"] = rinfo.get("used", "none")
+			except Exception as e:
+				refine_txt = f"\n\n【精密化】失敗（クリックの結果をそのまま使います）: {e}"
+
 		# 保存
 		b["marker_to_bone_T"] = T.tolist()
+		b["marker_to_bone_T_click"] = T_click.tolist()          # クリックだけの結果（精密化の前）
+		b.pop("marker_to_bone_T_before_refine", None)
 		b["marker_to_bone_size_mm"] = float(marker_size_mm)    # キャリブに使った実寸
 		b["marker_to_bone_method"] = "manual"
 		b["marker_to_bone_corners_used"] = len(used)           # 3 = 1つ飛ばした
 		self._ankle_refresh_bone_listbox()
+		self._ankle_refresh_scan_scale_lbl()
 
 		# 品質メッセージ
 		if rmse < 0.5:
@@ -8227,7 +9146,7 @@ class MainMenuGUI(_BaseWindow):
 		msg = (f"[{name}] マーカー-骨変換 T_L←Mk を保存しました。\n\n"
 		       f"{len(used)}隅の残差 RMSE = {rmse:.3f} mm\n"
 		       f"最大残差     = {max_r:.3f} mm\n"
-		       f"評価         = {verdict}\n{skip_note}\n"
+		       f"評価         = {verdict}\n{skip_note}{refine_txt}\n\n"
 		       f"次のダイアログで確認画面を表示します。")
 		messagebox.showinfo(f"{name} キャリブ完了", msg)
 
@@ -10440,7 +11359,9 @@ class MainMenuGUI(_BaseWindow):
 			return None
 		# 時刻合わせ
 		off = float(self.ankle_robot_log_offset_s.get())
-		if bool(self.ankle_robot_log_auto.get()):
+		if scene.get("_log_offset") is not None:
+			off = float(scene["_log_offset"])        # 可視化を開くときに全部の記録で決めたずれ
+		elif bool(self.ankle_robot_log_auto.get()):
 			fixed_si = next((si for si, b in enumerate(scene_bones)
 			                 if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), None)
 			cand = [si for si in range(len(scene_bones)) if si != fixed_si]
@@ -10462,7 +11383,7 @@ class MainMenuGUI(_BaseWindow):
 		items = [x.strip() for x in str(self.ankle_robot_log_items.get()).split(",") if x.strip()]
 		labels = dict(self._ANKLE_LOG_ITEMS)
 		st = {"charts": [], "plotter": None, "items": items}
-		tx = log["t"] + off                                # 映像の時刻でグラフを描く
+		tx = log["t"] + off - float(scene.get("_t_shift", 0.0) or 0.0)     # 映像の時刻でグラフを描く（軸力から始めたときは、そこを 0 に）
 
 		def _build(p):
 			for ch, *_ in st["charts"]:
@@ -10476,7 +11397,9 @@ class MainMenuGUI(_BaseWindow):
 				return
 			n = len(its)
 			top = 0.74                                 # 右上の姿勢の文字 (Rx, Ry, …) の下から並べる
-			h = min(0.24, (top - 0.02) / n)
+			top -= float(scene.get("_lig_chart_h", 0.0) or 0.0)    # 靭帯の長さのグラフ（いちばん上）の下から
+			bottom = 0.27 if scene.get("_pairs_chart") else 0.02     # 2点の距離のグラフがあれば、その上まで
+			h = min(0.24, (top - bottom) / n)
 			for k, key in enumerate(its):
 				y = np.asarray(log["cols"][key], dtype=float)
 				ch = pv.Chart2D(size=(0.33, h - 0.01), loc=(0.66, top - (k + 1) * h),
@@ -10509,6 +11432,8 @@ class MainMenuGUI(_BaseWindow):
 		def _make(p):
 			st["plotter"] = p
 			_build(p)
+			# 靭帯の長さのグラフが出たり消えたりしたら、並べ直せるように
+			scene["_log_rebuild"] = lambda: _build(st["plotter"]) if st["plotter"] is not None else None
 			return _update
 
 		def _choose():
@@ -10525,6 +11450,783 @@ class MainMenuGUI(_BaseWindow):
 		scene.setdefault("panel_buttons", []).append(("datalog の項目…", _choose))
 		print(f"[datalog] {Path(path).name}: {len(log['t'])} 行・{log['t'][-1]:.1f} 秒 / 表示: {', '.join(items)}")
 		return _make
+
+	# ---- 右のグラフのまとめ役（2026-10-15） ----
+	# 靭帯の長さ・膝蓋骨の移動・膝蓋骨の回転・datalog の各項目を、再生コントロールのチェックで選んで、
+	# 右側に上から並べる（高さは数で等分）。赤い線はいまの時刻。
+	_ANKLE_SIDE_CHART_KEYS = (("lig", "靭帯の長さ"), ("pat_t", "膝蓋骨の移動"), ("pat_r", "膝蓋骨の回転"))
+
+	def _ankle_patella_motion(self, scene_bones, times):
+		"""膝蓋骨の、固定した骨（無ければ大腿骨）に対する動き。{"t": (N,3) mm, "r": (N,3) deg, "axes": 名前} か None。
+
+		向きは方眼紙と同じ（横 = 画面の右、縦 = 脛骨の近位、奥行き = 屈曲の軸）。保存した方眼紙の向きがあればそれ。
+		移動 = 膝蓋骨の重心の、最初のコマからの移動の各成分。回転 = 最初のコマからの回転（回転ベクトル）の各成分。
+		"""
+		import numpy as np
+		names = [str(b.get("name", "")) for b in scene_bones]
+		pi = next((i for i, n in enumerate(names) if "膝蓋骨" in n), None)
+		if pi is None:
+			return None
+		ri = next((i for i, b in enumerate(scene_bones)
+		           if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), None)
+		fixed_is_ref = ri is not None
+		if ri is None:
+			ri = next((i for i, n in enumerate(names) if "大腿骨" in n), None)
+		if ri is None or ri == pi:
+			return None
+		Tr = np.asarray(scene_bones[ri]["poses"], dtype=float)
+		Tp = np.asarray(scene_bones[pi]["poses"], dtype=float)
+		n_ = min(len(Tr), len(Tp), len(times))
+		Rel = np.einsum("nij,njk->nik", np.linalg.inv(Tr[:n_]), Tp[:n_])
+		# 向き
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		plane = (tab_ref or {}).get("grid_plane") if isinstance(tab_ref, dict) else None
+		nrm = up = None
+		if fixed_is_ref and isinstance(plane, dict) and plane.get("normal") and plane.get("up"):
+			nrm, up = np.asarray(plane["normal"], float), np.asarray(plane["up"], float)
+		else:
+			ti = next((i for i, n in enumerate(names) if "脛骨" in n), None)
+			if ti is not None:
+				from scipy.spatial.transform import Rotation as _R
+				Tt = np.einsum("nij,njk->nik", np.linalg.inv(Tr[:n_]), np.asarray(scene_bones[ti]["poses"], float)[:n_])
+				idx = np.linspace(0, n_ - 1, min(n_, 400)).astype(int)
+				rv = _R.from_matrix(np.einsum("nij,kj->nik", Tt[idx, :3, :3], Tt[0, :3, :3])).as_rotvec()
+				if np.degrees(np.linalg.norm(rv, axis=1)).max() > 3.0:
+					nrm = np.linalg.svd(rv - rv.mean(axis=0))[2][0]
+					if nrm[int(np.argmax(np.abs(nrm)))] < 0:
+						nrm = -nrm
+				pm = np.asarray(scene_bones[ti]["mesh"].points, float)
+				pr_ = np.asarray(scene_bones[ri]["mesh"].points, float)
+				up = Tt[0][:3, :3] @ (pm.mean(axis=0)) + Tt[0][:3, 3]
+				up = pr_.mean(axis=0) - up                     # 脛骨 → 大腿骨 = 近位
+			if nrm is None:
+				nrm = np.array([0.0, 0.0, 1.0])
+			if up is None:
+				up = np.array([0.0, 1.0, 0.0])
+		nrm = nrm / np.linalg.norm(nrm)
+		v = up - nrm * (up @ nrm)
+		if np.linalg.norm(v) < 1e-6:
+			v = np.cross(nrm, [1.0, 0.0, 0.0])
+		v = v / np.linalg.norm(v)
+		u = np.cross(v, nrm)
+		B = np.vstack([u, v, nrm])                         # 行: 横・縦・奥行き
+		c_L = np.asarray(scene_bones[pi]["mesh"].points, float).mean(axis=0)
+		c = np.einsum("nij,j->ni", Rel[:, :3, :3], c_L) + Rel[:, :3, 3]
+		dt = (c - c[0]) @ B.T
+		from scipy.spatial.transform import Rotation as _R
+		rd = _R.from_matrix(np.einsum("nij,kj->nik", Rel[:, :3, :3], Rel[0, :3, :3])).as_rotvec()
+		dr = np.degrees(rd @ B.T)
+		return {"t": dt, "r": dr, "ref": names[ri]}
+
+	def _ankle_side_charts_extra(self, scene_bones, scene: dict, lig_cfg):
+		"""右のグラフのまとめ役。scene["chart_select"] に再生コントロールのチェックリストの設定を入れる。"""
+		import numpy as np
+		times = np.asarray(scene.get("frame_times") or [], dtype=float)
+		if len(times) < 2:
+			return None
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		st = {"plotter": None, "charts": [], "lig_items": list((lig_cfg or {}).get("items") or [])}
+		jfont = self._sim_ligament_font_file()          # 日本語が描けるフォント（靭帯の名前と同じ）
+		# ---- datalog ----
+		log, tx = None, None
+		try:
+			if bool(self.ankle_robot_log_show.get()):
+				path = str(self.ankle_robot_log_path.get() or "").strip()
+				if path and Path(path).exists():
+					log = self._ankle_robot_log_load(path)
+					if scene.get("_log_offset") is not None:
+						off = float(scene["_log_offset"])
+					else:
+						off = float(self.ankle_robot_log_offset_s.get())
+						if bool(self.ankle_robot_log_auto.get()):
+							fixed_si = next((si for si, b in enumerate(scene_bones)
+							                 if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), None)
+							cand = [si for si in range(len(scene_bones)) if si != fixed_si]
+							want = str(self.ankle_disp_bone.get() or "")
+							msi = next((si for si in cand if str(scene_bones[si].get("name", "")) == want), None)
+							if msi is None and cand:
+								msi = next((si for si in cand if "脛骨" in str(scene_bones[si].get("name", ""))), cand[0])
+							if fixed_si is not None and msi is not None:
+								try:
+									off, rms = self._ankle_robot_log_sync(log, scene_bones[msi]["poses"], list(times))
+									self.ankle_robot_log_offset_s.set(round(off, 2))
+									self._schedule_state_autosave("ankle")
+									print(f"[datalog] 時刻を自動で合わせました: ロボット = 映像 − {off:.2f} 秒（回転の一致 RMS {rms:.2f}°）")
+								except Exception as e:
+									print(f"[datalog] 自動の時刻合わせに失敗（⑤の値 {off:.2f} 秒を使います）: {e}")
+					tx = log["t"] + off - float(scene.get("_t_shift", 0.0) or 0.0)
+		except Exception as e:
+			print(f"[datalog] 読み込めません: {e}")
+			log = None
+		log_keys = [(f"log:{k}", k, lab) for k, lab in self._ANKLE_LOG_ITEMS if log is not None and k in log["cols"]]
+		# ---- 膝蓋骨 ----
+		pat = None
+		try:
+			pat = self._ankle_patella_motion(scene_bones, times)
+		except Exception as e:
+			print(f"[膝蓋骨の動き] 計算できません: {e}")
+
+		# ---- 候補と選ばれているもの ----
+		def _avail():
+			out = []
+			out.append(("lig", "靭帯の長さ"))           # 靭帯が無くても選べる（あとで作ればそこに出る）
+			if pat is not None:
+				out += [("pat_t", "膝蓋骨の移動"), ("pat_r", "膝蓋骨の回転")]
+			out += [(key, k) for key, k, lab in log_keys]
+			return out
+
+		def _sel_side():
+			try:
+				return [x.strip() for x in str(self.ankle_side_charts.get()).split(",") if x.strip()]
+			except Exception:
+				return ["lig"]
+
+		def _sel_log():
+			try:
+				return [x.strip() for x in str(self.ankle_robot_log_items.get()).split(",") if x.strip()]
+			except Exception:
+				return []
+
+		sel = {"side": _sel_side(), "log": _sel_log()}
+
+		def _is_on(key):
+			if key.startswith("log:"):
+				return key[4:] in sel["log"]
+			return key in sel["side"]
+
+		# ---- 1枚のグラフの中身 ----
+		def _series(key):
+			"""[(x, y, 色, 凡例)], y の名前"""
+			if key == "lig":
+				out = []
+				for it in st["lig_items"]:
+					if not bool(it.get("chart", True)):
+						continue
+					try:
+						Pa = np.asarray(scene_bones[int(it["a"]["bone"])]["poses"], float)
+						Pb = np.asarray(scene_bones[int(it["b"]["bone"])]["poses"], float)
+						pa, pb = np.asarray(it["a"]["point"], float), np.asarray(it["b"]["point"], float)
+						n = min(len(Pa), len(Pb), len(times))
+						L = np.linalg.norm((np.einsum("nij,j->ni", Pa[:n, :3, :3], pa) + Pa[:n, :3, 3])
+						                   - (np.einsum("nij,j->ni", Pb[:n, :3, :3], pb) + Pb[:n, :3, 3]), axis=1)
+						out.append((times[:n], L, str(it.get("color", "#FF8800")), str(it.get("name", ""))))
+					except Exception:
+						continue
+				return out, "Ligament (mm)"
+			if key in ("pat_t", "pat_r") and pat is not None:
+				arr = pat["t"] if key == "pat_t" else pat["r"]
+				n = min(len(arr), len(times))
+				labs = (("AP (horiz)", "PD (vert)", "ML (depth)") if key == "pat_t"
+				        else ("about AP: spin", "about PD: tilt", "about ML: flexion"))
+				return ([(times[:n], arr[:n, k], col, labs[k]) for k, col in enumerate(("#d62728", "#2ca02c", "#1f77b4"))],
+				        ("Patella move (mm)" if key == "pat_t" else "Patella rot (deg)"))
+			if key.startswith("log:") and log is not None:
+				k = key[4:]
+				lab = dict(self._ANKLE_LOG_ITEMS).get(k, k)
+				return [(tx, np.asarray(log["cols"][k], float), "#0000ff", "")], lab
+			return [], ""
+
+		def _build():
+			p = st["plotter"]
+			if p is None:
+				return
+			for ch, *_ in st["charts"]:
+				try:
+					p.remove_chart(ch)
+				except Exception:
+					pass
+			st["charts"] = []
+			keys = [k for k, _l in _ordered()]
+			made = []
+			for k in keys:
+				ser, ylab = _series(k)
+				if ser:
+					made.append((k, ser, ylab))
+			if not made:
+				return
+			top = 0.74
+			bottom = 0.27 if scene.get("_pairs_chart") else 0.02
+			h = min(0.24, (top - bottom) / len(made))
+			for j, (k, ser, ylab) in enumerate(made):
+				ch = pv.Chart2D(size=(0.33, h - 0.01), loc=(0.66, top - (j + 1) * h),
+				                x_label=("time [s]" if j == len(made) - 1 else ""), y_label=ylab)
+				lo, hi = np.inf, -np.inf
+				for x, y, col, lab in ser:
+					ok = np.isfinite(x) & np.isfinite(y) & (x >= times[0] - 1e-9) & (x <= times[-1] + 1e-9)   # 表示している時刻の範囲だけ（軸力から始めたときの前の記録は描かない）
+					if ok.sum() < 2:
+						continue
+					try:
+						ch.line(x[ok], y[ok], color=col, width=1.4, label=lab)
+					except Exception:
+						ch.line(x[ok], y[ok], color="b", width=1.4)
+					lo, hi = min(lo, float(np.min(y[ok]))), max(hi, float(np.max(y[ok])))
+				if not np.isfinite(lo):
+					continue
+				if k in ("log:Fml", "log:Fap", "log:Mfe", "log:Mvv", "log:Mie") and hi > 0 > lo:
+					# ＋と−の両方をとる力・モーメントは、0 を真ん中に ±（最大の大きさを切りのよい数に切り上げ）。例: Fap ±200 N
+					m_ = max(abs(lo), abs(hi)) / 1.03          # ノイズで少し超える分（3% まで）は切りのよい数に収める（201 N → ±200 N）
+					b_ = 10.0 ** np.floor(np.log10(m_))
+					m_ = next(f * b_ for f in (1.0, 2.0, 2.5, 5.0, 10.0) if m_ <= f * b_ + 1e-9)
+					lo, hi = -m_, m_
+				else:
+					pad = max(0.5 if k != "log:Fpd" else 1.0, 0.08 * (hi - lo))
+					lo, hi = lo - pad, hi + pad
+				cur = ch.line([times[0], times[0]], [lo, hi], color="r", width=2)
+				ch.background_color = "white"
+				# 1つずつ設定する（この版の pyvista には interactive が無く、まとめて try にすると
+				# そこで止まって範囲が設定されず、横軸が −50 から・縦軸が自動（Fap ±400）になっていた）
+				for _k, _v in (("active_background_color", "white"),
+				               ("x_range", [float(times[0]), float(times[-1])]),
+				               ("y_range", [float(lo), float(hi)]),
+				               ("legend_visible", any(lab for *_x, lab in ser))):
+					try:
+						setattr(ch, _k, _v)
+					except Exception:
+						pass
+				# 凡例・軸の名前に日本語のフォント（靭帯の名前が日本語でも出るように。2026-10-15）
+				if jfont:
+					try:
+						import vtk as _vtk
+						props = [ch.GetLegend().GetLabelProperties()]
+						props += [ch.GetAxis(_a).GetTitleProperties() for _a in (0, 1)]
+						for _tp in props:
+							_tp.SetFontFamily(_vtk.VTK_FONT_FILE)
+							_tp.SetFontFile(jfont)
+					except Exception as e:
+						print(f"[右のグラフ] 日本語のフォントを使えません: {e}")
+				p.add_chart(ch)
+				st["charts"].append((ch, cur, lo, hi))
+			try:
+				p.render()
+			except Exception:
+				pass
+
+		def _update(fi):
+			t = float(times[min(int(fi), len(times) - 1)])
+			for ch, cur, lo, hi in st["charts"]:
+				try:
+					cur.update([t, t], [lo, hi])
+				except Exception:
+					pass
+
+		def _make(p):
+			st["plotter"] = p
+			_build()
+			return _update
+
+		def _set(key, on):
+			"""再生コントロールのチェック。datalog の項目は②の「表示する項目」にも書く。"""
+			on = bool(on)
+			if key.startswith("log:"):
+				k = key[4:]
+				cur_ = [x for x in sel["log"] if x != k]
+				if on:
+					cur_.append(k)
+				order = [kk for kk, _l in self._ANKLE_LOG_ITEMS]
+				sel["log"] = sorted(cur_, key=lambda x: order.index(x) if x in order else 99)
+				self._ankle_view_write(tab_ref, {"ankle_robot_log_items": ",".join(sel["log"])})
+			else:
+				cur_ = [x for x in sel["side"] if x != key]
+				if on:
+					cur_.append(key)
+				order = [kk for kk, _l in self._ANKLE_SIDE_CHART_KEYS]
+				sel["side"] = sorted(cur_, key=lambda x: order.index(x) if x in order else 99)
+				self._ankle_view_write(tab_ref, {"ankle_side_charts": ",".join(sel["side"])})
+			_build()
+
+		# 可視化の中で靭帯を変えたら描き直す
+		_orig = (lig_cfg or {}).get("on_change")
+
+		def _on_lig_change(new_items):
+			if callable(_orig):
+				_orig(new_items)
+			st["lig_items"] = list(new_items or [])
+			try:
+				_build()
+			except Exception as e:
+				print(f"[右のグラフ] 描き直しに失敗: {e}")
+		if isinstance(lig_cfg, dict):
+			lig_cfg["on_change"] = _on_lig_change
+
+		def _order_list():
+			try:
+				return [x.strip() for x in str(self.ankle_chart_order.get()).split(",") if x.strip()]
+			except Exception:
+				return []
+
+		def _ordered():
+			"""表示中（チェックした）グラフを、上からの並び順で [(キー, 名前)]。"""
+			av = _avail()
+			od = _order_list()
+			on = [(k, l) for k, l in av if _is_on(k)]
+			pos = {k: i for i, (k, _l) in enumerate(av)}
+			return sorted(on, key=lambda kl: (od.index(kl[0]) if kl[0] in od else len(od) + pos[kl[0]]))
+
+		def _move(key, d):
+			"""表示中のグラフ key を、上（d=−1）・下（d=+1）へ1つ動かす。"""
+			cur = [k for k, _l in _ordered()]
+			if key not in cur:
+				return
+			i = cur.index(key)
+			j = max(0, min(len(cur) - 1, i + int(d)))
+			if i == j:
+				return
+			cur[i], cur[j] = cur[j], cur[i]
+			rest = [k for k in _order_list() if k not in cur]
+			self._ankle_view_write(tab_ref, {"ankle_chart_order": ",".join(cur + rest)})
+			_build()
+
+		scene["chart_select"] = {"items": _avail, "get": _is_on, "set": _set, "ordered": _ordered, "move": _move}
+		return _make
+
+	# ---- 靭帯の長さのグラフ（2026-10-15） ----
+	# 右側のグラフの いちばん上に、模擬靭帯（ACL・PCL・MCL・LCL など）の長さを1枚にまとめて描く。
+	# 靭帯の色の線・凡例は靭帯の名前。可視化の中で靭帯を足す・消す・動かすと描き直す（datalog のグラフも並べ直す）。
+	_ANKLE_LIG_CHART_H = 0.24
+
+	def _ankle_lig_chart_extra(self, scene_bones, scene: dict, lig_cfg):
+		import numpy as np
+		times = np.asarray(scene.get("frame_times") or [], dtype=float)
+		if len(times) < 2 or not isinstance(lig_cfg, dict):
+			return None
+		font = self._sim_ligament_font_file()
+		st = {"plotter": None, "chart": None, "cur": None, "lo": 0.0, "hi": 1.0,
+		      "items": list(lig_cfg.get("items") or [])}
+
+		def _lengths(it):
+			try:
+				Pa = np.asarray(scene_bones[int(it["a"]["bone"])]["poses"], dtype=float)
+				Pb = np.asarray(scene_bones[int(it["b"]["bone"])]["poses"], dtype=float)
+				pa = np.asarray(it["a"]["point"], dtype=float)
+				pb = np.asarray(it["b"]["point"], dtype=float)
+				n = min(len(Pa), len(Pb), len(times))
+				wa = np.einsum("nij,j->ni", Pa[:n, :3, :3], pa) + Pa[:n, :3, 3]
+				wb = np.einsum("nij,j->ni", Pb[:n, :3, :3], pb) + Pb[:n, :3, 3]
+				return np.linalg.norm(wa - wb, axis=1)
+			except Exception:
+				return None
+
+		def _use_font(prop):
+			if not font or prop is None:
+				return
+			try:
+				import vtk
+				prop.SetFontFamily(vtk.VTK_FONT_FILE)
+				prop.SetFontFile(font)
+			except Exception:
+				pass
+
+		def _build(p):
+			if st["chart"] is not None:
+				try:
+					p.remove_chart(st["chart"])
+				except Exception:
+					pass
+				st["chart"], st["cur"] = None, None
+			its = [it for it in st["items"] if bool(it.get("chart", True))]     # 3D で隠した靭帯もグラフには出す
+			series = [(it, _lengths(it)) for it in its]
+			series = [(it, L) for it, L in series if L is not None and len(L) > 1]
+			scene["_lig_chart_h"] = self._ANKLE_LIG_CHART_H if series else 0.0
+			if not series:
+				return
+			h = self._ANKLE_LIG_CHART_H
+			ch = pv.Chart2D(size=(0.33, h - 0.01), loc=(0.66, 0.74 - h),
+			                x_label=("" if scene.get("_log_rebuild") else "time [s]"), y_label="Ligament (mm)")
+			lo, hi = np.inf, -np.inf
+			for it, L in series:
+				t = times[:len(L)]
+				try:
+					ch.line(t, L, color=str(it.get("color", "#FF8800")), width=1.6, label=str(it.get("name", "")))
+				except Exception:
+					ch.line(t, L, color="b", width=1.6, label=str(it.get("name", "")))
+				lo, hi = min(lo, float(np.nanmin(L))), max(hi, float(np.nanmax(L)))
+			pad = max(0.5, 0.08 * (hi - lo))
+			lo, hi = lo - pad, hi + pad
+			cur = ch.line([times[0], times[0]], [lo, hi], color="r", width=2)
+			ch.background_color = "white"
+			try:
+				ch.active_background_color = "white"
+				ch.interactive = False
+				ch.x_range = [float(times[0]), float(times[-1])]
+				ch.y_range = [lo, hi]
+			except Exception:
+				pass
+			# 凡例（靭帯の名前）。日本語の名前も出るように、靭帯の名前と同じフォントにする
+			try:
+				ch.legend_visible = True
+			except Exception:
+				pass
+			try:
+				lg = ch._legend if hasattr(ch, "_legend") else ch.GetLegend()
+				_use_font(lg.GetLabelProperties())
+			except Exception:
+				pass
+			p.add_chart(ch)
+			st.update(chart=ch, cur=cur, lo=lo, hi=hi)
+
+		def _update(fi):
+			if st["cur"] is None:
+				return
+			t = float(times[min(int(fi), len(times) - 1)])
+			try:
+				st["cur"].update([t, t], [st["lo"], st["hi"]])
+			except Exception:
+				pass
+
+		def _rebuild(new_items):
+			st["items"] = list(new_items or [])
+			p = st["plotter"]
+			if p is None:
+				return
+			had = float(scene.get("_lig_chart_h", 0.0) or 0.0)
+			_build(p)
+			if float(scene.get("_lig_chart_h", 0.0) or 0.0) != had and callable(scene.get("_log_rebuild")):
+				try:
+					scene["_log_rebuild"]()           # 靭帯のグラフが出た・消えた → datalog のグラフを並べ直す
+				except Exception as e:
+					print(f"[靭帯の長さのグラフ] datalog のグラフの並べ直しに失敗: {e}")
+			try:
+				p.render()
+			except Exception:
+				pass
+
+		def _make(p):
+			st["plotter"] = p
+			_build(p)
+			return _update
+
+		# 可視化の中で靭帯を変えたら（保存のたびに）描き直す
+		_orig = lig_cfg.get("on_change")
+
+		def _on_change(new_items):
+			if callable(_orig):
+				_orig(new_items)
+			try:
+				_rebuild(new_items)
+			except Exception as e:
+				print(f"[靭帯の長さのグラフ] 描き直しに失敗: {e}")
+		lig_cfg["on_change"] = _on_change
+		# datalog のグラフより先に、いちばん上の場所を取っておく（datalog はその下から並ぶ）
+		scene["_lig_chart_h"] = self._ANKLE_LIG_CHART_H if any(bool(it.get("chart", True))
+		                                                      for it in st["items"]) else 0.0
+		return _make
+
+	# ---- 靭帯の長さを比べる（2026-10-15） ----
+	# 靭帯は骨リストを共有しているタブで共通（付着部は骨のモデルの座標）なので、ACL切のタブでも
+	# 同じ「ACL」の長さ＝ACL があった所の長さが測れる。タブごとに④の姿勢（平滑化も可視化と同じ）から計算する。
+	def _ankle_lig_lengths_current_tab(self):
+		"""いま開いているタブで、全靭帯の長さの時間変化。{"times", "lengths": {名前: L}, "log", "offset", "colors"}。"""
+		import numpy as np
+		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		if not cache:
+			raise RuntimeError("④の結果（姿勢時系列）がありません")
+		anim, N, _w = self._ankle_build_bone_transforms(cache)
+		if not anim:
+			raise RuntimeError("骨の姿勢が作れません（キャリブ・モデルを確かめてください）")
+		ts = np.asarray(cache.get("timestamps", np.arange(N) / 30.0), dtype=float)[:N]
+		ft = ts - ts[0]
+		bones_data = [(i, str(self.ankle_bones[i].get("name", "")), m, np.asarray(Ts, dtype=float)) for (i, m, Ts) in anim]
+		# 平滑化（可視化と同じ設定）
+		try:
+			if bool(self.ankle_smooth_enable.get()) and N >= 20:
+				dts = np.diff(ft)
+				dts = dts[(dts > 1e-6) & np.isfinite(dts)]
+				fps = float(np.clip(1.0 / float(np.median(dts)), 1.0, 240.0)) if len(dts) else 30.0
+				det = {}
+				cb = cache.get("bones", {}) or {}
+				for (i, nm, m, Ts) in bones_data:
+					aid = int(self.ankle_bones[i].get("aruco_id", -1))
+					if aid in cb:
+						dd = np.asarray(cb[aid].get("detected"), dtype=bool)
+						if len(dd) == len(Ts):
+							det[i] = dd
+				try:
+					rej = bool(self.ankle_reject_outliers.get())
+				except Exception:
+					rej = True
+				bones_data, _st = self._ankle_smooth_pose_series(
+					bones_data, cutoff_hz=float(self.ankle_smooth_cutoff_hz.get()), frame_rate_hz=fps,
+					detected_map=det, reject_outliers=rej)
+		except Exception as e:
+			print(f"[靭帯の長さを比べる] 平滑化に失敗（生の姿勢で計算）: {e}")
+		Ts_of = {i: np.asarray(Ts, dtype=float) for (i, nm, m, Ts) in bones_data}
+		name_of = {i: nm for (i, nm, m, Ts) in bones_data}
+		lengths, colors = {}, {}
+		for it in (getattr(self, "ankle_ligaments", []) or []):
+			try:
+				ends = []
+				for key in ("a", "b"):
+					ep = it[key]
+					nm = str(ep.get("bone_name", ""))
+					hits = [i for i in Ts_of if name_of[i] == nm]
+					if len(hits) != 1:
+						hits = [i for i in Ts_of if i == int(ep.get("bone_index", -1))]
+					if len(hits) != 1:
+						raise KeyError(nm)
+					ends.append((Ts_of[hits[0]], np.asarray(ep["point"], dtype=float)))
+				(Pa, pa), (Pb, pb) = ends
+				n = min(len(Pa), len(Pb), len(ft))
+				wa = np.einsum("nij,j->ni", Pa[:n, :3, :3], pa) + Pa[:n, :3, 3]
+				wb = np.einsum("nij,j->ni", Pb[:n, :3, :3], pb) + Pb[:n, :3, 3]
+				lengths[str(it.get("name", ""))] = np.linalg.norm(wa - wb, axis=1)
+				colors[str(it.get("name", ""))] = str(it.get("color", "#FF8800"))
+			except Exception as e:
+				print(f"[靭帯の長さを比べる] {it.get('name', '')}: 骨が見つかりません（{e}）")
+		# datalog と時刻のずれ（可視化と同じ: 自動で合わせる設定なら、回転の動きを重ねて決める）
+		log, off = None, None
+		try:
+			path = str(self.ankle_robot_log_path.get() or "").strip()
+			if path and Path(path).exists():
+				log = self._ankle_robot_log_load(path)
+				off = float(self.ankle_robot_log_offset_s.get())
+				if bool(self.ankle_robot_log_auto.get()):
+					fx = next((i for i in Ts_of if self.ankle_bones[i].get("fixed")), None)
+					want = str(self.ankle_disp_bone.get() or "")
+					cand = [i for i in Ts_of if i != fx]
+					mi = next((i for i in cand if name_of[i] == want), None)
+					if mi is None and cand:
+						mi = next((i for i in cand if "脛骨" in name_of[i]), cand[0])
+					if fx is not None and mi is not None:
+						Tf, Tm = Ts_of[fx], Ts_of[mi]
+						rel = np.einsum("nij,njk->nik", np.linalg.inv(Tf), Tm)
+						off, _rms = self._ankle_robot_log_sync(log, rel, list(ft))
+		except Exception as e:
+			print(f"[靭帯の長さを比べる] datalog を使えません: {e}")
+			log, off = None, None
+		return {"times": ft, "lengths": lengths, "colors": colors, "log": log, "offset": off}
+
+	def _ankle_open_lig_compare(self) -> None:
+		"""靭帯の長さを、タブ（試験）どうしで重ねて比べる画面。"""
+		import numpy as np
+		from matplotlib.figure import Figure
+		from matplotlib.font_manager import FontProperties
+		from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+		if not self._ankle_tabs:
+			return
+		try:
+			self._ankle_tabs[self._ankle_active_tab]["snapshot"] = self._ankle_snapshot_current()
+		except Exception:
+			pass
+		cur = self._ankle_active_tab_dict()
+		gid = self._ankle_tab_group(cur)
+
+		def _ligs_of(t):
+			sn = (t or {}).get("snapshot") or {}
+			g = self._ankle_tab_group(t)
+			if g:
+				return self._ankle_bone_groups_dict()[g].get("ligaments") or []
+			return sn.get("_ligaments") or []
+
+		tabs = [t for t in self._ankle_tabs if (gid and self._ankle_tab_group(t) == gid) or t is cur]
+		if len(tabs) < 2:
+			tabs = [t for t in self._ankle_tabs if _ligs_of(t)]
+		lig_names = []
+		for t in tabs:
+			for it in _ligs_of(t):
+				nm = str(it.get("name", ""))
+				if nm and nm not in lig_names:
+					lig_names.append(nm)
+		if not lig_names:
+			messagebox.showinfo("靭帯の長さを比べる",
+			                    "靭帯がありません。可視化ウィンドウの「靭帯…」で靭帯を作ってから使ってください。", parent=self)
+			return
+		cname = str((cur or {}).get("name", ""))
+		if cname.endswith("_ACL切"):
+			partner = cname[:-len("_ACL切")]
+		else:
+			partner = cname + "_ACL切"
+
+		win = tk.Toplevel(self)
+		win.title("靭帯の長さを比べる")
+		win.transient(self)
+		win.geometry(f"1250x780+{self.winfo_rootx() + 40}+{self.winfo_rooty() + 40}")
+		left = ttk.Frame(win)
+		left.pack(side="left", fill="y", padx=8, pady=8)
+		ttk.Label(left, text="試験（タブ）", font=(self.ui_font_family, 10, "bold")).pack(anchor="w")
+		tab_vars = []
+		for t in tabs:
+			v = tk.BooleanVar(win, value=(t is cur or str(t.get("name", "")) == partner))
+			ttk.Checkbutton(left, text=str(t.get("name", "")), variable=v).pack(anchor="w")
+			tab_vars.append((t, v))
+		ttk.Label(left, text="靭帯", font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(10, 0))
+		lig_vars = []
+		for nm in lig_names:
+			v = tk.BooleanVar(win, value=(nm.upper().startswith("ACL") if any(n.upper().startswith("ACL") for n in lig_names)
+			                              else True))
+			ttk.Checkbutton(left, text=nm, variable=v).pack(anchor="w")
+			lig_vars.append((nm, v))
+		ttk.Label(left, text="横軸", font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(10, 0))
+		x_choices = ["映像の時刻 [s]", "ロボットの時刻 [s]（datalog）"] + [f"ロボット {lab}" for k, lab in self._ANKLE_LOG_ITEMS]
+		x_var = tk.StringVar(win, value=x_choices[0])
+		ttk.Combobox(left, textvariable=x_var, values=x_choices, state="readonly", width=28).pack(anchor="w")
+		ttk.Label(left, text=("※ 試験ごとに撮影を始めたタイミングが違います。\n"
+		                      "  ロボットの時刻や AP・FE で並べると、\n  同じ動きの所どうしを比べられます\n"
+		                      "  （datalog と時刻合わせが必要）。\n"
+		                      "※ ACL切のタブの「ACL」は、\n  ACL があった所（付着部どうし）の長さです。\n"
+		                      "※ 表の「AP との相関」: 長さとロボットの AP\n  が一緒に増えれば +、逆なら −。\n"
+		                      "  AP の + が脛骨の前方なら、ACL は +\n  （前で伸びる）、PCL は − が目安。"),
+		          foreground="gray", font=(self.ui_font_family, 8), justify="left").pack(anchor="w", pady=(6, 0))
+		btns = ttk.Frame(left)
+		btns.pack(anchor="w", pady=(12, 0))
+		status = ttk.Label(left, text="", foreground="#005580", wraplength=260, justify="left")
+		status.pack(anchor="w", pady=(8, 0))
+
+		right = ttk.Frame(win)
+		right.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=8)
+		fig = Figure(figsize=(8, 5), dpi=100)
+		ax = fig.add_subplot(111)
+		canvas = FigureCanvasTkAgg(fig, master=right)
+		canvas.get_tk_widget().pack(fill="both", expand=True)
+		try:
+			NavigationToolbar2Tk(canvas, right).update()
+		except Exception:
+			pass
+		cols = ("試験", "靭帯", "最小 mm", "最大 mm", "変化の幅 mm", "平均 mm", "はじめ mm",
+		        "AP との相関 r", "Fap との相関 r", "AP が増えると")
+		tv = ttk.Treeview(right, columns=cols, show="headings", height=7)
+		for c in cols:
+			tv.heading(c, text=c)
+			tv.column(c, width=(230 if c == "試験" else (120 if c == "AP が増えると" else 90)),
+			          anchor=("w" if c in ("試験", "靭帯", "AP が増えると") else "e"))
+		tv.pack(fill="x", pady=(6, 0))
+		fp = FontProperties(family=["Meiryo", "Yu Gothic", "MS Gothic", "sans-serif"])
+		memo = {}
+		last = {"rows": []}
+
+		def _compute(t):
+			key = id(t)
+			if key in memo:
+				return memo[key]
+			orig = self._ankle_active_tab
+			idx = next((j for j, x in enumerate(self._ankle_tabs) if x is t), None)
+			try:
+				if idx is not None and idx != orig:
+					self.on_ankle_tab_select(idx)
+				res = self._ankle_lig_lengths_current_tab()
+			finally:
+				if idx is not None and idx != orig:
+					j = next((j for j, x in enumerate(self._ankle_tabs) if x is self._ankle_tabs[orig]), orig)
+					self.on_ankle_tab_select(j)
+			memo[key] = res
+			return res
+
+		def _x_of(res, choice):
+			t = res["times"]
+			if choice.startswith("映像"):
+				return t, "映像の時刻 [s]"
+			log, off = res.get("log"), res.get("offset")
+			if log is None or off is None:
+				return None, "datalog がない"
+			tr = t - float(off)              # ロボットの時刻 = 映像の時刻 − ずれ
+			if choice.startswith("ロボットの時刻"):
+				return tr, "ロボットの時刻 [s]"
+			lab = choice.replace("ロボット ", "")
+			k = next((k for k, l in self._ANKLE_LOG_ITEMS if l == lab), None)
+			if k is None or k not in log["cols"]:
+				return None, f"datalog に {lab} がない"
+			x = np.interp(tr, log["t"], np.asarray(log["cols"][k], dtype=float), left=np.nan, right=np.nan)
+			return x, lab
+
+		def draw():
+			sel_t = [t for t, v in tab_vars if v.get()]
+			sel_l = [n for n, v in lig_vars if v.get()]
+			if not sel_t or not sel_l:
+				status.config(text="試験と靭帯を1つ以上選んでください。", foreground="#c62828")
+				return
+			status.config(text="計算しています…（初回は 1 試験 数秒〜十数秒）", foreground="#005580")
+			win.update_idletasks()
+			ax.clear()
+			for r in tv.get_children():
+				tv.delete(r)
+			rows, notes = [], []
+			styles = ["-", "--", ":", "-."]
+			cmap = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#e377c2", "#17becf"]
+			xl = None
+			for ti, t in enumerate(sel_t):
+				tn = str(t.get("name", ""))
+				try:
+					res = _compute(t)
+				except Exception as e:
+					notes.append(f"{tn}: {e}")
+					continue
+				x, xlab = _x_of(res, x_var.get())
+				if x is None:
+					notes.append(f"{tn}: {xlab}")
+					continue
+				xl = xlab
+				for li, ln in enumerate(sel_l):
+					L = res["lengths"].get(ln)
+					if L is None:
+						notes.append(f"{tn}: 靭帯「{ln}」がない")
+						continue
+					n = min(len(L), len(x))
+					ok = np.isfinite(x[:n])
+					ax.plot(x[:n][ok], L[:n][ok], styles[li % len(styles)], color=cmap[ti % len(cmap)],
+					        linewidth=1.2, label=f"{tn} / {ln}")
+					Lv = L[:n][ok]
+					# 長さと ロボットの AP・Fap の相関（付着部が妥当かを確かめる。横軸の選び方とは関係なく、全コマで）
+					r_ap, r_fap, how = "—", "—", "—"
+					try:
+						if res.get("log") is not None and res.get("offset") is not None:
+							tr_ = res["times"] - float(res["offset"])
+							for k_, nm_ in (("AP", "ap"), ("Fap", "fap")):
+								if k_ in res["log"]["cols"]:
+									xx = np.interp(tr_, res["log"]["t"], np.asarray(res["log"]["cols"][k_], dtype=float),
+									               left=np.nan, right=np.nan)
+									m2 = min(len(xx), len(L))
+									ok2 = np.isfinite(xx[:m2]) & np.isfinite(L[:m2])
+									if ok2.sum() > 20 and np.std(xx[:m2][ok2]) > 1e-9:
+										rr = float(np.corrcoef(xx[:m2][ok2], L[:m2][ok2])[0, 1])
+										if nm_ == "ap":
+											r_ap = f"{rr:+.2f}"
+											how = ("伸びる" if rr > 0.3 else ("縮む" if rr < -0.3 else "ほぼ変わらない"))
+										else:
+											r_fap = f"{rr:+.2f}"
+					except Exception as e:
+						print(f"[靭帯の長さを比べる] 相関を出せません: {e}")
+					if len(Lv):
+						row = (tn, ln, f"{np.min(Lv):.2f}", f"{np.max(Lv):.2f}", f"{np.ptp(Lv):.2f}",
+						       f"{np.mean(Lv):.2f}", f"{Lv[0]:.2f}", r_ap, r_fap, how)
+						tv.insert("", "end", values=row)
+						rows.append((tn, ln, xlab, x[:n][ok], Lv))
+			ax.set_xlabel(xl or "", fontproperties=fp)
+			ax.set_ylabel("靭帯の長さ [mm]", fontproperties=fp)
+			ax.set_title("靭帯の長さの比較", fontproperties=fp)
+			ax.grid(True, alpha=0.3)
+			if rows:
+				ax.legend(prop=fp, fontsize=8, loc="best")
+			fig.tight_layout()
+			canvas.draw()
+			last["rows"] = rows
+			status.config(text=("描きました。" if not notes else "描きました。\n注意: " + " / ".join(notes)),
+			              foreground=("#1b5e20" if not notes else "#b35900"))
+
+		def export_csv():
+			if not last["rows"]:
+				messagebox.showinfo("靭帯の長さを比べる", "先に「描く」を押してください。", parent=win)
+				return
+			fp_ = filedialog.asksaveasfilename(parent=win, title="CSV に書き出す", defaultextension=".csv",
+			                                   filetypes=[("CSV", "*.csv")], initialfile="ligament_lengths.csv")
+			if not fp_:
+				return
+			import csv as _csv
+			with open(fp_, "w", newline="", encoding="utf-8-sig") as f:
+				w = _csv.writer(f)
+				w.writerow(["試験", "靭帯", "横軸", "x", "長さ mm"])
+				for tn, ln, xlab, x, L in last["rows"]:
+					for a, b in zip(x, L):
+						w.writerow([tn, ln, xlab, f"{a:.4f}", f"{b:.4f}"])
+			messagebox.showinfo("靭帯の長さを比べる", f"書き出しました:\n{fp_}", parent=win)
+
+		ttk.Button(btns, text="描く", command=draw).pack(side="left")
+		ttk.Button(btns, text="CSV に書き出す…", command=export_csv).pack(side="left", padx=(6, 0))
+		ttk.Button(btns, text="閉じる", command=win.destroy).pack(side="left", padx=(6, 0))
+		win._lig_compare = {"draw": draw, "tab_vars": tab_vars, "lig_vars": lig_vars, "x_var": x_var,
+		                    "tree": tv, "ax": ax, "status": status, "last": last, "export": export_csv}
 
 	# ---- 方眼紙と移動量（2026-10-09） ----
 	# 世界座標 = 固定した骨の座標（骨固定のとき、固定した骨は動かない）。方眼紙はそこに置くので、
@@ -10575,7 +12277,18 @@ class MainMenuGUI(_BaseWindow):
 				break
 		if fixed_si is None:
 			print("[方眼紙] ③で骨を「固定」にしていないので、方眼紙と移動量は表示しません")
-			return None
+			_msg = ("方眼紙・移動量: ③で骨を1つ「固定」にすると表示されます"
+			        "（動かない骨、たとえば大腿骨を選んで「この骨を固定する」）")
+			_font = self._sim_ligament_font_file()
+
+			def _make_note(plotter):
+				kw = {"font_file": _font} if _font else {}
+				try:
+					plotter.add_text(_msg, position="lower_left", font_size=11, color="#c62828", **kw)
+				except TypeError:
+					plotter.add_text(_msg, position="lower_left", font_size=11, color="#c62828")
+				return None
+			return _make_note
 		cand = [si for si in range(len(scene_bones)) if si != fixed_si]
 		meas_si = None
 		if want and want != "（自動）":
@@ -10643,16 +12356,8 @@ class MainMenuGUI(_BaseWindow):
 
 		def _overlay_renderer(p):
 			"""骨に隠れない重ね描き用のレンダラ（同じカメラを使う上の層）。移動の印と軌跡はここに描く。"""
-			import vtk
 			if st.get("ov") is None:
-				rw = p.render_window
-				rw.SetNumberOfLayers(max(2, rw.GetNumberOfLayers()))
-				ov = vtk.vtkRenderer()
-				ov.SetLayer(1)
-				ov.SetActiveCamera(p.renderer.GetActiveCamera())
-				ov.InteractiveOff()
-				rw.AddRenderer(ov)
-				st["ov"] = ov
+				st["ov"] = self._sim_overlay_renderer(p)     # 2点の距離と同じ重ね描きの層
 			return st["ov"]
 
 		def _ov_actor(mesh, color, line_width=None):
@@ -10746,8 +12451,7 @@ class MainMenuGUI(_BaseWindow):
 			_draw()
 			_update(st["fi"])
 			if isinstance(tab_ref, dict):
-				tab_ref["grid_plane"] = {"normal": st["n"].tolist(), "up": st["v"].tolist()}
-				self._schedule_state_autosave("ankle")
+				self._ankle_grid_plane_write(tab_ref, {"normal": st["n"].tolist(), "up": st["v"].tolist()})
 			try:
 				st["plotter"].render()
 			except Exception:
@@ -10897,20 +12601,24 @@ class MainMenuGUI(_BaseWindow):
 			neg, pos = 2.0, 2.0
 
 		def _on_change(lo, hi):
-			# 開いたときのタブに書く（別のタブに切り替えていても元のタブへ）
+			# 開いたときのタブに書く（別のタブに切り替えていても元のタブへ。骨リストを共有していれば全部へ）
 			if tab_ref is None:
 				return
-			if tab_ref is self._ankle_active_tab_dict():
-				self.ankle_hm_neg_mm.set(abs(lo))
-				self.ankle_hm_pos_mm.set(abs(hi))
-			else:
-				sn = tab_ref.setdefault("snapshot", {})
-				sn["ankle_hm_neg_mm"] = abs(lo)
-				sn["ankle_hm_pos_mm"] = abs(hi)
-			self._schedule_state_autosave("ankle")
+			self._ankle_view_write(tab_ref, {"ankle_hm_neg_mm": abs(lo), "ankle_hm_pos_mm": abs(hi)})
+
+		try:
+			show = bool(self.ankle_hm_show.get())
+		except Exception:
+			show = True
+
+		def _on_show(on):
+			if tab_ref is None:
+				return
+			self._ankle_view_write(tab_ref, {"ankle_hm_show": bool(on)})
 
 		return {"clim": (-max(neg, 0.01), pos), "editable": True, "on_range_change": _on_change,
-		        "presets": self._ankle_hm_presets, "save_preset": self._ankle_hm_save_preset}
+		        "presets": self._ankle_hm_presets, "save_preset": self._ankle_hm_save_preset,
+		        "show": show, "on_show_change": _on_show}
 
 	def _ankle_marker_true_mm(self) -> float:
 		"""実寸（ノギス）。印刷・自動キャリブ（スキャン上のマーカー）・キャリブの記録に使う。"""
@@ -10977,7 +12685,15 @@ class MainMenuGUI(_BaseWindow):
 			except Exception:
 				pass
 		else:
-			self.ankle_marker_size_note.set(f"手動（自動なら {auto_val:g} mm" + ("・深度の推定" if est else "・実寸と同じ") + "）")
+			_basis = ""
+			try:
+				_basis = str(self.ankle_marker_size_basis.get() or "").strip()
+			except Exception:
+				_basis = ""
+			if _basis:
+				self.ankle_marker_size_note.set(f"{_basis}（このタブだけの自動なら {auto_val:g} mm）")
+			else:
+				self.ankle_marker_size_note.set(f"手動（自動なら {auto_val:g} mm" + ("・深度の推定" if est else "・実寸と同じ") + "）")
 			try:
 				self._ankle_size_auto_btn.pack(side=tk.LEFT, padx=(8, 0))
 			except Exception:
@@ -10988,6 +12704,10 @@ class MainMenuGUI(_BaseWindow):
 		if event is not None and getattr(event, "keysym", "") in ("Tab", "Shift_L", "Shift_R", "Control_L",
 		                                                          "Control_R", "Left", "Right", "Home", "End"):
 			return
+		try:
+			self.ankle_marker_size_basis.set("")       # 手で変えたら、中央値などの由来は消す
+		except Exception:
+			pass
 		if bool(self.ankle_marker_size_auto.get()):
 			self.ankle_marker_size_auto.set(False)
 			print("[マーカー実寸] 補正後を手で変えたので「手動」にしました（「自動に戻す」で戻せます）")
@@ -10995,11 +12715,60 @@ class MainMenuGUI(_BaseWindow):
 		self._schedule_state_autosave("ankle")
 
 	def _ankle_size_set_auto(self, on: bool) -> None:
+		if on:
+			try:
+				self.ankle_marker_size_basis.set("")
+			except Exception:
+				pass
 		self.ankle_marker_size_auto.set(bool(on))
 		self._ankle_size_refresh_auto()
 		self._schedule_state_autosave("ankle")
 
-	def _ankle_size_apply_to_tabs(self, tabs, v: float) -> int:
+	def _ankle_tab_depth_estimate(self, tab):
+		"""そのタブの録画の、深度で測ったマーカーの大きさ（中央値）。無ければ None。"""
+		try:
+			name = str((tab or {}).get("name", ""))
+			sn = (tab or {}).get("snapshot") or {}
+			c = self._ankle_pose_cache.get(name) or {}
+			src = str(c.get("source", "") or "") or str(sn.get("ankle_depth", "") or sn.get("ankle_video", "") or "")
+			if tab is self._ankle_active_tab_dict():
+				src = self._ankle_size_source() or src
+			e = self._ankle_depth_size_get(src) or {}
+			return float(e["all"]["median"]) if e.get("all") else None
+		except Exception:
+			return None
+
+	def _ankle_tab_eff_size(self, tab, true_mm=None):
+		"""そのタブで計算に使う「補正後」: (値mm, 種類, 由来)。種類 = 中央値 / 手動 / 自動。
+		自動のタブは、深度の推定（無ければ ノギス）。開いているタブは画面の値。"""
+		active = tab is not None and tab is self._ankle_active_tab_dict()
+		sn = (tab or {}).get("snapshot") or {}
+		try:
+			auto = bool(self.ankle_marker_size_auto.get()) if active else bool(sn.get("ankle_marker_size_auto", True))
+		except Exception:
+			auto = True
+		if true_mm is None:
+			try:
+				true_mm = float(self.ankle_marker_size_true_mm.get()) if active else \
+					float(sn.get("ankle_marker_size_true_mm", sn.get("ankle_marker_size_mm", 15.0)))
+			except Exception:
+				true_mm = None
+		if auto:
+			est = self._ankle_tab_depth_estimate(tab)
+			if est:
+				return round(float(est), 2), "自動", "深度の推定"
+			return (float(true_mm) if true_mm else None), "自動", "推定なし→ノギス"
+		try:
+			val = float(self.ankle_marker_size_mm.get()) if active else float(sn.get("ankle_marker_size_mm"))
+		except Exception:
+			val = None
+		try:
+			basis = str(self.ankle_marker_size_basis.get() if active else sn.get("ankle_marker_size_basis", "") or "")
+		except Exception:
+			basis = ""
+		return val, ("中央値" if basis.startswith("中央値") else "手動"), basis
+
+	def _ankle_size_apply_to_tabs(self, tabs, v: float, basis: str = "") -> int:
 		"""タブの「補正後・計算に使う」に v を入れて手動にする。実寸（ノギス）は変えない。
 
 		まだ開いていない古いタブには実寸（ノギス）の項目が無いので、補正後を書き換える前に
@@ -11018,7 +12787,9 @@ class MainMenuGUI(_BaseWindow):
 					sn["ankle_marker_size_true_mm"] = v
 			sn["ankle_marker_size_mm"] = v
 			sn["ankle_marker_size_auto"] = False
+			sn["ankle_marker_size_basis"] = str(basis or "")
 			if t is active:
+				self.ankle_marker_size_basis.set(str(basis or ""))
 				self.ankle_marker_size_auto.set(False)
 				if abs(float(self.ankle_marker_size_mm.get()) - v) > 1e-12:
 					self.ankle_marker_size_mm.set(v)
@@ -11047,11 +12818,24 @@ class MainMenuGUI(_BaseWindow):
 		win = tk.Toplevel(self)
 		win.title("補正後の値を他のタブと同期")
 		win.transient(self)
-		win.geometry("720x560")
-		ttk.Label(win, text=(f"いまのタブ「{(cur or {}).get('name', '')}」の「補正後・計算に使う」= {v:g} mm を、"
-		                     "チェックしたタブの「補正後」に入れます。入れたタブは「手動」になります"
-		                     "（実寸 ノギス は変えません。各タブの「自動に戻す」で戻せます）。"),
-		          wraplength=690, justify="left").pack(anchor="w", padx=10, pady=(10, 4))
+		win.geometry("760x620")
+		mode_var = tk.StringVar(win, value="median")
+		mf = ttk.Frame(win)
+		mf.pack(fill=tk.X, padx=10, pady=(10, 2))
+		ttk.Radiobutton(mf, variable=mode_var, value="median",
+		                text="チェックしたタブ（いまのタブも含む）の、深度で測った大きさの中央値を、全部に入れる（推奨）"
+		                ).pack(anchor="w")
+		ttk.Radiobutton(mf, variable=mode_var, value="current",
+		                text=f"いまのタブの値 {v:g} mm を、チェックしたタブに入れる").pack(anchor="w")
+		med_var = tk.StringVar(win, value="")
+		ttk.Label(win, textvariable=med_var, foreground="#005580", font=(self.ui_font_family, 10, "bold")
+		          ).pack(anchor="w", padx=28)
+		ttk.Label(win, text=("※ 同じカメラ配置・同じ日の録画なら、本当の大きさは同じはず。録画ごとの深度の推定のぶれ"
+		                     "（マーカーの傾きなどで ±0.1〜0.2mm）が条件の差に見えないよう、共通の値（中央値）をおすすめします。"
+		                     "入れたタブは「手動」になり、②に「中央値」と出ます（実寸 ノギス は変えません。"
+		                     "各タブの「自動に戻す」で戻せます）。カメラの位置や露出を変えた録画は、別にしてください。"),
+		          wraplength=730, justify="left", foreground="gray", font=(self.ui_font_family, 8)
+		          ).pack(anchor="w", padx=10, pady=(2, 4))
 		ctl = ttk.Frame(win)
 		ctl.pack(fill=tk.X, padx=10)
 		lst = tk.Frame(win)
@@ -11076,44 +12860,115 @@ class MainMenuGUI(_BaseWindow):
 			how = "自動" if sn.get("ankle_marker_size_auto", True) else "手動"
 			return f"{t.get('name', '')}　（補正後 {eff:g} mm・{how} / 実寸 {tru:g} mm）"
 
-		same = [t for t in self._ankle_tabs if t is not cur and folder and str(t.get("folder", "") or "") == folder]
-		others = [t for t in self._ankle_tabs if t is not cur and t not in same]
-		ttk.Label(inner, text=(f"同じフォルダ「{folder}」" if folder else "同じフォルダ（フォルダ未設定）"),
-		          font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(2, 2))
+		def _est_txt(t):
+			e = self._ankle_tab_depth_estimate(t)
+			return f"　深度の推定 {e:.2f}" if e else "　深度の推定なし"
+
+		# 最初から選ぶのは、骨リストを共有しているタブ（＝同じ標本・同じ撮影。2026-10-15）。
+		# 共有していなければ、同じフォルダのタブ（以前どおり）
+		gid = self._ankle_tab_group(cur)
+		grp_tabs = [t for t in self._ankle_tabs if t is not cur and gid and self._ankle_tab_group(t) == gid]
+		same = [t for t in self._ankle_tabs if t is not cur and t not in grp_tabs
+		        and folder and str(t.get("folder", "") or "") == folder]
+		others = [t for t in self._ankle_tabs if t is not cur and t not in same and t not in grp_tabs]
+		if grp_tabs:
+			_gname = str(self._ankle_bone_groups_dict()[gid].get("name", "") or "")
+			ttk.Label(inner, text=f"骨リストを共有しているタブ（同じ標本{('「' + _gname + '」') if _gname else ''}）",
+			          font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(2, 2))
+			for t in grp_tabs:
+				var = tk.BooleanVar(win, value=True)
+				ttk.Checkbutton(inner, variable=var, text=_label(t) + _est_txt(t), command=lambda: _upd()).pack(anchor="w")
+				checks.append((t, var, "group"))
+		ttk.Label(inner, text=(f"同じフォルダ「{folder}」" + ("のほかのタブ" if grp_tabs else "") if folder
+		                       else "同じフォルダ（フォルダ未設定）"),
+		          font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(10 if grp_tabs else 2, 2))
 		if not same:
 			ttk.Label(inner, text="　（ほかのタブはありません）", foreground="#666666").pack(anchor="w")
 		for t in same:
-			var = tk.BooleanVar(win, value=True)
-			ttk.Checkbutton(inner, variable=var, text=_label(t)).pack(anchor="w")
-			checks.append((t, var, True))
+			var = tk.BooleanVar(win, value=not grp_tabs)
+			ttk.Checkbutton(inner, variable=var, text=_label(t) + _est_txt(t), command=lambda: _upd()).pack(anchor="w")
+			checks.append((t, var, "same"))
 		ttk.Label(inner, text="ほかのフォルダ", font=(self.ui_font_family, 10, "bold")).pack(anchor="w", pady=(10, 2))
 		for t in others:
 			var = tk.BooleanVar(win, value=False)
 			f_ = str(t.get("folder", "") or "")
-			ttk.Checkbutton(inner, variable=var, text=_label(t) + (f"　［{f_}］" if f_ else "")).pack(anchor="w")
-			checks.append((t, var, False))
+			ttk.Checkbutton(inner, variable=var, text=_label(t) + _est_txt(t) + (f"　［{f_}］" if f_ else ""),
+			                command=lambda: _upd()).pack(anchor="w")
+			checks.append((t, var, "other"))
+
+		def _median():
+			"""(中央値, 推定のあるタブ数, 推定の無いタブ数)。いまのタブも含む。"""
+			import numpy as np
+			tabs_ = [cur] + [t for t, var, _ in checks if var.get()]
+			es = [self._ankle_tab_depth_estimate(t) for t in tabs_ if t is not None]
+			ok = [e for e in es if e]
+			return (float(np.median(ok)) if ok else None), len(ok), len(es) - len(ok)
+
+		def _upd(*_):
+			m, n_ok, n_no = _median()
+			if mode_var.get() == "median":
+				if m is None:
+					med_var.set("深度の推定のあるタブがありません（先に④を実行してください）")
+				else:
+					med_var.set(f"中央値 = {m:.2f} mm（深度の推定のある {n_ok} タブ" +
+					            (f"・推定の無い {n_no} タブは数に入れません" if n_no else "") + "）")
+				try:
+					btn_go.configure(text=("チェックしたタブといまのタブに、中央値 " +
+					                       (f"{m:.2f}" if m is not None else "—") + " mm を入れる"))
+				except Exception:
+					pass
+			else:
+				med_var.set("")
+				try:
+					btn_go.configure(text=f"チェックしたタブの「補正後」に {v:g} mm を入れる")
+				except Exception:
+					pass
+		mode_var.trace_add("write", _upd)
 
 		def _set(which, on):
-			for t, var, is_same in checks:
-				if which == "all" or (which == "same" and is_same):
+			for t, var, kind in checks:
+				if which == "all" or which == kind:
 					var.set(on)
-		ttk.Button(ctl, text="同じフォルダをすべてチェック", command=lambda: _set("same", True)).pack(side=tk.LEFT)
+			_upd()
+		if gid:
+			ttk.Button(ctl, text="骨リストを共有しているタブをチェック", command=lambda: _set("group", True)).pack(side=tk.LEFT, padx=(0, 6))
+		ttk.Button(ctl, text="同じフォルダをすべてチェック",
+		           command=lambda: (_set("group", True), _set("same", True))).pack(side=tk.LEFT)
 		ttk.Button(ctl, text="すべて外す", command=lambda: _set("all", False)).pack(side=tk.LEFT, padx=6)
 
 		def do_sync():
+			import datetime as _dt
 			targets = [t for t, var, _ in checks if var.get()]
-			if not targets:
-				messagebox.showinfo("他のタブと同期", "タブがチェックされていません。", parent=win)
-				return
-			n = self._ankle_size_apply_to_tabs(targets, v)
-			messagebox.showinfo("他のタブと同期", f"{n} 個のタブの「補正後」に {v:g} mm を入れました（手動）。\n"
-			                    "④をやり直さなくても、可視化に反映されます。", parent=win)
+			if mode_var.get() == "median":
+				m, n_ok, _n_no = _median()
+				if m is None:
+					messagebox.showinfo("他のタブと同期", "深度の推定のあるタブがありません。", parent=win)
+					return
+				val = round(m, 2)
+				basis = f"中央値 {val:.2f} mm（{n_ok}タブの深度推定・{_dt.date.today():%m/%d}）"
+				targets = ([cur] if cur is not None else []) + targets
+			else:
+				if not targets:
+					messagebox.showinfo("他のタブと同期", "タブがチェックされていません。", parent=win)
+					return
+				val = v
+				try:
+					basis = str(self.ankle_marker_size_basis.get() or "")     # いまのタブが中央値なら、その由来も一緒に
+				except Exception:
+					basis = ""
+			n = self._ankle_size_apply_to_tabs(targets, val, basis=basis)
+			messagebox.showinfo("他のタブと同期", f"{n} 個のタブの「補正後」に {val:g} mm を入れました（手動）。\n"
+			                    + (f"②には「{basis}」と出ます。\n" if basis else "")
+			                    + "④をやり直さなくても、可視化に反映されます（接触は、その値で計算済みでなければ計算し直しです）。",
+			                    parent=win)
 			win.destroy()
 
 		bf = ttk.Frame(win)
 		bf.pack(fill=tk.X, padx=10, pady=8)
-		ttk.Button(bf, text=f"チェックしたタブの「補正後」に {v:g} mm を入れる", command=do_sync).pack(side=tk.LEFT)
+		btn_go = ttk.Button(bf, text="", command=do_sync)
+		btn_go.pack(side=tk.LEFT)
 		ttk.Button(bf, text="やめる", command=win.destroy).pack(side=tk.RIGHT)
+		_upd()
 
 	def _ankle_size_export_csv(self, parent=None) -> None:
 		"""全タブの 実寸 / 補正後 / 自動か / 深度の推定 を CSV に書き出す。"""
@@ -11152,9 +13007,16 @@ class MainMenuGUI(_BaseWindow):
 		messagebox.showinfo("マーカー実寸の一覧", f"{len(rows)} 個のタブを書き出しました:\n{fp}", parent=parent or self)
 
 	def _ankle_cache_size_ratio(self, cache) -> tuple:
-		"""(倍率, ④を計算したときの実寸, いまの②の実寸)。どちらかが分からなければ倍率 1。"""
+		"""(倍率, ④を計算したときの実寸, いまの②の実寸)。どちらかが分からなければ倍率 1。
+
+		「スキャンの縮尺を直す」（ankle_scale_mode = scan）のときは、補正後ではなくノギスの実寸を使う
+		（骨のすき間は、3D モデルの縮尺の方で直すため。2026-10-14）。
+		"""
 		try:
-			cur = float(self.ankle_marker_size_mm.get())
+			if self._ankle_scale_mode_is_scan():
+				cur = float(self.ankle_marker_size_true_mm.get())
+			else:
+				cur = float(self.ankle_marker_size_mm.get())
 		except Exception:
 			cur = None
 		try:
@@ -12428,6 +14290,555 @@ class MainMenuGUI(_BaseWindow):
 					return np.asarray(poses[k], dtype=float), k
 		return None, -1
 
+	# ==================================================================
+	# 骨片つきでスキャンした骨を、骨片と重なる部分だけ削る（2026-10-13）
+	# ==================================================================
+	# niki: 脛骨を骨片（内側・外側）を付けたままスキャンしたため、可視化で骨片が脛骨に
+	# 埋まって見えた。録画の最初のコマ（その骨と骨片がどちらも写っている最初のコマ）の位置で、
+	# 骨片と重なる部分を削り、骨片の割れ面（もとの骨の中にあった面）を裏返して穴に貼る
+	# （割れ面どうしはかみ合っているので、骨側の割れ面の形の代わりになる。骨片が動くと すき間が
+	#  ヒートマップに出る）。骨片のマーカーが写っていない録画（intact など）では何もしない。
+	# 実測（niki, 2026-10-13）:
+	#   - 最初のコマでの骨片と脛骨のずれは中央値 1〜2mm（マーカーとキャリブの誤差）→ 余裕 1.5mm
+	#   - ICP で合わせ直すのは不可: 骨片の外側の面が小さく滑らかで、内側の骨片がタブごとに
+	#     最大 38mm / 46° 違う所へ滑った
+	#   - スキャンのメッシュには穴がある（脛骨は骨幹の切り口も開いている）ので、符号つき距離は
+	#     遠くの骨幹まで「中」と誤る → 「表面から余裕以内」か「穴をふさいだ骨片の中」で判定
+	#   - 骨片（内側）は面の向き（表裏）がメッシュの中でそろっていない → ふたの面は1枚ずつ向きを直す
+	_ANKLE_TRIM_DEFAULT_MARGIN = 1.5
+	# 外側に取り残された殻（2026-10-13 追加）:
+	#   取り残しの正体 = 脛骨のスキャンの中の「骨片の写し」が、マーカーから求めた骨片の位置と ずれていること。
+	#   外側の骨片は、上限つきの小さな ICP で全タブ同じ位置に収まり（ばらつき 0.07mm/0.85°）、表面とのずれが
+	#   中央値 1.0→0.45mm に半減（マーカーの位置と約 7°・2mm 違っていた）。内側の骨片は良くならない/滑る
+	#   → 良くなったときだけ使い、マーカーの位置と補正した位置の両方で削る（骨片の表示と動きは変えない）。
+	#   残る細いリボン状の切れ端は、骨片の近くだけで「縁から w 削る→小さなかけらを捨てる→元の形まで戻す」で消す。
+	#   ためした: 骨片の面に垂直かで殻を見分ける → 骨片の縁が丸いので本物の脛骨の表面と見分けられない。
+	_ANKLE_TRIM_DEFAULT_CLEAN = 2.0
+	_ANKLE_TRIM_REFINE_MAX_DEG = 10.0
+	_ANKLE_TRIM_REFINE_MAX_MM = 4.0
+
+	def _ankle_trim_refine_pose(self, base, fmesh, M0):
+		"""骨片を、骨のスキャンの中の「骨片の写し」に小さく合わせ直す（上限つき・良くなったときだけ）。
+
+		返り値 (M, 使ったか, 説明の dict)。骨片の外側の面（骨の表面から 3mm 以内の点）だけで合わせる。
+		"""
+		import numpy as np
+		st = {"used": False}
+		try:
+			import open3d as o3d
+		except Exception:
+			st["why"] = "open3d なし"
+			return M0, False, st
+		M0 = np.asarray(M0, dtype=float)
+		fp = np.asarray(fmesh.extract_surface().clean().points, dtype=float)
+		q0 = (M0[:3, :3] @ fp.T).T + M0[:3, 3]
+		d0 = np.abs(np.asarray(pv.PolyData(q0).compute_implicit_distance(base)["implicit_distance"]))
+		use = d0 < 3.0
+		if use.sum() < 100:
+			st["why"] = "骨の表面に近い点が少ない"
+			return M0, False, st
+		bn = base.compute_normals(point_normals=True, cell_normals=False, auto_orient_normals=False)
+		tgt = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(bn.points, dtype=float)))
+		tgt.normals = o3d.utility.Vector3dVector(np.asarray(bn.point_normals, dtype=float))
+		src = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(fp[use]))
+		M = M0.copy()
+		for thr in (3.0, 2.0, 1.5):
+			r = o3d.pipelines.registration.registration_icp(
+				src, tgt, thr, M, o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+				o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
+			M = np.asarray(r.transformation, dtype=float)
+		q1 = (M[:3, :3] @ fp[use].T).T + M[:3, 3]
+		d1 = np.abs(np.asarray(pv.PolyData(q1).compute_implicit_distance(base)["implicit_distance"]))
+		dM = np.linalg.inv(M0) @ M
+		deg = float(np.degrees(np.arccos(np.clip((np.trace(dM[:3, :3]) - 1) / 2, -1, 1))))
+		c = fp.mean(axis=0)
+		mm = float(np.linalg.norm((M[:3, :3] @ c + M[:3, 3]) - (M0[:3, :3] @ c + M0[:3, 3])))
+		med0, med1 = float(np.median(d0[use])), float(np.median(d1))
+		f0, f1 = float(np.mean(d0[use] < 1.0)), float(np.mean(d1 < 1.0))
+		ok = (med1 <= 0.8 * med0 and f1 > f0 and deg <= self._ANKLE_TRIM_REFINE_MAX_DEG
+		      and mm <= self._ANKLE_TRIM_REFINE_MAX_MM)
+		st.update({"used": bool(ok), "deg": deg, "mm": mm, "med0": med0, "med1": med1, "f0": f0, "f1": f1})
+		return (M if ok else M0), bool(ok), st
+
+	def _ankle_mesh_open_near(self, mesh, near_pts, w: float, zone_mm: float = 10.0,
+	                          min_frac: float = 0.02, everywhere: bool = False):
+		"""細い切れ端を消す（画像処理のオープニングと同じ考え）。near_pts から zone_mm 以内だけ。
+
+		縁（穴のふち）から面の上で w mm 以内の面をいったん削り、残りのうち小さなかけら（全体の min_frac 未満）
+		を捨ててから、残った本体を面の上で 1.5w まで元に戻す。幅 2w より細い帯や、細い首でつながった
+		切れ端が消え、太いところの形は元のまま。
+		"""
+		import numpy as np
+		import scipy.sparse as sp
+		from scipy.sparse.csgraph import dijkstra, connected_components
+		m = mesh.extract_surface().triangulate()
+		m.clear_data()
+		if m.n_cells == 0 or w <= 0:
+			return m
+		F = np.asarray(m.faces).reshape(-1, 4)[:, 1:]
+		P = np.asarray(m.points, dtype=float)
+		nC = len(F)
+		if everywhere:
+			zone = np.ones(nC, dtype=bool)
+		else:
+			from scipy.spatial import cKDTree
+			zone = cKDTree(np.asarray(near_pts, dtype=float)).query(P[F].mean(axis=1))[0] < zone_mm
+		if not zone.any():
+			return m
+		e = np.sort(np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+		ue, cnt = np.unique(e, axis=0, return_counts=True)
+		bpts = np.unique(ue[cnt == 1].ravel())
+		if bpts.size == 0:
+			return m
+		rows = np.concatenate([F[:, 0], F[:, 1], F[:, 2]])
+		cols = np.concatenate([F[:, 1], F[:, 2], F[:, 0]])
+		G = sp.csr_matrix((np.linalg.norm(P[rows] - P[cols], axis=1) + 1e-9, (rows, cols)), shape=(len(P), len(P)))
+		dist = dijkstra(G, directed=False, indices=bpts, min_only=True, limit=w * 1.01)
+		kept = ~(zone & np.any((dist < w)[F], axis=1))
+		kidx = np.where(kept)[0]
+		if kidx.size == 0:
+			return m.extract_cells(np.where(~zone)[0]).extract_surface()
+		A = sp.csr_matrix((np.ones(3 * len(kidx)), (np.repeat(np.arange(len(kidx)), 3), F[kidx].ravel())),
+		                  shape=(len(kidx), len(P)))
+		_, lab = connected_components(A @ A.T, directed=False)
+		sizes = np.bincount(lab)
+		core = np.zeros(nC, dtype=bool)
+		core[kidx[sizes[lab] >= max(30, min_frac * nC)]] = True
+		cpts = np.unique(F[core].ravel())
+		if cpts.size:
+			d2 = dijkstra(G, directed=False, indices=cpts, min_only=True, limit=w * 1.5)
+			back = np.all(d2[F] <= w * 1.5, axis=1)
+		else:
+			back = np.zeros(nC, dtype=bool)
+		final = core | back | ~zone
+		r = m.extract_cells(np.where(final)[0]).extract_surface()
+		r.clear_data()
+		return r
+
+	def _ankle_trim_cfg(self, b) -> dict:
+		"""骨の「骨片と重なる部分を削る」設定（無ければ使わない）。"""
+		c = (b or {}).get("trim_fragments") if isinstance(b, dict) else None
+		if not isinstance(c, dict):
+			c = {}
+		try:
+			margin = float(c.get("margin_mm", self._ANKLE_TRIM_DEFAULT_MARGIN))
+		except (TypeError, ValueError):
+			margin = self._ANKLE_TRIM_DEFAULT_MARGIN
+		try:
+			clean = float(c.get("clean_mm", self._ANKLE_TRIM_DEFAULT_CLEAN))
+		except (TypeError, ValueError):
+			clean = self._ANKLE_TRIM_DEFAULT_CLEAN
+		return {"enabled": bool(c.get("enabled", False)),
+		        "by": [str(x) for x in (c.get("by") or [])],
+		        "margin_mm": max(0.1, min(10.0, margin)),
+		        "cap": bool(c.get("cap", True)),
+		        "clean_mm": max(0.0, min(10.0, clean)),
+		        "refine": bool(c.get("refine", True))}
+
+	@staticmethod
+	def _ankle_mesh_outward_sign(m) -> float:
+		"""面の向きが外向きなら +1、内向きなら -1（いちばん外側の面の法線で多数決）。"""
+		import numpy as np
+		try:
+			mm = m.compute_normals(cell_normals=True, point_normals=False, auto_orient_normals=False,
+			                       consistent_normals=False, split_vertices=False)
+			n = np.asarray(mm.cell_data["Normals"])
+			c = np.asarray(mm.cell_centers().points)
+			votes = []
+			for ax in range(3):
+				for sg in (1.0, -1.0):
+					idx = np.argsort(sg * c[:, ax])[-30:]
+					votes.append(float(np.mean(np.sign(sg * n[idx, ax]))))
+			return 1.0 if float(np.mean(votes)) >= 0 else -1.0
+		except Exception:
+			return 1.0
+
+	@staticmethod
+	def _ankle_flip_cells(m, mask):
+		"""三角形の面のうち mask の面だけ、頂点の順番を入れ替えて表裏を反対にする。"""
+		import numpy as np
+		f = np.asarray(m.faces).reshape(-1, 4).copy()
+		mask = np.asarray(mask, dtype=bool)
+		f[mask, 2], f[mask, 3] = f[mask, 3].copy(), f[mask, 2].copy()
+		out = pv.PolyData(np.asarray(m.points), faces=f.ravel())
+		return out
+
+	def _ankle_trim_mesh_by_fragments(self, mesh, frags, margin_mm: float = 1.5, cap: bool = True,
+	                                  clean_mm: float = 0.0, refine: bool = False):
+		"""mesh（骨片つきでスキャンした骨）から、frags と重なる部分を削る。
+
+		frags: [(名前, 骨片のメッシュ, 骨片→この骨のモデル座標 の 4x4)]
+		clean_mm: 骨片の近くの細い切れ端を消す幅（0 = しない）
+		refine: 骨片の位置をスキャンの中の「骨片の写し」に小さく合わせ直し、その位置でも削る
+		返り値: (削ったメッシュ, 説明の dict)
+		"""
+		import numpy as np
+		margin = float(margin_mm)
+		base = mesh.extract_surface().triangulate().clean()
+		base.clear_data()
+		P = np.asarray(base.points)
+		remove = np.zeros(base.n_points, dtype=bool)
+		placed = []
+		info = {"removed_points": 0, "points": int(base.n_points), "cap_cells": 0, "per": {}, "refine": {},
+		        "cleaned_cells": 0}
+		near_pts = []
+
+		def _overlap(fw):
+			closed_ = fw.fill_holes(1e6).clean()
+			ud = np.abs(np.asarray(pv.PolyData(P).compute_implicit_distance(fw)["implicit_distance"]))
+			bb = np.array(closed_.bounds).reshape(3, 2)
+			near = np.all((P >= bb[:, 0] - 1.0) & (P <= bb[:, 1] + 1.0), axis=1)
+			ins = np.zeros(base.n_points, dtype=bool)
+			if np.any(near):
+				enc = pv.PolyData(P[near]).select_enclosed_points(closed_, tolerance=1e-6, check_surface=False)
+				ins[np.where(near)[0]] = np.asarray(enc["SelectedPoints"]).astype(bool)
+			return ins | (ud < margin), closed_
+
+		for (fname, fmesh, M) in frags:
+			fclean = fmesh.extract_surface().triangulate().clean()
+			fclean.clear_data()
+			fw = fclean.transform(np.asarray(M, dtype=float), inplace=False)
+			r, closed = _overlap(fw)
+			near_pts.append(np.asarray(fw.points))
+			if refine:
+				try:
+					M2, used, st = self._ankle_trim_refine_pose(base, fclean, M)
+					info["refine"][fname] = st
+					if used:
+						fw2 = fclean.transform(np.asarray(M2, dtype=float), inplace=False)
+						r2, _c2 = _overlap(fw2)
+						r = r | r2
+						near_pts.append(np.asarray(fw2.points))
+				except Exception as e:
+					print(f"[骨片で削る] {fname} の位置の微調整に失敗（マーカーの位置だけで削ります）: {e}")
+			remove |= r
+			placed.append((fname, fw, closed))
+			info["per"][fname] = int(r.sum())
+		near_all = np.vstack(near_pts) if near_pts else np.zeros((0, 3))
+		cells = np.asarray(base.faces).reshape(-1, 4)[:, 1:]
+		keep = ~np.any(remove[cells], axis=1)
+		trimmed = base.extract_cells(np.where(keep)[0]).extract_surface().clean()
+		# 削ったあとに取り残された小さなかけらを落とす（全体の 1% 未満のかたまり）
+		try:
+			conn = trimmed.connectivity(extraction_mode="all")
+			rid = np.asarray(conn.cell_data["RegionId"])
+			cnt = np.bincount(rid)
+			big = np.where(cnt >= max(20, 0.01 * len(rid)))[0]
+			trimmed = conn.extract_cells(np.where(np.isin(rid, big))[0]).extract_surface().clean()
+		except Exception as e:
+			print(f"[骨片で削る] 小さなかけらの除去を省略: {e}")
+		trimmed.clear_data()
+		info["kept"] = trimmed          # 削ったあとに残った骨の面（関節面モデルを同じように削るのに使う）
+		# 骨片の近くの細い切れ端（取り残しのリボン）を消す
+		if clean_mm and clean_mm > 0 and len(near_all):
+			try:
+				n_before = trimmed.n_cells
+				trimmed = self._ankle_mesh_open_near(trimmed, near_all, float(clean_mm))
+				info["cleaned_cells"] = int(n_before - trimmed.n_cells)
+			except Exception as e:
+				print(f"[骨片で削る] 細い切れ端の除去を省略: {e}")
+		info["kept"] = trimmed
+		info["removed_points"] = int(remove.sum())
+		parts = [trimmed]
+		if cap and placed:
+			# 骨片の面のうち、もとの骨の中にあって骨の表面から離れている面 = 割れ面
+			base_closed = base.fill_holes(1e6).clean()
+			s_bone = self._ankle_mesh_outward_sign(base)
+			for (fname, fw, closed) in placed:
+				try:
+					fn_ = fw.compute_normals(cell_normals=True, point_normals=False, auto_orient_normals=False,
+					                         consistent_normals=False, split_vertices=False)
+					cc = np.asarray(fn_.cell_centers().points)
+					nrm = np.asarray(fn_.cell_data["Normals"])
+					udc = np.abs(np.asarray(pv.PolyData(cc).compute_implicit_distance(base)["implicit_distance"]))
+					inb = np.asarray(pv.PolyData(cc).select_enclosed_points(
+						base_closed, tolerance=1e-6, check_surface=False)["SelectedPoints"]).astype(bool)
+					sel = np.where(inb & (udc > margin))[0]
+					if sel.size == 0:
+						continue
+					cp = fw.extract_cells(sel).extract_surface().triangulate()
+					cp.clear_data()
+					# つながった面ごとに、まず面の向きをそろえ（骨片（内側）のスキャンは表裏がばらばら）、
+					# かたまりごとに多数決で表裏を決める。骨の割れ面としての外向き = 骨片の中へ向かう向き。
+					# 1枚ずつ決めると、縁の薄いところで判定がぶれる（実測 77% しか そろわなかった）。
+					cc2 = cp.connectivity(extraction_mode="all")
+					rid = np.asarray(cc2.cell_data["RegionId"])
+					cnt = np.bincount(rid)
+					for r_ in np.where(cnt >= max(10, 0.02 * len(rid)))[0]:   # 小さなかけらは落とす
+						reg = cc2.extract_cells(np.where(rid == r_)[0]).extract_surface().triangulate()
+						reg.clear_data()
+						reg = reg.compute_normals(cell_normals=True, point_normals=False, consistent_normals=True,
+						                          auto_orient_normals=False, split_vertices=False)
+						c2 = np.asarray(reg.cell_centers().points)
+						n2 = np.asarray(reg.cell_data["Normals"])
+						probe = pv.PolyData(c2 + 0.5 * n2).select_enclosed_points(
+							closed, tolerance=1e-6, check_surface=False)
+						into = float(np.mean(np.asarray(probe["SelectedPoints"]).astype(bool)))
+						reg.clear_data()
+						# 骨の面の向きのそろえ方（外向き/内向き）に合わせる
+						if (into < 0.5) == (s_bone > 0):
+							reg = self._ankle_flip_cells(reg, np.ones(reg.n_cells, dtype=bool))
+						# ふたの縁の細い切れ端も消す（向きは変わらない）
+						if clean_mm and clean_mm > 0:
+							try:
+								reg = self._ankle_mesh_open_near(reg, None, float(clean_mm), min_frac=0.1,
+								                                 everywhere=True)
+							except Exception as e:
+								print(f"[骨片で削る] ふたの切れ端の除去を省略: {e}")
+						if reg.n_cells == 0:
+							continue
+						parts.append(reg)
+						info["cap_cells"] += int(reg.n_cells)
+				except Exception as e:
+					print(f"[骨片で削る] {fname} の割れ面のふたに失敗: {e}")
+		out = parts[0] if len(parts) == 1 else parts[0].merge(parts[1:])
+		out = out.extract_surface().triangulate()
+		out.clear_data()
+		return out, info
+
+	def _ankle_fragment_trim_for_bone(self, bi, animatable, cache):
+		"""骨 bi を、設定どおり骨片で削る。返り値 (メッシュ or None, 説明, 使った骨片 [(名前, メッシュ, M)])。"""
+		import numpy as np
+		b = self.ankle_bones[bi] if 0 <= bi < len(self.ankle_bones) else None
+		cfg = self._ankle_trim_cfg(b)
+		name = str((b or {}).get("name", f"骨{bi + 1}"))
+		if not cfg["enabled"]:
+			return None, "", []
+		by_idx = {idx: (m, Ts) for (idx, m, Ts) in animatable}
+		if bi not in by_idx:
+			return None, f"{name}: 可視化に出ないので削りません", []
+		mesh_b, Ts_b = by_idx[bi]
+		bones_cache = (cache or {}).get("bones", {}) or {}
+
+		def _det(i):
+			try:
+				return np.asarray(bones_cache[int(self.ankle_bones[i].get("aruco_id", -1))]["detected"], dtype=bool)
+			except Exception:
+				return None
+		det_b = _det(bi)
+		frags, used, skipped = [], [], []
+		for fname in cfg["by"]:
+			fi = next((i for i, x in enumerate(self.ankle_bones) if str(x.get("name", "")) == fname and i != bi), None)
+			if fi is None or fi not in by_idx:
+				skipped.append(f"{fname}（この録画に写っていない）")
+				continue
+			det_f = _det(fi)
+			both = np.where(det_b & det_f)[0] if (det_b is not None and det_f is not None
+			                                      and len(det_b) == len(det_f)) else np.array([], dtype=int)
+			if both.size == 0:
+				if det_f is not None and not det_f.any():
+					skipped.append(f"{fname}（この録画にはマーカーが写っていない。intact など骨を割る前の試験では正常です）")
+				else:
+					skipped.append(f"{fname}（{name}と同時に写っているコマがない）")
+				continue
+			f0 = int(both[0])
+			m_f, Ts_f = by_idx[fi]
+			M = np.linalg.inv(np.asarray(Ts_b[f0], dtype=float)) @ np.asarray(Ts_f[f0], dtype=float)
+			frags.append((fname, m_f, M))
+			used.append(f"{fname}（コマ {f0}）")
+		if not frags:
+			note = f"{name}: 削る骨片がありません" + (f"（{'、'.join(skipped)}）" if skipped else "")
+			return None, note, []
+		# 同じ条件なら計算を省く（この起動中だけ覚える）
+		import hashlib
+		h = hashlib.md5()
+		h.update(f"{cfg['margin_mm']:.3f}|{int(cfg['cap'])}|{cfg['clean_mm']:.3f}|{int(cfg['refine'])}|v2|".encode())
+		for m in [mesh_b] + [f[1] for f in frags]:
+			h.update(np.ascontiguousarray(np.asarray(m.points, dtype=np.float64)).tobytes())
+		for f in frags:
+			h.update(np.round(np.asarray(f[2], dtype=float), 4).tobytes())
+		key = h.hexdigest()
+		memo = getattr(self, "_ankle_trim_memo", None)
+		if memo is None:
+			memo = self._ankle_trim_memo = {}
+		if key in memo:
+			out, info = memo[key]
+		else:
+			t0 = time.time()
+			out, info = self._ankle_trim_mesh_by_fragments(mesh_b, frags, cfg["margin_mm"], cfg["cap"],
+			                                               clean_mm=cfg["clean_mm"], refine=cfg["refine"])
+			info["sec"] = time.time() - t0
+			if len(memo) > 8:
+				memo.clear()
+			memo[key] = (out, info)
+		if info["removed_points"] == 0 and info["cap_cells"] == 0:
+			return None, f"{name}: {'・'.join(used)} と重なるところがないので、削っていません", []
+		ref = [f"{k}（{v['deg']:.1f}°・{v['mm']:.1f}mm）" for k, v in (info.get("refine") or {}).items() if v.get("used")]
+		note = (f"{name}: {'・'.join(used)} と重なる {info['removed_points']:,} 点を削りました"
+		        + (f"（位置を微調整して削った骨片: {'、'.join(ref)}）" if ref else "")
+		        + (f"、細い切れ端 {info['cleaned_cells']:,} 面を消しました" if info.get("cleaned_cells") else "")
+		        + (f"、割れ面でふた {info['cap_cells']:,} 面" if cfg["cap"] else "")
+		        + f"（余裕 {cfg['margin_mm']:g} mm）"
+		        + (f"。使わなかった骨片: {'、'.join(skipped)}" if skipped else ""))
+		if not isinstance(getattr(self, "_ankle_trim_kept", None), dict):
+			self._ankle_trim_kept = {}
+		self._ankle_trim_kept[bi] = info.get("kept")
+		return out.copy(), note, frags
+
+	def _ankle_apply_fragment_trim(self, animatable, cache):
+		"""設定のある骨を骨片で削ったメッシュに差し替える。返り値 (animatable, 説明のリスト)。"""
+		notes, out = [], []
+		self._ankle_trim_kept = {}
+		for (idx, mesh_L, Ts) in animatable:
+			try:
+				m, note, _fr = self._ankle_fragment_trim_for_bone(idx, animatable, cache)
+			except Exception as e:
+				m, note = None, f"{self.ankle_bones[idx].get('name', '')}: 骨片で削るのに失敗 ({e})"
+				traceback.print_exc()
+			if note:
+				notes.append(note)
+				print(f"[骨片で削る] {note}")
+			out.append((idx, m if m is not None else mesh_L, Ts))
+		return out, notes
+
+	def _ankle_trim_set(self, **kw) -> None:
+		"""③の「骨片と重なる部分を削る」の設定を、選んでいる骨に書く。"""
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		c = self._ankle_trim_cfg(b)
+		c.update(kw)
+		b["trim_fragments"] = c
+		self._ankle_refresh_trim_ui()
+		self._schedule_state_autosave("ankle")
+
+	def _ankle_trim_toggle(self) -> None:
+		w = self._ankle_bone_editor_widgets
+		on = bool(w["trim_on_var"].get())
+		b = self._ankle_current_bone()
+		if b is None:
+			w["trim_on_var"].set(False)
+			return
+		c = self._ankle_trim_cfg(b)
+		if on and not c["by"]:
+			# 名前に「骨片」が入っている骨を、はじめの候補にする
+			c["by"] = [str(x.get("name", "")) for x in self.ankle_bones
+			           if x is not b and "骨片" in str(x.get("name", ""))]
+		self._ankle_trim_set(enabled=on, by=c["by"])
+		if on and not c["by"]:
+			self._ankle_trim_choose()
+
+	def _ankle_trim_choose(self) -> None:
+		"""削るのに使う骨片を選ぶ。"""
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		c = self._ankle_trim_cfg(b)
+		others = [str(x.get("name", "")) for x in self.ankle_bones if x is not b]
+		if not others:
+			messagebox.showinfo("骨片を選ぶ", "ほかの骨がありません。先に③で骨片を登録してください。", parent=self)
+			return
+		win = tk.Toplevel(self)
+		win.title(f"{b.get('name', '')} を削る骨片を選ぶ")
+		win.transient(self)
+		ttk.Label(win, text=f"「{b.get('name', '')}」のスキャンに一緒に写っている（付いたままだった）骨片を選んでください。",
+		          wraplength=420, justify="left").pack(anchor="w", padx=12, pady=(10, 6))
+		vs = {}
+		for nm in others:
+			v = tk.BooleanVar(win, value=(nm in c["by"]))
+			ttk.Checkbutton(win, text=nm, variable=v).pack(anchor="w", padx=24)
+			vs[nm] = v
+
+		def ok():
+			self._ankle_trim_set(by=[nm for nm, v in vs.items() if v.get()])
+			win.destroy()
+		bf = ttk.Frame(win)
+		bf.pack(fill="x", padx=12, pady=10)
+		ttk.Button(bf, text="OK", command=ok).pack(side="right")
+		ttk.Button(bf, text="やめる", command=win.destroy).pack(side="right", padx=6)
+		win.bind("<Escape>", lambda e: win.destroy())
+		try:
+			win.grab_set()
+			win.lift()
+			win.focus_force()
+		except Exception:
+			pass
+
+	def _ankle_refresh_trim_ui(self) -> None:
+		w = getattr(self, "_ankle_bone_editor_widgets", None) or {}
+		if "trim_on_var" not in w:
+			return
+		b = self._ankle_current_bone()
+		c = self._ankle_trim_cfg(b)
+		w["_trim_loading"] = True
+		try:
+			w["trim_on_var"].set(c["enabled"])
+			w["trim_margin_var"].set(c["margin_mm"])
+			w["trim_cap_var"].set(c["cap"])
+			if "trim_refine_var" in w:
+				w["trim_refine_var"].set(c["refine"])
+				w["trim_clean_var"].set(c["clean_mm"])
+			w["trim_by_lbl"].configure(text=("骨片: " + ("、".join(c["by"]) if c["by"] else "（未選択）")))
+		finally:
+			w["_trim_loading"] = False
+
+	def _ankle_trim_preview(self) -> None:
+		"""いまのタブの録画の最初のコマで削った結果を、削る前と並べて見せる。"""
+		import numpy as np
+		b = self._ankle_current_bone()
+		if b is None:
+			return
+		bi = self._ankle_selected_bone
+		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		if not cache:
+			messagebox.showinfo("骨片で削る", "このタブには④の結果（姿勢時系列）がありません。\n"
+			                    "骨片が写っている試験のタブで押してください。", parent=self)
+			return
+		c = self._ankle_trim_cfg(b)
+		if not c["by"]:
+			messagebox.showinfo("骨片で削る", "先に「骨片を選ぶ…」で、削るのに使う骨片を選んでください。", parent=self)
+			return
+		animatable, N, warns = self._ankle_build_bone_transforms(cache)
+		saved = b.get("trim_fragments")
+		b["trim_fragments"] = dict(c, enabled=True)      # 「使う」が外れていても試せるように
+		try:
+			out, note, frags = self._ankle_fragment_trim_for_bone(bi, animatable, cache)
+		finally:
+			if saved is None:
+				b.pop("trim_fragments", None)
+			else:
+				b["trim_fragments"] = saved
+		if out is None:
+			messagebox.showinfo("骨片で削る", note or "削れませんでした。", parent=self)
+			return
+		mesh_b = next(m for (i, m, Ts) in animatable if i == bi)
+		_ff = {}
+		for _f in (os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "meiryo.ttc"),
+		           os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "BIZ-UDGothicR.ttc")):
+			if os.path.exists(_f):
+				_ff = {"font_file": _f}
+				break
+		color = self._ankle_color_of(bi)
+		fcol = {}
+		for (fname, fm, M) in frags:
+			fi = next((i for i, x in enumerate(self.ankle_bones) if str(x.get("name", "")) == fname), 0)
+			fcol[fname] = self._ankle_color_of(fi)
+		fr_w = [(fname, fm.transform(np.asarray(M, dtype=float), inplace=False)) for (fname, fm, M) in frags]
+		pts = np.vstack([np.asarray(f.points) for _, f in fr_w])
+		bb = pv.PolyData(pts).bounds
+		ctr = pts.mean(axis=0)
+		p = pv.Plotter(shape=(1, 3), window_size=(1500, 650), title="骨片で削った結果の確認")
+		heads = ["削る前（骨片つきのスキャン + 骨片）", "削った後 + 骨片", "削った後（骨片を隠す）"]
+		for j in range(3):
+			p.subplot(0, j)
+			p.set_background("white")
+			p.add_text(heads[j], font_size=11, color="black", **_ff)
+			p.add_mesh(mesh_b if j == 0 else out, color=color, smooth_shading=True)
+			if j < 2:
+				for fname, f in fr_w:
+					p.add_mesh(f, color=fcol.get(fname, "#FF6699"), smooth_shading=True)
+		p.link_views()
+		p.subplot(0, 0)
+		p.camera.focal_point = tuple(ctr)
+		p.camera.position = tuple(ctr + np.array([0.0, -250.0, 80.0]))
+		p.camera.up = (0, 0, 1)
+		p.reset_camera(bounds=bb)
+		p.camera.zoom(0.8)
+		p.subplot(0, 1)
+		p.add_text(note, position="lower_left", font_size=8, color="#333333", **_ff)
+		print(f"[骨片で削る] 確認: {note}")
+		p.show()
+
 	def _ankle_build_bone_transforms(self, cache: dict):
 		"""キャッシュ+骨リストから、各骨の T_W←bone(t) 時系列を構築する。
 
@@ -12482,6 +14893,8 @@ class MainMenuGUI(_BaseWindow):
 				except Exception as e:
 					warnings.append(f"{name}: モデル読込失敗 ({e}) → スキップ")
 					continue
+				# スキャンの縮尺を直す（マーカーを中心に 1/k 倍。2026-10-14）
+				mesh_L = self._ankle_apply_scan_scale_mesh(bone, mesh_L)
 				T_L_Mk = np.asarray(bone["marker_to_bone_T"], dtype=float)
 				try:
 					T_Mk_L = np.linalg.inv(T_L_Mk)
@@ -12692,6 +15105,17 @@ class MainMenuGUI(_BaseWindow):
 			frame_times = [t / 30.0 for t in range(N)]
 		hm = scene.get("heatmap", {}) or {}
 		heatmap_enabled = bool(hm.get("enabled"))
+		# ヒートマップを見せるか（scene["heatmap"]["show"]。外しても距離は持ったまま。2026-10-13）
+		hm_show = [bool(hm.get("show", True)) and heatmap_enabled]
+		# 関節面だけの表示（scene["joint_view"] があるときだけ。ankle。2026-10-14）
+		jv = scene.get("joint_view")
+		jv_on = [bool((jv or {}).get("show", False))]
+		# 表示変更用モデル（scene["alt_model"] があるときだけ。ankle。2026-10-15・臨時）
+		av = scene.get("alt_model")
+		av_on = [bool((av or {}).get("show", False))]
+		# 右上の数字の表示（scene["overlay_cfg"] があるときだけ切り替えられる。2026-10-15）
+		ovc = scene.get("overlay_cfg")
+		ov_on = [bool((ovc or {}).get("show", True))]
 		clim_lo, clim_hi = hm.get("clim", (-10.0, 0.0))
 		features = scene.get("features") or {
 			"csv": bool(scene.get("on_csv_export")), "export_model": True, "screenshot": True}
@@ -12719,8 +15143,11 @@ class MainMenuGUI(_BaseWindow):
 
 		# --- 2. 骨アクター ---
 		hm_cmap = self._sim_view_heatmap_cmap(clim_lo, clim_hi)
+		sb_pos = dict(scene.get("scalar_bar_pos") or {})     # 色の帯の位置（無ければ pyvista の既定）
 		hm_range = [float(clim_lo), float(clim_hi)]
 		actors = []            # index を bones と揃える
+		actors_j = []          # 関節面のアクター（無い骨は None）。index を bones と揃える
+		actors_a = []          # 表示変更用モデルのアクター（無い骨は None）。index を bones と揃える
 		first_T_inv = []
 		bar_shown = [False]
 		for bi, b in enumerate(bones):
@@ -12733,12 +15160,13 @@ class MainMenuGUI(_BaseWindow):
 				if d0 is None or len(d0) != m0.n_points:
 					d0 = np.full(m0.n_points, np.inf, dtype=np.float32)
 				m0['distance'] = np.asarray(d0, dtype=np.float32)
-				sb = ({'title': hm.get("title", "distance [mm]"), 'color': 'black'}
+				sb = ({'title': hm.get("title", "distance [mm]"), 'color': 'black', **sb_pos}
 				      if not bar_shown[0] else None)
 				actor = anim_plotter.add_mesh(
 					m0, scalars='distance', cmap=hm_cmap, clim=[clim_lo, clim_hi],
 					opacity=float(b.get("opacity", 1.0)), smooth_shading=True,
-					show_edges=False, name=f'bone_{bi}', scalar_bar_args=sb)
+					show_edges=False, name=f'bone_{bi}', scalar_bar_args=sb,
+					show_scalar_bar=(sb is not None))   # 色の帯は1本だけ（2本目以降の骨にも付いていた）
 				bar_shown[0] = True
 				# 離間(範囲上) は骨本来の色 / めり込み(範囲下) は濃赤
 				try:
@@ -12748,6 +15176,8 @@ class MainMenuGUI(_BaseWindow):
 					lut.SetAboveRangeColor(r, g, bl, 1.0)
 					lut.SetUseBelowRangeColor(True)
 					lut.SetBelowRangeColor(0.5, 0.0, 0.0, 1.0)
+					# ヒートマップを外したときに出る色（骨の色）
+					actor.GetProperty().SetColor(r, g, bl)
 				except Exception:
 					pass
 				try:
@@ -12762,6 +15192,74 @@ class MainMenuGUI(_BaseWindow):
 					smooth_shading=True, show_edges=False,
 					name=f'bone_{bi}', label=b.get("name", f"bone{bi}"))
 			actors.append(actor)
+			# 関節面（骨の切り抜き。骨と同じ動きで描く。ヒートマップは骨全体の値を写す）
+			aj = None
+			jm = b.get("joint_mesh")
+			if jm is not None:
+				try:
+					mj0 = self._sim_apply_T_to_mesh(jm, poses[0])
+					jidx = b.get("joint_idx")
+					if has_sc and jidx is not None:
+						mj0['distance'] = np.asarray(m0['distance'], dtype=np.float32)[np.asarray(jidx)]
+						aj = anim_plotter.add_mesh(
+							mj0, scalars='distance', cmap=hm_cmap, clim=[clim_lo, clim_hi],
+							opacity=float(b.get("opacity", 1.0)), smooth_shading=True, show_edges=False,
+							name=f'bone_{bi}_joint', show_scalar_bar=False)
+						try:
+							r, g, bl = self._sim_hex_to_rgb01(color)
+							lutj = aj.GetMapper().GetLookupTable()
+							lutj.SetUseAboveRangeColor(True)
+							lutj.SetAboveRangeColor(r, g, bl, 1.0)
+							lutj.SetUseBelowRangeColor(True)
+							lutj.SetBelowRangeColor(0.5, 0.0, 0.0, 1.0)
+							aj.GetProperty().SetColor(r, g, bl)
+						except Exception:
+							pass
+					else:
+						aj = anim_plotter.add_mesh(
+							mj0, color=color, opacity=float(b.get("opacity", 1.0)),
+							smooth_shading=True, show_edges=False, name=f'bone_{bi}_joint')
+					aj.VisibilityOff()
+				except Exception as e:
+					print(f"[sim engine] 関節面の表示の準備に失敗 ({b.get('name', '')}): {e}")
+					aj = None
+			actors_j.append(aj)
+			# 表示変更用モデル（骨と同じ動き。ヒートマップは計算に使ったモデルのいちばん近い点の値を写す）
+			aa = None
+			am = b.get("alt_mesh")
+			if am is not None:
+				try:
+					ma0 = self._sim_apply_T_to_mesh(am, poses[0])
+					aidx = b.get("alt_idx")
+					if has_sc and aidx is not None:
+						da = np.asarray(m0['distance'], dtype=np.float32)[np.asarray(aidx)]
+						far = b.get("alt_far")
+						if far is not None:
+							da[np.asarray(far, dtype=bool)] = 1e6          # 範囲より上 = 骨の色
+						ma0['distance'] = da
+						aa = anim_plotter.add_mesh(
+							ma0, scalars='distance', cmap=hm_cmap, clim=[clim_lo, clim_hi],
+							opacity=float(b.get("opacity", 1.0)), smooth_shading=True, show_edges=False,
+							name=f'bone_{bi}_alt', show_scalar_bar=False)
+						try:
+							r, g, bl = self._sim_hex_to_rgb01(color)
+							luta = aa.GetMapper().GetLookupTable()
+							luta.SetUseAboveRangeColor(True)
+							luta.SetAboveRangeColor(r, g, bl, 1.0)
+							luta.SetUseBelowRangeColor(True)
+							luta.SetBelowRangeColor(0.5, 0.0, 0.0, 1.0)
+							aa.GetProperty().SetColor(r, g, bl)
+						except Exception:
+							pass
+					else:
+						aa = anim_plotter.add_mesh(
+							ma0, color=color, opacity=float(b.get("opacity", 1.0)),
+							smooth_shading=True, show_edges=False, name=f'bone_{bi}_alt')
+					aa.VisibilityOff()
+				except Exception as e:
+					print(f"[sim engine] 表示変更用モデルの表示の準備に失敗 ({b.get('name', '')}): {e}")
+					aa = None
+			actors_a.append(aa)
 			try:
 				first_T_inv.append(np.linalg.inv(poses[0]))
 			except np.linalg.LinAlgError:
@@ -12815,9 +15313,13 @@ class MainMenuGUI(_BaseWindow):
 					poses = b["poses"]
 					dT = np.asarray(poses[fi], dtype=float) @ first_T_inv[bi]
 					_apply_matrix(actors[bi], dT)
+					if actors_j[bi] is not None:
+						_apply_matrix(actors_j[bi], dT)
+					if actors_a[bi] is not None:
+						_apply_matrix(actors_a[bi], dT)
 				# ヒートマップ scalars 更新
 				max_pent = 0.0
-				if heatmap_enabled:
+				if heatmap_enabled and hm_show[0]:      # 外している間は塗り替えない（軽くなる）
 					for bi, b in enumerate(bones):
 						sc = b.get("scalars")
 						if sc is None or fi >= len(sc):
@@ -12834,6 +15336,30 @@ class MainMenuGUI(_BaseWindow):
 								arr.Modified()
 						except Exception:
 							pass
+						# 関節面だけの表示中は、関節面にも同じ距離を写す
+						if jv_on[0] and actors_j[bi] is not None and b.get("joint_idx") is not None:
+							try:
+								from vtk.util.numpy_support import vtk_to_numpy
+								arrj = actors_j[bi].GetMapper().GetInput().GetPointData().GetScalars()
+								if arrj is not None:
+									vtk_to_numpy(arrj)[:] = np.asarray(d, dtype=np.float32)[np.asarray(b["joint_idx"])]
+									arrj.Modified()
+							except Exception:
+								pass
+						# 表示変更用モデルの表示中は、それにも写す（元の表面から離れた所は骨の色のまま）
+						if (av_on[0] and not jv_on[0] and actors_a[bi] is not None
+								and b.get("alt_idx") is not None):
+							try:
+								from vtk.util.numpy_support import vtk_to_numpy
+								arra = actors_a[bi].GetMapper().GetInput().GetPointData().GetScalars()
+								if arra is not None:
+									va = np.asarray(d, dtype=np.float32)[np.asarray(b["alt_idx"])]
+									if b.get("alt_far") is not None:
+										va[np.asarray(b["alt_far"], dtype=bool)] = 1e6
+									vtk_to_numpy(arra)[:] = va
+									arra.Modified()
+							except Exception:
+								pass
 						try:
 							dmin = float(np.nanmin(d))
 							if dmin < 0 and abs(dmin) > max_pent:
@@ -12845,7 +15371,7 @@ class MainMenuGUI(_BaseWindow):
 					ctrl_widgets['frame_label'].config(
 						text=f"Frame: {fi}/{max(N-1,0)} | Time: {frame_times[fi]:.3f}s")
 					ctrl_widgets['max_pent_label'].config(
-						text=(f"Max Pent: {max_pent:.2f} mm" if heatmap_enabled
+						text=(f"Max Pent: {max_pent:.2f} mm" if (heatmap_enabled and hm_show[0])
 						      else "Max Pent: -- mm"))
 				except Exception:
 					pass
@@ -12864,7 +15390,7 @@ class MainMenuGUI(_BaseWindow):
 				# 右上テキスト
 				try:
 					fn = scene.get("overlay_text")
-					if callable(fn):
+					if callable(fn) and ov_on[0]:
 						txt = fn(fi)
 						if txt:
 							if overlay_actor[0] is None:
@@ -13003,16 +15529,24 @@ class MainMenuGUI(_BaseWindow):
 						lut.below_range_color = (0.5, 0.0, 0.0, 1.0)
 						actors[bi].mapper.lookup_table = lut
 						actors[bi].mapper.scalar_range = (lo, hi)
+						aj = actors_j[bi] if bi < len(actors_j) else None
+						if aj is not None:
+							aj.mapper.lookup_table = lut
+							aj.mapper.scalar_range = (lo, hi)
+						aa = actors_a[bi] if bi < len(actors_a) else None
+						if aa is not None:
+							aa.mapper.lookup_table = lut
+							aa.mapper.scalar_range = (lo, hi)
 						if first is None:
 							first = actors[bi]
 					except Exception as e:
 						print(f"[sim engine] ヒートマップの範囲の変更に失敗: {e}")
 				hm_range[0], hm_range[1] = lo, hi
 				try:
-					if first is not None:
+					if first is not None and hm_show[0]:     # 外している間は色の帯を出さない
 						anim_plotter.remove_scalar_bar()
 						anim_plotter.add_scalar_bar(title=hm.get("title", "distance [mm]"), mapper=first.mapper,
-						                            color='black')
+						                            color='black', **sb_pos)
 				except Exception as e:
 					print(f"[sim engine] 色の帯の更新に失敗: {e}")
 				try:
@@ -13069,6 +15603,23 @@ class MainMenuGUI(_BaseWindow):
 									lut.Modified()
 							except Exception:
 								pass
+					# 関節面・表示変更用モデルにも同じ色・不透明度
+					for aj in ((actors_j[bi] if bi < len(actors_j) else None),
+					           (actors_a[bi] if bi < len(actors_a) else None)):
+						if aj is None:
+							continue
+						pj = aj.GetProperty()
+						if opacity is not None:
+							pj.SetOpacity(max(0.0, min(1.0, float(opacity))))
+						if color is not None:
+							pj.SetColor(r, g, bl)
+							try:
+								lj = aj.GetMapper().GetLookupTable()
+								if lj is not None:
+									lj.SetAboveRangeColor(r, g, bl, 1.0)
+									lj.Modified()
+							except Exception:
+								pass
 				except Exception as e:
 					print(f"[sim engine] 骨の表示変更に失敗: {e}")
 					return
@@ -13090,6 +15641,291 @@ class MainMenuGUI(_BaseWindow):
 				"apply": _bs_apply,
 			}
 
+		# --- 5c. ヒートマップの表示・非表示 (scene["heatmap"] に "show" があるときだけ。ankle) ---
+		# 距離は計算済みのまま、色の付け外しだけをする（計算し直しは不要）。2026-10-13
+		def _hm_apply_visible(on):
+			"""骨の塗り方（距離の色 / 骨の色）と色の帯を切り替える。描き直しは呼び出し側。"""
+			first = None
+			for bi, b in enumerate(bones):
+				if b.get("scalars") is None or bi >= len(actors) or actors[bi] is None:
+					continue
+				try:
+					mp = actors[bi].GetMapper()
+					if on:
+						mp.ScalarVisibilityOn()
+					else:
+						mp.ScalarVisibilityOff()
+					r, g, bl = self._sim_hex_to_rgb01(b.get("color", "#DEB887"))
+					actors[bi].GetProperty().SetColor(r, g, bl)
+					for aj in ((actors_j[bi] if bi < len(actors_j) else None),
+					           (actors_a[bi] if bi < len(actors_a) else None)):
+						if aj is None:
+							continue
+						mpj = aj.GetMapper()
+						if on:
+							mpj.ScalarVisibilityOn()
+						else:
+							mpj.ScalarVisibilityOff()
+						aj.GetProperty().SetColor(r, g, bl)
+					if first is None:
+						first = actors[bi]
+				except Exception as e:
+					print(f"[sim engine] ヒートマップの切り替えに失敗: {e}")
+			try:
+				anim_plotter.remove_scalar_bar()
+			except Exception:
+				pass
+			if on and first is not None:
+				try:
+					anim_plotter.add_scalar_bar(title=hm.get("title", "distance [mm]"), mapper=first.mapper,
+					                            color='black', **sb_pos)
+				except Exception as e:
+					print(f"[sim engine] 色の帯の表示に失敗: {e}")
+
+		hm_toggle_cb = None
+		if "show" in hm:
+			def _hm_set_visible(on, propagate=True):
+				on = bool(on) and heatmap_enabled
+				try:
+					var = ctrl_widgets.get('hm_show_var')
+					if var is not None and bool(var.get()) != on:
+						var.set(on)
+				except Exception:
+					pass
+				if on == hm_show[0]:
+					return
+				hm_show[0] = on
+				_hm_apply_visible(on)
+				show_frame(current_frame[0], force_render=True)   # 戻したときは いまのコマの色を塗る
+				fn = hm.get("on_show_change")
+				if callable(fn):
+					try:
+						fn(on)
+					except Exception as e:
+						print(f"[sim engine] ヒートマップ表示の保存に失敗: {e}")
+				if propagate:
+					self._sim_hm_propagate(viewer_ref[0], on)
+
+			hm_toggle_cb = {"available": heatmap_enabled, "get": lambda: bool(hm_show[0]),
+			                "set": _hm_set_visible}
+		if heatmap_enabled and not hm_show[0]:
+			_hm_apply_visible(False)     # 前回外していたら、外した状態で開く
+
+		# --- 5d. 関節面だけの表示 (scene に "joint_view" があるときだけ。ankle) ---
+		# 関節面モデルのある骨は関節面に、無い骨は隠す。動き・ヒートマップ・色は骨と同じ。
+		def _vis_apply():
+			"""どのモデルを見せるか: 関節面だけ ＞ 表示変更用モデル ＞ 計算に使ったモデル。"""
+			for bi in range(len(actors)):
+				a = actors[bi]
+				aj = actors_j[bi] if bi < len(actors_j) else None
+				aa = actors_a[bi] if bi < len(actors_a) else None
+				use_alt = bool(av_on[0]) and aa is not None and not jv_on[0]
+				try:
+					if a is not None:
+						a.SetVisibility(0 if (jv_on[0] or use_alt) else 1)
+					if aj is not None:
+						aj.SetVisibility(1 if jv_on[0] else 0)
+					if aa is not None:
+						aa.SetVisibility(1 if use_alt else 0)
+				except Exception:
+					pass
+
+		def _jv_apply(on):
+			_vis_apply()
+
+		jv_cb = None
+		if jv is not None:
+			jv_avail = any(a is not None for a in actors_j)
+
+			def _jv_set(on, propagate=True):
+				on = bool(on) and jv_avail
+				try:
+					var = ctrl_widgets.get('jv_var')
+					if var is not None and bool(var.get()) != on:
+						var.set(on)
+				except Exception:
+					pass
+				if on == jv_on[0]:
+					return
+				jv_on[0] = on
+				_jv_apply(on)
+				show_frame(current_frame[0], force_render=True)     # 関節面の色を いまのコマで塗る
+				fn = jv.get("on_change")
+				if callable(fn):
+					try:
+						fn(on)
+					except Exception as e:
+						print(f"[sim engine] 関節面だけ表示の保存に失敗: {e}")
+				if propagate:
+					self._sim_view_propagate(viewer_ref[0], "set_joint_view", on)
+
+			jv_cb = {"available": jv_avail, "get": lambda: bool(jv_on[0]), "set": _jv_set}
+			if jv_on[0] and jv_avail:
+				_jv_apply(True)
+			else:
+				jv_on[0] = False
+
+		# --- 5e. 表示変更用モデル (scene に "alt_model" があるときだけ。ankle。2026-10-15・臨時) ---
+		av_cb = None
+		if av is not None:
+			av_avail = any(a is not None for a in actors_a)
+
+			def _av_set(on, propagate=True):
+				on = bool(on) and av_avail
+				try:
+					var = ctrl_widgets.get('av_var')
+					if var is not None and str(var.get()) != ("alt" if on else "calc"):
+						var.set("alt" if on else "calc")
+				except Exception:
+					pass
+				if on == av_on[0]:
+					return
+				av_on[0] = on
+				_vis_apply()
+				show_frame(current_frame[0], force_render=True)     # 表示変更用モデルの色を いまのコマで塗る
+				fn = av.get("on_change")
+				if callable(fn):
+					try:
+						fn(on)
+					except Exception as e:
+						print(f"[sim engine] 表示変更用モデルの切り替えの保存に失敗: {e}")
+				if propagate:
+					self._sim_view_propagate(viewer_ref[0], "set_alt_model", on)
+
+			av_cb = {"available": av_avail, "get": lambda: bool(av_on[0]), "set": _av_set}
+			if not av_avail:
+				av_on[0] = False
+		else:
+			av_on[0] = False
+		_vis_apply()
+
+		# --- 5f. 右上の数字の表示・非表示 (scene に overlay_cfg があるときだけ。ankle。2026-10-15) ---
+		ov_cb = None
+		if ovc is not None and callable(scene.get("overlay_text")):
+			def _ov_set(on, propagate=True):
+				on = bool(on)
+				try:
+					var = ctrl_widgets.get('ov_var')
+					if var is not None and bool(var.get()) != on:
+						var.set(on)
+				except Exception:
+					pass
+				if on == ov_on[0]:
+					return
+				ov_on[0] = on
+				try:
+					if overlay_actor[0] is not None:
+						overlay_actor[0].SetVisibility(1 if on else 0)
+				except Exception:
+					pass
+				show_frame(current_frame[0], force_render=True)      # 出すときは いまのコマの数字に
+				fn = ovc.get("on_change")
+				if callable(fn):
+					try:
+						fn(on)
+					except Exception as e:
+						print(f"[sim engine] 右上の数字の表示の保存に失敗: {e}")
+				if propagate:
+					self._sim_view_propagate(viewer_ref[0], "set_overlay_visible", on)
+
+			ov_cb = {"get": lambda: bool(ov_on[0]), "set": _ov_set}
+		else:
+			ov_on[0] = True
+
+		# --- 5g. 軸力から始める (scene に start_at_load があるときだけ。ankle。2026-10-15) ---
+		sal = scene.get("start_at_load")
+		sal_cb = None
+		if sal is not None:
+			def _sal_set(on):
+				if bool(on) == bool(sal.get("show")):
+					return
+				fn = sal.get("on_toggle")
+				try:
+					_cb_close()                    # いまの窓を閉じて、開き直す
+				except Exception as e:
+					print(f"[sim engine] 閉じられませんでした: {e}")
+				if callable(fn):
+					self.after(200, lambda: fn(bool(on)))
+
+			sal_cb = {"available": bool(sal.get("available")), "get": lambda: bool(sal.get("show")),
+			          "set": _sal_set, "label": str(sal.get("label", ""))}
+
+		# --- 5h. 固定する骨 (scene に fix_select があるときだけ。ankle。2026-10-15) ---
+		fxs = scene.get("fix_select")
+		fxs_cb = None
+		if fxs is not None:
+			def _fxs_set(name):
+				if str(name) == str(fxs.get("current")):
+					return
+				fn = fxs.get("on_change")
+				try:
+					_cb_close()                    # いまの窓を閉じて、開き直す
+				except Exception as e:
+					print(f"[sim engine] 閉じられませんでした: {e}")
+				if callable(fn):
+					self.after(200, lambda: fn(str(name)))
+
+			fxs_cb = {"options": list(fxs.get("options") or []), "current": str(fxs.get("current", "")), "set": _fxs_set}
+
+		# --- 5i. 名前を付けて保存した視点 (scene に view_store があるときだけ。ankle。2026-10-15) ---
+		vst = scene.get("view_store")
+		views_cb = None
+		if vst is not None and callable(vst.get("load")) and callable(vst.get("save")):
+			import datetime as _dtv
+
+			def _vw_names():
+				return [str(x["name"]) for x in vst["load"]()]
+
+			def _vw_save_current(name):
+				name = str(name).strip()
+				if not name:
+					return "名前が空です"
+				items = vst["load"]()
+				cam = [list(c) if isinstance(c, tuple) else c for c in self._sim_cam_get(anim_plotter)]
+				ent = {"name": name, "cam": cam, "fixed": str(vst.get("fixed", "")),
+				       "time": _dtv.datetime.now().isoformat(timespec="seconds")}
+				hit = next((k for k, x in enumerate(items) if x["name"] == name), None)
+				if hit is None:
+					items.append(ent)
+				else:
+					items[hit] = ent
+				vst["save"](items)
+				return None
+
+			def _vw_apply(name):
+				it = next((x for x in vst["load"]() if x["name"] == name), None)
+				if it is None:
+					return "見つかりません"
+				c = it["cam"]
+				try:
+					self._sim_cam_set(anim_plotter, (tuple(c[0]), tuple(c[1]), tuple(c[2]), float(c[3]), float(c[4]), int(c[5])))
+				except Exception as e:
+					return f"視点を変えられません: {e}"
+				if str(it.get("fixed", "")) != str(vst.get("fixed", "")):
+					return (f"※ この視点は「{it.get('fixed') or '固定なし'}」を固定して保存したもの（いまは"
+					        f"「{vst.get('fixed') or '固定なし'}」）。骨の見え方がずれることがあります")
+				return None
+
+			def _vw_rename(old, new):
+				new = str(new).strip()
+				items = vst["load"]()
+				if not new:
+					return "名前が空です"
+				if any(x["name"] == new for x in items):
+					return f"「{new}」はもうあります"
+				for x in items:
+					if x["name"] == old:
+						x["name"] = new
+				vst["save"](items)
+				return None
+
+			def _vw_delete(name):
+				vst["save"]([x for x in vst["load"]() if x["name"] != name])
+				return None
+
+			views_cb = {"names": _vw_names, "save": _vw_save_current, "apply": _vw_apply,
+			            "rename": _vw_rename, "delete": _vw_delete}
+
 		# --- 6. 制御パネル ---
 		ctrl_widgets = self._sim_view_create_control_panel(
 			n_frames=N,
@@ -13106,6 +15942,14 @@ class MainMenuGUI(_BaseWindow):
 				                 if scene.get("ligaments") is not None else None),
 				'bone_style': bone_style_cb,
 				'heatmap_range': hm_range_cb,
+				'heatmap_toggle': hm_toggle_cb,
+				'joint_view': jv_cb,
+				'alt_model': av_cb,
+				'overlay_toggle': ov_cb,
+				'start_at_load': sal_cb,
+				'fix_select': fxs_cb,
+				'views': views_cb,
+				'chart_select': scene.get("chart_select"),
 				'extra_buttons': scene.get("panel_buttons"),
 			},
 			features=features)
@@ -13197,6 +16041,13 @@ class MainMenuGUI(_BaseWindow):
 			"speed": lambda: float(playback_speed[0]),
 			"max_time": float(frame_times[-1]) if frame_times else 0.0,
 			"frame_dt": _frame_dt, "alive": lambda: bool(is_animation_active[0]),
+			"set_heatmap_visible": ((lambda on: hm_toggle_cb["set"](on, propagate=False))
+			                        if hm_toggle_cb is not None and heatmap_enabled else None),
+			"set_joint_view": ((lambda on: jv_cb["set"](on, propagate=False))
+			                   if jv_cb is not None and jv_cb["available"] else None),
+			"set_alt_model": ((lambda on: av_cb["set"](on, propagate=False))
+			                  if av_cb is not None and av_cb["available"] else None),
+			"set_overlay_visible": ((lambda on: ov_cb["set"](on, propagate=False)) if ov_cb is not None else None),
 		}
 
 		# --- 6b. 模擬靭帯 (scene に "ligaments" があるときだけ。hip/knee は渡さない) ---
@@ -13204,7 +16055,9 @@ class MainMenuGUI(_BaseWindow):
 			try:
 				lig_ctx[0] = self._sim_ligament_attach(
 					anim_plotter, bones, actors, ctrl_widgets.get('window'),
-					lambda: current_frame[0], scene.get("ligaments"))
+					lambda: current_frame[0], scene.get("ligaments"),
+					extra_pick=([(a, i) for i, a in enumerate(actors_j) if a is not None]
+					            + [(a, i) for i, a in enumerate(actors_a) if a is not None]))
 			except Exception as e:
 				print(f"[sim engine] 模擬靭帯の準備に失敗: {e}")
 				traceback.print_exc()
@@ -13449,6 +16302,40 @@ class MainMenuGUI(_BaseWindow):
 	def _sim_compare_linked(self):
 		return [v for v in self._sim_viewers_alive() if bool(v["linked"].get())]
 
+	def _sim_view_propagate(self, src, key: str, on) -> None:
+		"""比較中（連動しているウィンドウどうし）は、表示の切り替え（key = viewer_ref の関数名）をそろえる。"""
+		try:
+			if src is None or not bool(src["linked"].get()):
+				return
+		except Exception:
+			return
+		if len(self._sim_viewers_alive()) < 2:
+			return
+		for w in self._sim_compare_linked():
+			if w is src or not callable(w.get(key)):
+				continue
+			try:
+				w[key](on)
+			except Exception as e:
+				print(f"[比較] 表示をそろえられませんでした ({key}): {e}")
+
+	def _sim_hm_propagate(self, src, on) -> None:
+		"""比較中（連動しているウィンドウどうし）は、ヒートマップの表示・非表示もそろえる。"""
+		try:
+			if src is None or not bool(src["linked"].get()):
+				return
+		except Exception:
+			return
+		if len(self._sim_viewers_alive()) < 2:
+			return
+		for w in self._sim_compare_linked():
+			if w is src or not callable(w.get("set_heatmap_visible")):
+				continue
+			try:
+				w["set_heatmap_visible"](on)
+			except Exception as e:
+				print(f"[比較] ヒートマップの表示をそろえられませんでした: {e}")
+
 	def _sim_compare_stop_at_end(self, v) -> bool:
 		"""連動中のウィンドウは末尾で止める（先頭に戻ると、ほかとのずれが崩れるため）。"""
 		win = getattr(self, "_sim_compare_win", None)
@@ -13688,8 +16575,8 @@ class MainMenuGUI(_BaseWindow):
 			st["speed_last"] = sp
 			self._sim_compare_set_speed(sp)
 
-		spd = tk.Scale(win, from_=0.25, to=10.0, resolution=0.25, orient=tk.HORIZONTAL,
-		               label="再生速度（連動中のすべて）", command=_on_spd)
+		spd = tk.Scale(win, from_=0.25, to=30.0, resolution=0.25, orient=tk.HORIZONTAL,
+		               label="再生速度（連動中のすべて・30倍まで）", command=_on_spd)
 		spd.set(st["speed_last"])
 		spd.pack(fill=tk.X, padx=10)
 
@@ -14187,7 +17074,8 @@ class MainMenuGUI(_BaseWindow):
 						prox_points=local_pts[idx_i],
 						transform_data=transform_data_pair,
 						update_progress=_pair_progress,
-						cancel_var=cancel_var)
+						cancel_var=cancel_var,
+						sign_check=True)
 					if cancel_var.get():
 						return []
 					# lazy は _LazyHeatmapList もしくは list of PolyData 相当
@@ -14253,7 +17141,7 @@ class MainMenuGUI(_BaseWindow):
 				return p
 		return None
 
-	def _sim_ligament_attach(self, plotter, bones, actors, parent, get_frame, cfg):
+	def _sim_ligament_attach(self, plotter, bones, actors, parent, get_frame, cfg, extra_pick=None):
 		"""ビューアに模擬靭帯の機能を足す。
 
 		Returns: {"open": fn(), "update": fn(frame_idx), "close": fn()} または None
@@ -14429,9 +17317,9 @@ class MainMenuGUI(_BaseWindow):
 				except Exception:
 					pass
 
-		def _new(name, color, radius, visible, a_bone, a_pt, b_bone, b_pt):
+		def _new(name, color, radius, visible, a_bone, a_pt, b_bone, b_pt, chart=True):
 			lig = {"name": str(name), "color": str(color), "radius": float(radius),
-			       "visible": bool(visible),
+			       "visible": bool(visible), "chart": bool(chart),
 			       "a_bone": int(a_bone), "a_pt": np.asarray(a_pt, dtype=float).reshape(3),
 			       "b_bone": int(b_bone), "b_pt": np.asarray(b_pt, dtype=float).reshape(3),
 			       "row": None}
@@ -14451,7 +17339,7 @@ class MainMenuGUI(_BaseWindow):
 		# ------------------------------------------------------------ 保存
 		def _items():
 			return [{"name": l["name"], "color": l["color"], "radius": float(l["radius"]),
-			         "visible": bool(l["visible"]),
+			         "visible": bool(l["visible"]), "chart": bool(l.get("chart", True)),
 			         "a": {"bone": int(l["a_bone"]), "point": [float(v) for v in l["a_pt"]]},
 			         "b": {"bone": int(l["b_bone"]), "point": [float(v) for v in l["b_pt"]]}}
 			        for l in ligs]
@@ -14493,8 +17381,23 @@ class MainMenuGUI(_BaseWindow):
 		def _idle_status():
 			_status("骨の上を右クリックすると 1 点目を指定します（右ドラッグのズームは従来どおり）", "gray")
 
+		def _repick(l, end):
+			"""靭帯 l の 1点目（end="a"）か 2点目（"b"）を、次の右クリックで付け直す。"""
+			_cancel_pending(render=False)
+			st["repick"] = (l, end)
+			try:
+				if st["pick_var"] is not None and not bool(st["pick_var"].get()):
+					st["pick_var"].set(True)
+			except Exception:
+				pass
+			st["pick_on"] = True
+			_render()
+			_status(f"「{l['name']}」の{'1' if end == 'a' else '2'}点目（いまは {names[l['a_bone' if end == 'a' else 'b_bone']]}）を"
+			        "打ち直します。新しい付着部を右クリックしてください（やめるときは「1点目を取り消す」）。", "blue")
+
 		def _cancel_pending(render=True):
 			st["pending"] = None
+			st["repick"] = None
 			if st["pending_actor"] is not None:
 				try:
 					plotter.renderer.RemoveActor(st["pending_actor"])
@@ -14519,6 +17422,11 @@ class MainMenuGUI(_BaseWindow):
 			picker.SetPickFromList(True)
 			picker.InitializePickList()
 			for a in actors:
+				if a is not None:
+					picker.AddPickList(a)
+			# 関節面モデル・表示変更用モデルにも当てる（どちらかを表示中は、元の骨は隠れていて当たらない。2026-10-15）。
+			# どれも元の骨と同じ座標・同じ動きなので、当たった点は その骨の点として扱える
+			for a, _si in (extra_pick or []):
 				if a is not None:
 					picker.AddPickList(a)
 		except Exception as e:
@@ -14609,6 +17517,8 @@ class MainMenuGUI(_BaseWindow):
 				hit = picker.GetActor()
 				si = next((i for i, a in enumerate(actors) if a is hit), None)
 				if si is None:
+					si = next((int(i) for a, i in (extra_pick or []) if a is hit), None)
+				if si is None:
 					return
 				world = np.array(picker.GetPickPosition(), dtype=float)
 				M = np.eye(4)
@@ -14621,6 +17531,24 @@ class MainMenuGUI(_BaseWindow):
 				_status(f"指定に失敗しました: {e}", "red")
 				return
 			fi = _fi()
+			# 靭帯の 1点目 / 2点目 の打ち直し（2026-10-15）
+			rp = st.get("repick")
+			if rp is not None:
+				l_, end_ = rp
+				st["repick"] = None
+				if l_ in ligs:
+					if end_ == "a":
+						l_["a_bone"], l_["a_pt"] = int(si), np.asarray(local, dtype=float)
+					else:
+						l_["b_bone"], l_["b_pt"] = int(si), np.asarray(local, dtype=float)
+					l_["lengths"] = _lengths(l_)
+					_place(l_, fi)
+					_rebuild_rows()
+					_render()
+					_schedule_save(0)
+					_status(f"「{l_['name']}」の{'1' if end_ == 'a' else '2'}点目を {names[si]} の上に打ち直しました"
+					        f"（{names[l_['a_bone']]} → {names[l_['b_bone']]}）。", "green")
+				return
 			if st["pending"] is None:
 				st["pending"] = (si, local)
 				try:
@@ -14686,8 +17614,8 @@ class MainMenuGUI(_BaseWindow):
 				w.destroy()
 			for l in ligs:
 				l["row"] = None
-			hdr = ("表示", "名前", "付着部（1点目 → 2点目）", "長さ 現在（全フレームの範囲）",
-			       "半径 mm", "色", "")
+			hdr = ("表示", "グラフ", "名前", "付着部（1点目 → 2点目）", "長さ 現在（全フレームの範囲）",
+			       "半径 mm", "色", "", "")
 			for c, h in enumerate(hdr):
 				ttk.Label(fr, text=h, font=(self.ui_font_family, 9, "bold")).grid(
 					row=0, column=c, padx=4, pady=(2, 4), sticky="w")
@@ -14700,23 +17628,31 @@ class MainMenuGUI(_BaseWindow):
 				vis = tk.BooleanVar(master=fr, value=bool(l["visible"]))
 				ttk.Checkbutton(fr, variable=vis, command=lambda l=l, v=vis: _set_visible(l, v.get())
 				                ).grid(row=r, column=0, padx=4)
+				chv = tk.BooleanVar(master=fr, value=bool(l.get("chart", True)))
+				ttk.Checkbutton(fr, variable=chv, command=lambda l=l, v=chv: _set_chart(l, v.get())
+				                ).grid(row=r, column=1, padx=4)
 				nm = tk.StringVar(master=fr, value=l["name"])
-				ttk.Entry(fr, textvariable=nm, width=16).grid(row=r, column=1, padx=4, sticky="w")
+				ttk.Entry(fr, textvariable=nm, width=16).grid(row=r, column=2, padx=4, sticky="w")
 				nm.trace_add("write", lambda *_a, l=l, v=nm: _set_name(l, v.get()))
-				ttk.Label(fr, text=f"{names[l['a_bone']]} → {names[l['b_bone']]}").grid(
-					row=r, column=2, padx=4, sticky="w")
+				_af = ttk.Frame(fr)
+				_af.grid(row=r, column=3, padx=4, sticky="w")
+				ttk.Label(_af, text=f"{names[l['a_bone']]} → {names[l['b_bone']]}").pack(side="left")
+				ttk.Button(_af, text="1点目を打ち直す", command=lambda l=l: _repick(l, "a")).pack(side="left", padx=(6, 2))
+				ttk.Button(_af, text="2点目を打ち直す", command=lambda l=l: _repick(l, "b")).pack(side="left", padx=2)
 				len_lbl = ttk.Label(fr, text=_len_text(l, fi), font=("Consolas", 9))
-				len_lbl.grid(row=r, column=3, padx=4, sticky="w")
+				len_lbl.grid(row=r, column=4, padx=4, sticky="w")
 				rv = tk.StringVar(master=fr, value=f"{float(l['radius']):.2f}")
 				ttk.Spinbox(fr, textvariable=rv, from_=0.1, to=20.0, increment=0.1, width=6).grid(
-					row=r, column=4, padx=4)
+					row=r, column=5, padx=4)
 				rv.trace_add("write", lambda *_a, l=l, v=rv: _set_radius(l, v.get()))
 				cb = tk.Button(fr, text="    ", bg=l["color"], activebackground=l["color"],
 				               relief="raised", command=lambda l=l: _pick_color(l))
-				cb.grid(row=r, column=5, padx=4)
+				cb.grid(row=r, column=6, padx=4)
+				ttk.Button(fr, text="複製", width=6, command=lambda l=l: _duplicate(l)).grid(
+					row=r, column=7, padx=4)
 				ttk.Button(fr, text="削除", width=6, command=lambda l=l: _delete(l)).grid(
-					row=r, column=6, padx=4)
-				l["row"] = {"len": len_lbl, "color_btn": cb, "vars": (vis, nm, rv)}
+					row=r, column=8, padx=4)
+				l["row"] = {"len": len_lbl, "color_btn": cb, "vars": (vis, chv, nm, rv)}
 			try:
 				fr.update_idletasks()
 				cv = st.get("canvas")
@@ -14730,6 +17666,11 @@ class MainMenuGUI(_BaseWindow):
 			_style(l)
 			_render()
 			_schedule_save()
+
+		def _set_chart(l, v):
+			"""長さのグラフに出すか（3D の表示とは別。ACL を切ったあと「ACL があった所」の長さだけ見たいとき）。"""
+			l["chart"] = bool(v)
+			_schedule_save(0)
 
 		def _set_name(l, v):
 			l["name"] = str(v)
@@ -14771,6 +17712,23 @@ class MainMenuGUI(_BaseWindow):
 				pass
 			_render()
 			_schedule_save()
+
+		def _duplicate(l):
+			"""同じ付着部の靭帯を作る（名前は「〇〇（複製）」。名前の欄で変えられる。2026-10-15）。"""
+			used = {x["name"] for x in ligs}
+			nm = f"{l['name']}（複製）"
+			k = 2
+			while nm in used:
+				nm = f"{l['name']}（複製{k}）"
+				k += 1
+			col = PALETTE[len(ligs) % len(PALETTE)]
+			if col.lower() == str(l["color"]).lower():
+				col = PALETTE[(len(ligs) + 1) % len(PALETTE)]
+			_new(nm, col, float(l["radius"]), True, l["a_bone"], l["a_pt"].copy(), l["b_bone"], l["b_pt"].copy())
+			_rebuild_rows()
+			_render()
+			_schedule_save(0)
+			_status(f"「{l['name']}」を複製して「{nm}」を作りました（名前の欄で変えられます）。", "green")
 
 		def _delete(l):
 			if not messagebox.askyesno("靭帯の削除", f"「{l['name']}」を削除しますか？",
@@ -14818,7 +17776,7 @@ class MainMenuGUI(_BaseWindow):
 			        "note": "point は各骨のモデルファイル座標 (mm)",
 			        "ligaments": [
 				        {"name": l["name"], "color": l["color"], "radius": float(l["radius"]),
-				         "visible": bool(l["visible"]),
+				         "visible": bool(l["visible"]), "chart": bool(l.get("chart", True)),
 				         "a": {"bone_name": names[l["a_bone"]],
 				               "point": [float(v) for v in l["a_pt"]]},
 				         "b": {"bone_name": names[l["b_bone"]],
@@ -14872,7 +17830,7 @@ class MainMenuGUI(_BaseWindow):
 						ends.append((hits[0], pt))
 					_new(it.get("name") or _unique_name(), it.get("color", PALETTE[len(ligs) % len(PALETTE)]),
 					     float(it.get("radius", 1.5)), bool(it.get("visible", True)),
-					     ends[0][0], ends[0][1], ends[1][0], ends[1][1])
+					     ends[0][0], ends[0][1], ends[1][0], ends[1][1], chart=bool(it.get("chart", True)))
 					added += 1
 				except Exception as e:
 					skipped.append(f"{it.get('name', '?') if isinstance(it, dict) else '?'}（{e}）")
@@ -14978,6 +17936,8 @@ class MainMenuGUI(_BaseWindow):
 			ttk.Checkbutton(bot, text="名前ラベルを表示", variable=st["label_var"],
 			                command=_toggle_labels).pack(side="left")
 			ttk.Button(bot, text="閉じる", command=_close_window).pack(side="right", padx=2)
+			if callable(cfg.get("on_compare")):
+				ttk.Button(bot, text="長さを比べる…", command=cfg["on_compare"]).pack(side="left", padx=2)
 			ttk.Button(bot, text="すべて削除", command=_delete_all).pack(side="right", padx=2)
 			ttk.Button(bot, text="ファイルから読込…", command=_import).pack(side="right", padx=2)
 			ttk.Button(bot, text="ファイルに保存…", command=_export).pack(side="right", padx=2)
@@ -15041,7 +18001,7 @@ class MainMenuGUI(_BaseWindow):
 					raise IndexError("骨番号が範囲外")
 				_new(it.get("name") or _unique_name(), it.get("color", PALETTE[len(ligs) % len(PALETTE)]),
 				     float(it.get("radius", 1.5)), bool(it.get("visible", True)),
-				     ai, a["point"], bi, b["point"])
+				     ai, a["point"], bi, b["point"], chart=bool(it.get("chart", True)))
 			except Exception as e:
 				n_bad += 1
 				print(f"[靭帯] 復元をスキップ: {e}")
@@ -15153,8 +18113,8 @@ class MainMenuGUI(_BaseWindow):
 			except Exception as e:
 				print(f"[sim_view] on_speed 失敗: {e}")
 
-		speed_scale = tk.Scale(control_window, from_=0.25, to=10.0, resolution=0.25,
-			orient=tk.HORIZONTAL, label="Playback Speed (0.25x - 10x)",
+		speed_scale = tk.Scale(control_window, from_=0.25, to=30.0, resolution=0.25,
+			orient=tk.HORIZONTAL, label="Playback Speed (0.25x - 30x)",
 			command=_on_speed)
 		speed_scale.set(1.0)
 		speed_scale.pack(pady=5, padx=10, fill=tk.X)
@@ -15245,6 +18205,306 @@ class MainMenuGUI(_BaseWindow):
 				_btn.config(command=_on_color)
 			style_frame.columnconfigure(3, weight=1)
 			building[0] = False
+
+		# ヒートマップの表示・非表示 (呼び出し側が heatmap_toggle を渡したときだけ。ankle)
+		hm_show_var = None
+		_ht = callbacks.get('heatmap_toggle')
+		if _ht and callable(_ht.get('set')):
+			ht_frame = ttk.Frame(control_window)
+			ht_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			_avail = bool(_ht.get('available', True))
+			hm_show_var = tk.BooleanVar(control_window, value=(bool(_ht['get']()) if _avail else False))
+
+			def _on_hm_toggle():
+				try:
+					_ht['set'](bool(hm_show_var.get()))
+				except Exception as e:
+					print(f"[sim_view] ヒートマップの切り替えに失敗: {e}")
+			_hm_cb = ttk.Checkbutton(ht_frame, text="ヒートマップを表示", variable=hm_show_var,
+			                         command=_on_hm_toggle)
+			_hm_cb.pack(side=tk.LEFT, padx=(8, 6))
+			if _avail:
+				_note = "（外すと骨の色だけになります。計算し直しは不要。比較中は連動しているウィンドウもそろえます）"
+			else:
+				_hm_cb.state(["disabled"])
+				_note = "（接触を計算していないので使えません。可視化のときに計算すると使えます）"
+			ttk.Label(ht_frame, text=_note, foreground="gray",
+			          font=(self.ui_font_family, 8)).pack(side=tk.LEFT)
+			try:
+				_panel_h += 32
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
+
+		# 関節面だけ表示 (呼び出し側が joint_view を渡したときだけ。ankle)
+		jv_var = None
+		_jv = callbacks.get('joint_view')
+		if _jv and callable(_jv.get('set')):
+			jv_frame = ttk.Frame(control_window)
+			jv_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			_javail = bool(_jv.get('available', True))
+			jv_var = tk.BooleanVar(control_window, value=(bool(_jv['get']()) if _javail else False))
+
+			def _on_jv_toggle():
+				try:
+					_jv['set'](bool(jv_var.get()))
+				except Exception as e:
+					print(f"[sim_view] 関節面だけ表示の切り替えに失敗: {e}")
+			_jv_cb = ttk.Checkbutton(jv_frame, text="関節面だけ表示", variable=jv_var, command=_on_jv_toggle)
+			_jv_cb.pack(side=tk.LEFT, padx=(8, 6))
+			if _javail:
+				_jnote = "（③で関節面モデルを入れた骨だけを関節面で表示し、ほかの骨は隠します）"
+			else:
+				_jv_cb.state(["disabled"])
+				_jnote = "（③で関節面モデルを入れた骨がないので使えません）"
+			ttk.Label(jv_frame, text=_jnote, foreground="gray",
+			          font=(self.ui_font_family, 8)).pack(side=tk.LEFT)
+			try:
+				_panel_h += 32
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
+
+		# 骨のモデル: 計算に使ったモデル / 表示変更用モデル (呼び出し側が alt_model を渡したときだけ。ankle。2026-10-15・臨時)
+		av_var = None
+		_av = callbacks.get('alt_model')
+		if _av and callable(_av.get('set')):
+			av_frame = ttk.Frame(control_window)
+			av_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			_aavail = bool(_av.get('available', True))
+			av_var = tk.StringVar(control_window, value=("alt" if (_aavail and bool(_av['get']())) else "calc"))
+
+			def _on_av_toggle():
+				try:
+					_av['set'](str(av_var.get()) == "alt")
+				except Exception as e:
+					print(f"[sim_view] 骨のモデルの切り替えに失敗: {e}")
+			ttk.Label(av_frame, text="骨のモデル:").pack(side=tk.LEFT, padx=(8, 4))
+			ttk.Radiobutton(av_frame, text="計算に使ったモデル", value="calc", variable=av_var,
+			                command=_on_av_toggle).pack(side=tk.LEFT, padx=(0, 6))
+			_rb_alt = ttk.Radiobutton(av_frame, text="表示変更用モデル（臨時）", value="alt", variable=av_var,
+			                          command=_on_av_toggle)
+			_rb_alt.pack(side=tk.LEFT, padx=(0, 6))
+			if _aavail:
+				_anote = "（③で入れた骨だけ。ヒートマップは計算済みのものを写します）"
+			else:
+				_rb_alt.state(["disabled"])
+				_anote = "（③で表示変更用モデルを入れた骨がないので使えません）"
+			ttk.Label(av_frame, text=_anote, foreground="gray",
+			          font=(self.ui_font_family, 8)).pack(side=tk.LEFT)
+			try:
+				_panel_h += 32
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
+
+		# 右のグラフのチェックリスト (呼び出し側が chart_select を渡したときだけ。ankle。2026-10-15)
+		chart_vars = {}
+		_cs = callbacks.get('chart_select')
+		if _cs and callable(_cs.get('set')):
+			try:
+				_items_cs = list(_cs['items']()) if callable(_cs.get('items')) else list(_cs.get('items') or [])
+			except Exception:
+				_items_cs = []
+			if _items_cs:
+				cs_frame = ttk.LabelFrame(control_window, text="右のグラフ（チェックしたものを上から並べます）")
+				cs_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+				_ord_lb = None
+
+				def _ord_refresh(sel_key=None):
+					if _ord_lb is None or not callable(_cs.get('ordered')):
+						return
+					try:
+						od = list(_cs['ordered']())
+					except Exception:
+						od = []
+					_ord_lb.delete(0, tk.END)
+					for k_, l_ in od:
+						_ord_lb.insert(tk.END, str(l_))
+					_ord_lb._keys = [k_ for k_, _l in od]
+					if sel_key in _ord_lb._keys:
+						_ord_lb.selection_set(_ord_lb._keys.index(sel_key))
+
+				def _toggle_cs(k, vv):
+					_cs['set'](k, bool(vv.get()))
+					_ord_refresh()
+
+				for j, (key, lab) in enumerate(_items_cs):
+					v = tk.BooleanVar(control_window, value=bool(_cs['get'](key)))
+					chart_vars[key] = v
+					ttk.Checkbutton(cs_frame, text=str(lab), variable=v,
+					                command=(lambda k=key, vv=v: _toggle_cs(k, vv))
+					                ).grid(row=j // 8, column=j % 8, sticky="w", padx=(6, 4), pady=1)
+				_n_rows = (len(_items_cs) + 7) // 8
+				if callable(_cs.get('move')) and callable(_cs.get('ordered')):
+					of = ttk.Frame(cs_frame)
+					of.grid(row=_n_rows, column=0, columnspan=8, sticky="w", padx=6, pady=(4, 2))
+					ttk.Label(of, text="並び（上から）:").pack(side=tk.LEFT, anchor="n")
+					_ord_lb = tk.Listbox(of, height=5, width=22, exportselection=False)
+					_ord_lb.pack(side=tk.LEFT, padx=(4, 4))
+					_ord_lb._keys = []
+
+					def _ord_move(d):
+						sel = _ord_lb.curselection()
+						if not sel:
+							return
+						k_ = _ord_lb._keys[sel[0]]
+						_cs['move'](k_, d)
+						_ord_refresh(k_)
+					bf_ = ttk.Frame(of)
+					bf_.pack(side=tk.LEFT, anchor="n")
+					ttk.Button(bf_, text="▲ 上へ", width=8, command=lambda: _ord_move(-1)).pack(pady=(0, 2))
+					ttk.Button(bf_, text="▼ 下へ", width=8, command=lambda: _ord_move(+1)).pack()
+					ttk.Label(of, text="（一覧で選んで ▲▼。チェックした順ではなく、ここの並びで上から並べます）",
+					          foreground="gray", font=(self.ui_font_family, 8)).pack(side=tk.LEFT, anchor="n", padx=(6, 0))
+					_ord_refresh()
+					chart_vars["_order_lb"] = _ord_lb
+				try:
+					_panel_h += 30 + 26 * _n_rows + (100 if _ord_lb is not None else 0)
+					control_window.geometry(f"850x{_panel_h}")
+				except Exception:
+					pass
+
+		# 視点の保存・呼び出し (呼び出し側が views を渡したときだけ。ankle。2026-10-15)
+		views_var = None
+		_vw = callbacks.get('views')
+		if _vw and callable(_vw.get('save')):
+			vw_frame = ttk.LabelFrame(control_window, text="視点（名前を付けて保存・選ぶとその視点に）")
+			vw_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			views_var = tk.StringVar(control_window, value="")
+			_vw_cb = ttk.Combobox(vw_frame, textvariable=views_var, values=list(_vw['names']()), state="readonly", width=22)
+			_vw_cb.grid(row=0, column=0, padx=(6, 4), pady=3, sticky="w")
+			_vw_msg = ttk.Label(vw_frame, text="", foreground="gray", font=(self.ui_font_family, 8), wraplength=780,
+			                    justify="left")
+			_vw_msg.grid(row=1, column=0, columnspan=6, sticky="w", padx=6)
+
+			def _vw_refresh(sel=None):
+				names_ = list(_vw['names']())
+				_vw_cb.configure(values=names_)
+				views_var.set(sel if (sel in names_) else "")
+
+			def _vw_say(msg, ok_text=""):
+				_vw_msg.configure(text=(msg or ok_text), foreground=("#b35900" if msg else "#1b5e20"))
+
+			def _vw_on_select(_e=None):
+				n_ = views_var.get()
+				if n_:
+					_vw_say(_vw['apply'](n_), f"「{n_}」の視点にしました")
+
+			def _vw_on_save():
+				names_ = list(_vw['names']())
+				k_ = len(names_) + 1
+				while f"視点{k_}" in names_:
+					k_ += 1
+				n_ = simpledialog.askstring("この視点を保存", "視点の名前（同じ名前なら上書き）:",
+				                           initialvalue=f"視点{k_}", parent=control_window)
+				if n_ is None:
+					return
+				msg = _vw['save'](n_)
+				_vw_refresh(n_.strip())
+				_vw_say(msg, f"「{n_.strip()}」を保存しました（骨リストを共有している試験で使えます）")
+
+			def _vw_on_rename():
+				old = views_var.get()
+				if not old:
+					_vw_say("名前を変える視点を選んでください")
+					return
+				n_ = simpledialog.askstring("視点の名前を変える", f"「{old}」の新しい名前:", initialvalue=old,
+				                           parent=control_window)
+				if n_ is None or n_.strip() == old:
+					return
+				msg = _vw['rename'](old, n_)
+				_vw_refresh(n_.strip() if not msg else old)
+				_vw_say(msg, f"「{old}」→「{n_.strip()}」に変えました")
+
+			def _vw_on_delete():
+				old = views_var.get()
+				if not old:
+					_vw_say("削除する視点を選んでください")
+					return
+				if not messagebox.askyesno("視点の削除", f"視点「{old}」を削除しますか？", parent=control_window):
+					return
+				_vw['delete'](old)
+				_vw_refresh()
+				_vw_say(None, f"「{old}」を削除しました")
+
+			_vw_cb.bind("<<ComboboxSelected>>", _vw_on_select)
+			ttk.Button(vw_frame, text="この視点を保存…", command=_vw_on_save).grid(row=0, column=1, padx=2)
+			ttk.Button(vw_frame, text="この視点にする", command=_vw_on_select).grid(row=0, column=2, padx=2)
+			ttk.Button(vw_frame, text="名前を変える…", command=_vw_on_rename).grid(row=0, column=3, padx=2)
+			ttk.Button(vw_frame, text="削除", command=_vw_on_delete).grid(row=0, column=4, padx=2)
+			try:
+				_panel_h += 70
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
+
+		# 固定する骨 (呼び出し側が fix_select を渡したときだけ。ankle。2026-10-15)
+		fix_var = None
+		_fx = callbacks.get('fix_select')
+		if _fx and callable(_fx.get('set')) and _fx.get('options'):
+			fx_frame = ttk.Frame(control_window)
+			fx_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			ttk.Label(fx_frame, text="固定する骨:").pack(side=tk.LEFT, padx=(8, 4))
+			fix_var = tk.StringVar(control_window, value=str(_fx.get('current', '')))
+			_fx_cb = ttk.Combobox(fx_frame, textvariable=fix_var, values=list(_fx['options']), state="readonly", width=16)
+			_fx_cb.pack(side=tk.LEFT)
+			_fx_cb.bind("<<ComboboxSelected>>", lambda e: _fx['set'](fix_var.get()))
+			ttk.Label(fx_frame, text="（固定した骨は動かず、ほかの骨はその骨から見た動きになります。変えると開き直します。"
+			                         "接触の計算はし直しません）",
+			          foreground="gray", font=(self.ui_font_family, 8)).pack(side=tk.LEFT, padx=(6, 0))
+			try:
+				_panel_h += 32
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
+
+		# 軸力から始める (呼び出し側が start_at_load を渡したときだけ。ankle。2026-10-15)
+		sal_var = None
+		_sal = callbacks.get('start_at_load')
+		if _sal and callable(_sal.get('set')):
+			sal_frame = ttk.Frame(control_window)
+			sal_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			sal_var = tk.BooleanVar(control_window, value=bool(_sal['get']()))
+
+			def _on_sal():
+				try:
+					_sal['set'](bool(sal_var.get()))
+				except Exception as e:
+					print(f"[sim_view] 軸力から始めるの切り替えに失敗: {e}")
+			_sal_w = ttk.Checkbutton(sal_frame, text=str(_sal.get('label', '')), variable=sal_var, command=_on_sal)
+			_sal_w.pack(side=tk.LEFT, padx=(8, 6))
+			if not _sal.get('available'):
+				_sal_w.state(["disabled"])
+			else:
+				ttk.Label(sal_frame, text="（切り替えると開き直します）", foreground="gray",
+				          font=(self.ui_font_family, 8)).pack(side=tk.LEFT)
+			try:
+				_panel_h += 32
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
+
+		# 右上の数字の表示 (呼び出し側が overlay_toggle を渡したときだけ。ankle。2026-10-15)
+		ov_var = None
+		_ov = callbacks.get('overlay_toggle')
+		if _ov and callable(_ov.get('set')):
+			ov_frame = ttk.Frame(control_window)
+			ov_frame.pack(pady=(0, 6), padx=10, fill=tk.X)
+			ov_var = tk.BooleanVar(control_window, value=bool(_ov['get']()))
+
+			def _on_ov_toggle():
+				try:
+					_ov['set'](bool(ov_var.get()))
+				except Exception as e:
+					print(f"[sim_view] 右上の数字の切り替えに失敗: {e}")
+			ttk.Checkbutton(ov_frame, text="右上の数字（骨A→B の相対姿勢 Rx〜tz）を表示", variable=ov_var,
+			                command=_on_ov_toggle).pack(side=tk.LEFT, padx=(8, 6))
+			try:
+				_panel_h += 32
+				control_window.geometry(f"850x{_panel_h}")
+			except Exception:
+				pass
 
 		# 追加のボタン (呼び出し側が extra_buttons を渡したときだけ。ankle の方眼紙・移動量)
 		_xb = [b for b in (callbacks.get('extra_buttons') or []) if b and callable(b[1])]
@@ -15340,6 +18600,14 @@ class MainMenuGUI(_BaseWindow):
 			'user_is_dragging': user_is_dragging,
 			'is_programmatic_update': is_programmatic_update,
 			'button_frame': button_frame,
+			'hm_show_var': hm_show_var,
+			'jv_var': jv_var,
+			'av_var': av_var,
+			'ov_var': ov_var,
+			'sal_var': sal_var,
+			'fix_var': fix_var,
+			'views_var': views_var,
+			'chart_vars': chart_vars,
 		}
 
 	def _ankle_accumulate_method_compare(self, det: dict, target_ids) -> None:
@@ -15796,6 +19064,768 @@ class MainMenuGUI(_BaseWindow):
 	# 骨は「名前が一意に一致」→「番号が一致」の順で対応づける。
 	# 対応が取れない靭帯は表示しないが、保存データからは消さない。
 
+	# ==================================================================
+	# 2点の距離の変化（2026-10-14）
+	# ==================================================================
+	# 骨Aの点A と 骨Bの点B（どちらも骨モデルの座標で覚える）の距離を各コマで求め、最初のコマを 0 とした
+	# 変化を出す（+ = 離れた / − = 近づいた）。点は点A側の骨の "disp_pairs" に入れる（骨リストの共有で全タブに入る）。
+	# 距離は2点を結ぶ向きの動きにだけ強く反応する（垂直な横ずれ δ では約 δ²/2L）ので、2点は近くに置くよう案内する。
+	_ANKLE_PAIR_COLORS = ("#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#17becf", "#e377c2", "#8c564b")
+	_ANKLE_PAIR_NOTE = '※ 2点はできるだけ近くに置いてください（それぞれ関節面の近くで、割れ目をはさんで向かい合う所）。距離は、2点を結ぶ向きの動きにはそのまま反応しますが、それに垂直な横ずれにはほとんど反応しません（例: 2点が 10 mm 離れていると、0.5 mm の横ずれでも距離は 0.01 mm しか変わりません。2点が近いほど、どの向きのずれも距離の変化に出ます）。'
+
+	def _ankle_pairs_all(self):
+		"""[(点A側の骨の番号, 組の dict)]（骨リストの順）"""
+		out = []
+		for i, b in enumerate(getattr(self, "ankle_bones", None) or []):
+			for pr in (b.get("disp_pairs") or []):
+				if isinstance(pr, dict):
+					out.append((i, pr))
+		return out
+
+	def _ankle_refresh_pairs_ui(self) -> None:
+		fr = getattr(self, "_ankle_pairs_frame", None)
+		if fr is None:
+			return
+		for c in fr.winfo_children():
+			c.destroy()
+		allp = self._ankle_pairs_all()
+		if not allp:
+			ttk.Label(fr, text="（まだありません。「＋ 2点を追加…」で、骨Aの点と骨Bの点を置いてください）",
+			          foreground="gray").pack(anchor="w")
+			return
+		for k, (ia, pr) in enumerate(allp):
+			row = ttk.Frame(fr)
+			row.pack(fill="x", pady=1)
+			v = tk.BooleanVar(row, value=bool(pr.get("visible", True)))
+
+			def _vis(pr=pr, v=v):
+				pr["visible"] = bool(v.get())
+				self._schedule_state_autosave("ankle")
+			ttk.Checkbutton(row, variable=v, command=_vis).pack(side="left")
+			col = str(pr.get("color", "#d62728"))
+			cb = tk.Button(row, text=f" #{k + 1} ", bg=col, fg="white", activebackground=col, relief="flat")
+
+			def _color(pr=pr, cb=cb):
+				from tkinter import colorchooser
+				res = colorchooser.askcolor(color=cb.cget("bg"), parent=self, title="線と点の色")
+				if res and res[1]:
+					pr["color"] = str(res[1])
+					cb.configure(bg=res[1], activebackground=res[1])
+					self._schedule_state_autosave("ankle")
+			cb.configure(command=_color)
+			cb.pack(side="left", padx=(2, 6))
+			bname = str(self.ankle_bones[ia].get("name", ""))
+			ttk.Label(row, text=f"{pr.get('name') or (bname + '–' + str(pr.get('bone_b', '')))}"
+			                    f"　（点A: {bname} ／ 点B: {pr.get('bone_b', '')}）").pack(side="left")
+			ttk.Button(row, text="削除", width=5,
+			           command=lambda ia=ia, pr=pr: self._ankle_pair_delete(ia, pr)).pack(side="right")
+			ttk.Button(row, text="置き直す…", width=9,
+			           command=lambda ia=ia, pr=pr: self._ankle_pair_repick(ia, pr)).pack(side="right", padx=2)
+
+	def _ankle_pair_delete(self, ia, pr) -> None:
+		b = self.ankle_bones[ia]
+		if not messagebox.askyesno("2点の距離", f"「{pr.get('name', '')}」を削除しますか？", parent=self):
+			return
+		b["disp_pairs"] = [x for x in (b.get("disp_pairs") or []) if x is not pr]
+		self._schedule_state_autosave("ankle")
+		self._ankle_refresh_pairs_ui()
+
+	def _ankle_pair_add(self) -> None:
+		"""骨Aと骨Bを選んでから、点を置く画面を開く。"""
+		names = [str(b.get("name", "")) for b in (self.ankle_bones or [])]
+		if len(names) < 2:
+			messagebox.showinfo("2点の距離", "骨が2本以上ないと使えません。", parent=self)
+			return
+		win = tk.Toplevel(self)
+		win.title("2点を追加")
+		win.transient(self)
+		ttk.Label(win, text="点A を置く骨と、点B を置く骨を選んでください（例: 点A＝脛骨、点B＝骨片）。").grid(
+			row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 6))
+		va = tk.StringVar(win, value=next((n for n in names if "脛骨" in n), names[0]))
+		vb = tk.StringVar(win, value=next((n for n in names if "骨片" in n and n != va.get()),
+		                                  next(n for n in names if n != va.get())))
+		ttk.Label(win, text="点A の骨:").grid(row=1, column=0, sticky="e", padx=(10, 4))
+		ttk.Combobox(win, textvariable=va, values=names, state="readonly", width=18).grid(row=1, column=1, sticky="w")
+		ttk.Label(win, text="点B の骨:").grid(row=2, column=0, sticky="e", padx=(10, 4), pady=4)
+		ttk.Combobox(win, textvariable=vb, values=names, state="readonly", width=18).grid(row=2, column=1, sticky="w")
+		ttk.Label(win, text=self._ANKLE_PAIR_NOTE, foreground="gray", font=(self.ui_font_family, 8),
+		          wraplength=420, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 4))
+
+		def ok():
+			a, b_ = va.get(), vb.get()
+			if a == b_:
+				messagebox.showwarning("2点の距離", "点A と点B は、違う骨を選んでください。", parent=win)
+				return
+			win.destroy()
+			ia, ib = names.index(a), names.index(b_)
+			res = self._ankle_pair_pick(ia, ib)
+			if res is None:
+				return
+			pa, pb = res
+			used = {str(p.get("color")) for _, p in self._ankle_pairs_all()}
+			col = next((c for c in self._ANKLE_PAIR_COLORS if c not in used), self._ANKLE_PAIR_COLORS[0])
+			pr = {"id": __import__("uuid").uuid4().hex[:8], "name": f"{a}–{b_}", "color": col, "visible": True,
+			      "point_a": [float(x) for x in pa], "bone_b": b_, "point_b": [float(x) for x in pb]}
+			self.ankle_bones[ia].setdefault("disp_pairs", []).append(pr)
+			self._schedule_state_autosave("ankle")
+			self._ankle_refresh_pairs_ui()
+			print(f"[2点の距離] 追加: {pr['name']}（点A {pr['point_a']} / 点B {pr['point_b']}）")
+		bf = ttk.Frame(win)
+		bf.grid(row=4, column=0, columnspan=2, sticky="e", padx=10, pady=10)
+		ttk.Button(bf, text="点を置く画面を開く", command=ok).pack(side="right")
+		ttk.Button(bf, text="やめる", command=win.destroy).pack(side="right", padx=6)
+		win.bind("<Escape>", lambda e: win.destroy())
+		try:
+			win.grab_set()
+			win.lift()
+			win.focus_force()
+		except Exception:
+			pass
+
+	def _ankle_pair_repick(self, ia, pr) -> None:
+		names = [str(b.get("name", "")) for b in self.ankle_bones]
+		bn = str(pr.get("bone_b", ""))
+		if bn not in names:
+			messagebox.showwarning("2点の距離", f"点B の骨「{bn}」が骨リストにありません。", parent=self)
+			return
+		res = self._ankle_pair_pick(ia, names.index(bn), old=(pr.get("point_a"), pr.get("point_b")))
+		if res is None:
+			return
+		pr["point_a"] = [float(x) for x in res[0]]
+		pr["point_b"] = [float(x) for x in res[1]]
+		self._schedule_state_autosave("ankle")
+		self._ankle_refresh_pairs_ui()
+
+	def _ankle_pair_pick(self, ia, ib, old=None):
+		"""点を置く画面。いまのタブの録画で、2つの骨が同時に写っている最初のコマの位置関係で表示する。
+
+		返り値 (点A, 点B)（それぞれの骨モデルの座標）か None。VTK のコールバックの中では Tk に触らない。
+		"""
+		import numpy as np
+		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		if not cache:
+			messagebox.showinfo("2点の距離", "このタブには④の結果（姿勢時系列）がありません。\n"
+			                    "2つの骨が写っている試験のタブで、点を置いてください。", parent=self)
+			return None
+		anim, N, _w = self._ankle_build_bone_transforms(cache)
+		try:
+			anim, _n = self._ankle_apply_fragment_trim(anim, cache)
+		except Exception:
+			pass
+		by = {i: (m, Ts) for (i, m, Ts) in anim}
+		na, nb = str(self.ankle_bones[ia].get("name", "")), str(self.ankle_bones[ib].get("name", ""))
+		if ia not in by or ib not in by:
+			messagebox.showinfo("2点の距離", f"この録画では「{na if ia not in by else nb}」が可視化に出ません"
+			                    f"（マーカーが写っていないか、キャリブ・モデルが未設定）。", parent=self)
+			return None
+		bc = cache.get("bones", {}) or {}
+
+		def _det(i):
+			try:
+				return np.asarray(bc[int(self.ankle_bones[i].get("aruco_id", -1))]["detected"], dtype=bool)
+			except Exception:
+				return np.ones(N, dtype=bool)
+		both = np.where(_det(ia) & _det(ib))[0]
+		if both.size == 0:
+			messagebox.showinfo("2点の距離", f"この録画では「{na}」と「{nb}」が同時に写っているコマがありません。", parent=self)
+			return None
+		f0 = int(both[0])
+		Ta_inv = np.linalg.inv(np.asarray(by[ia][1][f0], dtype=float))
+		mesh_a = by[ia][0]
+		M = Ta_inv @ np.asarray(by[ib][1][f0], dtype=float)          # 骨B → 骨A の座標
+		mesh_b = by[ib][0].transform(M, inplace=False)
+		_ff = {}
+		_font = self._sim_ligament_font_file()
+		if _font:
+			_ff = {"font_file": _font}
+		col_a, col_b = self._ankle_color_of(ia), self._ankle_color_of(ib)
+		sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+		title = f"2点を置く: 点A＝{na} ／ 点B＝{nb}"
+		p = pv.Plotter(title=title, window_size=(int(sw * 0.75), int(sh * 0.75)))
+		p.set_background("white")
+		for (i, m, Ts) in anim:
+			if i in (ia, ib):
+				continue
+			try:
+				p.add_mesh(m.transform(Ta_inv @ np.asarray(Ts[f0], dtype=float), inplace=False),
+				           color=self._ankle_color_of(i), opacity=0.15, pickable=False)
+			except Exception:
+				pass
+		p.add_mesh(mesh_a, color=col_a, smooth_shading=True)
+		p.add_mesh(mesh_b, color=col_b, smooth_shading=True)
+		if old and old[0] is not None and old[1] is not None:
+			try:
+				ob = (M[:3, :3] @ np.asarray(old[1], dtype=float)) + M[:3, 3]
+				for q in (np.asarray(old[0], dtype=float), ob):
+					p.add_mesh(pv.Sphere(radius=0.5, center=q), color="#9e9e9e", opacity=0.6, pickable=False)
+			except Exception:
+				pass
+		picked = []
+		st = {"msg": ""}
+		targets = [(mesh_a, na, "#d62728"), (mesh_b, nb, "#1f77b4")]
+
+		def status():
+			k = len(picked)
+			s_ = st["msg"] + ("\n" if st["msg"] else "")
+			if k < 2:
+				s_ += f"次: 点{'AB'[k]} を「{targets[k][1]}」の上に置く（右クリック または P キー）　[U] 1つ戻す"
+			else:
+				d = float(np.linalg.norm(picked[1] - picked[0]))
+				s_ += f"2点を置きました（いまの距離 {d:.2f} mm）→ ウィンドウを閉じると保存します　[U] 1つ戻す"
+				if d > 5.0:
+					s_ += (f"\n※ 2点が {d:.1f} mm 離れています。横ずれに鈍くなるので、"
+					       f"もっと近くに置くのがおすすめです（U で戻して置き直せます）")
+			return s_
+
+		def refresh():
+			p.add_text(status(), position="upper_left", font_size=11, color="black", name="pair_status", **_ff)
+			try:
+				p.render()
+			except Exception:
+				pass
+
+		def cb(point, *_a):
+			k = len(picked)
+			if k >= 2 or point is None:
+				return
+			mesh, nm, colr = targets[k]
+			try:
+				cid, q = mesh.find_closest_cell(np.asarray([point], dtype=float), return_closest_point=True)
+				q = np.asarray(q, dtype=float).reshape(-1, 3)[0]
+			except Exception:
+				q = np.asarray(point, dtype=float)
+			if float(np.linalg.norm(q - np.asarray(point, dtype=float))) > 2.0:
+				st["msg"] = f"「{nm}」の上をクリックしてください"
+				refresh()
+				return
+			st["msg"] = ""
+			picked.append(q)
+			p.add_mesh(pv.Sphere(radius=0.6, center=q), color=colr, name=f"pair_pt{k}", pickable=False)
+			if len(picked) == 2:
+				p.add_mesh(pv.Line(picked[0], picked[1]), color="black", line_width=3, name="pair_line", pickable=False)
+			refresh()
+
+		def undo():
+			if not picked:
+				return
+			k = len(picked) - 1
+			picked.pop()
+			for nm_ in (f"pair_pt{k}", "pair_line"):
+				try:
+					p.remove_actor(nm_)
+				except Exception:
+					pass
+			st["msg"] = ""
+			refresh()
+
+		# 注意書きは折り返して読める大きさで（1行だと小さく縮んで読めない）
+		_note = self._ANKLE_PAIR_NOTE
+		_lines = [_note[i:i + 58] for i in range(0, len(_note), 58)]
+		p.add_text("\n".join(_lines), position="lower_left", font_size=11, color="#444444", **_ff)
+		refresh()
+		try:
+			p.enable_surface_point_picking(callback=cb, show_point=False, show_message=False)
+		except Exception:
+			try:
+				p.enable_point_picking(callback=cb, use_picker=True, show_point=False, show_message=False)
+			except Exception as e:
+				print(f"[2点の距離] 点を置く準備に失敗: {e}")
+		for key in ("u", "U"):
+			try:
+				p.add_key_event(key, undo)
+			except Exception:
+				pass
+		_front = {"done": False}
+
+		def _bring_front(*_a):
+			if _front["done"]:
+				return
+			_front["done"] = True
+			try:
+				self._sim_set_native_title(p, title)
+			except Exception:
+				pass
+		try:
+			p.iren.add_observer("RenderEvent", _bring_front)
+		except Exception:
+			pass
+		p.camera_position = "iso"
+		p.reset_camera()
+		p.show()
+		if len(picked) < 2:
+			return None
+		Minv = np.linalg.inv(M)
+		pb_model = Minv[:3, :3] @ picked[1] + Minv[:3, 3]
+		# 点は「スキャンの縮尺を直す前」の骨モデルの座標で覚える（やり方を切り替えても同じ所を指すように）
+		return (self._ankle_scan_point(self.ankle_bones[ia], picked[0], to_scaled=False),
+		        self._ankle_scan_point(self.ankle_bones[ib], pb_model, to_scaled=False))
+
+	@staticmethod
+	def _sim_overlay_renderer(p):
+		"""骨に隠れない重ね描き用のレンダラ（同じカメラを使う上の層）。ウィンドウに1つだけ作り、みんなで使う。"""
+		import vtk
+		ov = getattr(p, "_frs_overlay", None)
+		if ov is None:
+			rw = p.render_window
+			rw.SetNumberOfLayers(max(2, rw.GetNumberOfLayers()))
+			ov = vtk.vtkRenderer()
+			ov.SetLayer(1)
+			ov.SetActiveCamera(p.renderer.GetActiveCamera())
+			ov.InteractiveOff()
+			rw.AddRenderer(ov)
+			p._frs_overlay = ov
+		return ov
+
+	def _ankle_pairs_extra(self, scene_bones, scene: dict):
+		"""可視化に2点の距離の変化を出す（点・線・左上の数値・右下のグラフ・CSV）。使わないときは None。"""
+		import numpy as np
+		try:
+			if not bool(self.ankle_pairs_show.get()):
+				return None
+		except Exception:
+			return None
+		by_idx = {int(b.get("_idx", -1)): si for si, b in enumerate(scene_bones)}
+		by_name = {str(b.get("name", "")): si for si, b in enumerate(scene_bones)}
+		items = []
+		for ia, pr in self._ankle_pairs_all():
+			if not pr.get("visible", True):
+				continue
+			sa, sb = by_idx.get(ia), by_name.get(str(pr.get("bone_b", "")))
+			if sa is None or sb is None:
+				print(f"[2点の距離] {pr.get('name', '')}: この録画では骨が出ないので表示しません")
+				continue
+			Ta = np.asarray(scene_bones[sa]["poses"], dtype=float)
+			Tb = np.asarray(scene_bones[sb]["poses"], dtype=float)
+			_bb = next((x for x in self.ankle_bones if str(x.get("name", "")) == str(pr.get("bone_b", ""))), {})
+			qa = self._ankle_scan_point(self.ankle_bones[ia], pr["point_a"], to_scaled=True)
+			qb = self._ankle_scan_point(_bb, pr["point_b"], to_scaled=True)
+			pa = np.einsum('nij,j->ni', Ta[:, :3, :3], qa) + Ta[:, :3, 3]
+			pb = np.einsum('nij,j->ni', Tb[:, :3, :3], qb) + Tb[:, :3, 3]
+			dist = np.linalg.norm(pb - pa, axis=1)
+			items.append({"name": str(pr.get("name", "")), "color": str(pr.get("color", "#d62728")),
+			              "pa": pa, "pb": pb, "dist": dist, "chg": dist - dist[0]})
+		if not items:
+			return None
+		times = np.asarray(scene.get("frame_times") or np.arange(len(items[0]["dist"])) / 30.0, dtype=float)
+		scene["_pairs_chart"] = True          # datalog のグラフは、この上に詰める
+		font = self._sim_ligament_font_file()
+		st = {"acts": [], "texts": [], "chart": None, "cur": None, "lo": 0.0, "hi": 1.0}
+
+		def _make(p):
+			import vtk
+			ov = self._sim_overlay_renderer(p)
+			for k, it in enumerate(items):
+				rgb = self._sim_hex_to_rgb01(it["color"])
+				acts = []
+				for key in ("pa", "pb"):
+					src = vtk.vtkSphereSource()
+					src.SetRadius(0.6)
+					src.SetThetaResolution(16)
+					src.SetPhiResolution(16)
+					mp = vtk.vtkPolyDataMapper()
+					mp.SetInputConnection(src.GetOutputPort())
+					a = vtk.vtkActor()
+					a.SetMapper(mp)
+					a.GetProperty().SetColor(*rgb)
+					ov.AddActor(a)
+					acts.append(a)
+				ls = vtk.vtkLineSource()
+				ls.SetPoint1(*it["pa"][0])
+				ls.SetPoint2(*it["pb"][0])
+				lm = vtk.vtkPolyDataMapper()
+				lm.SetInputConnection(ls.GetOutputPort())
+				la = vtk.vtkActor()
+				la.SetMapper(lm)
+				la.GetProperty().SetColor(*rgb)
+				la.GetProperty().SetLineWidth(3)
+				la.GetProperty().LightingOff()
+				ov.AddActor(la)
+				ta = vtk.vtkTextActor()
+				tp = ta.GetTextProperty()
+				tp.SetFontSize(15)
+				tp.SetColor(*rgb)
+				tp.BoldOn()
+				if font:
+					tp.SetFontFamily(vtk.VTK_FONT_FILE)
+					tp.SetFontFile(font)
+				ta.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+				ta.GetPositionCoordinate().SetValue(0.01, 0.95 - 0.04 * k)
+				p.renderer.AddActor2D(ta)
+				st["acts"].append((acts[0], acts[1], ls, la))
+				st["texts"].append(ta)
+			# 右下のグラフ（すべての組を色分けして重ねる）
+			try:
+				ch = pv.Chart2D(size=(0.33, 0.22), loc=(0.66, 0.03), x_label="time [s]",
+				                y_label="distance change [mm]")
+				lo = min(float(np.nanmin(it["chg"])) for it in items)
+				hi = max(float(np.nanmax(it["chg"])) for it in items)
+				if hi - lo < 0.2:
+					mid = (hi + lo) / 2.0
+					lo, hi = mid - 0.1, mid + 0.1
+				for k, it in enumerate(items):
+					ch.line(times, it["chg"], color=it["color"], width=1.6, label=f"#{k + 1}")
+				st["cur"] = ch.line([times[0], times[0]], [lo, hi], color="k", width=1.5)
+				ch.background_color = "white"
+				try:
+					ch.active_background_color = "white"
+					ch.interactive = False
+					ch.x_range = [float(times[0]), float(times[-1])]
+					ch.y_range = [lo, hi]
+				except Exception:
+					pass
+				p.add_chart(ch)
+				st["chart"], st["lo"], st["hi"] = ch, lo, hi
+			except Exception as e:
+				print(f"[2点の距離] グラフの準備に失敗: {e}")
+			_update(0)
+			return _update
+
+		def _update(fi):
+			import vtk
+			fi = int(min(max(int(fi), 0), len(times) - 1))
+			for k, (it, (sa_, sb_, ls, la), ta) in enumerate(zip(items, st["acts"], st["texts"])):
+				for a, key in ((sa_, "pa"), (sb_, "pb")):
+					m = vtk.vtkMatrix4x4()
+					for j in range(3):
+						m.SetElement(j, 3, float(it[key][fi][j]))
+					a.SetUserMatrix(m)
+				ls.SetPoint1(*it["pa"][fi])
+				ls.SetPoint2(*it["pb"][fi])
+				ls.Modified()
+				ta.SetInput(f"#{k + 1} {it['name']}: 距離 {it['dist'][fi]:.2f} mm（変化 {it['chg'][fi]:+.2f} mm）")
+			if st["cur"] is not None:
+				try:
+					t = float(times[fi])
+					st["cur"].update([t, t], [st["lo"], st["hi"]])
+				except Exception:
+					pass
+
+		def _csv():
+			import csv
+			fp = filedialog.asksaveasfilename(parent=self, title="2点の距離の変化を CSV に保存",
+			                                  defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+			                                  initialfile="2点の距離の変化.csv")
+			if not fp:
+				return
+			try:
+				with open(fp, "w", newline="", encoding="utf-8-sig") as f:
+					w = csv.writer(f)
+					hdr = ["time_s", "frame"]
+					for k, it in enumerate(items):
+						hdr += [f"#{k + 1} {it['name']} 距離[mm]", f"#{k + 1} {it['name']} 変化[mm]"]
+					w.writerow(hdr)
+					for fi in range(len(times)):
+						row = [f"{times[fi]:.4f}", fi]
+						for it in items:
+							row += [f"{it['dist'][fi]:.4f}", f"{it['chg'][fi]:.4f}"]
+						w.writerow(row)
+				messagebox.showinfo("2点の距離", f"保存しました（{len(times)} コマ・{len(items)} 組）:\n{fp}", parent=self)
+			except Exception as e:
+				messagebox.showerror("2点の距離", f"保存できませんでした:\n{e}", parent=self)
+
+		scene.setdefault("panel_buttons", []).append(("2点の距離を CSV に保存…", _csv))
+		scene["_pairs_csv"] = _csv
+		print(f"[2点の距離] {len(items)} 組を表示: " + " / ".join(
+			f"{it['name']}（最初 {it['dist'][0]:.2f} mm）" for it in items))
+		return _make
+
+	def _ankle_joint_view_cfg(self, scene_bones):
+		"""「関節面だけ表示」: 関節面モデルを読み、scene の骨に joint_mesh / joint_idx を付ける（2026-10-14）。
+
+		関節面モデルは骨モデル（可視化用フル）の切り抜きなので、骨と同じ姿勢で動かせばよい。
+		ヒートマップは骨全体の距離を、いちばん近い頂点から写す（計算し直しは不要）。
+		「骨片で削る」で削った骨は、削られた所（骨片の部分）の関節面も落とす。
+		"""
+		import numpy as np
+		from scipy.spatial import cKDTree
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		kept = getattr(self, "_ankle_trim_kept", None) or {}
+		memo = getattr(self, "_ankle_joint_memo", None)
+		if not isinstance(memo, dict):
+			memo = self._ankle_joint_memo = {}
+		n = 0
+		for b in scene_bones:
+			idx = int(b.get("_idx", -1))
+			bone = self.ankle_bones[idx] if 0 <= idx < len(self.ankle_bones) else {}
+			path = str(bone.get("joint_model_path", "") or "")
+			if not path:
+				continue
+			try:
+				key = (path, os.path.getmtime(path))
+				if key not in memo:
+					jm = pv.read(path).extract_surface().triangulate().clean()
+					jm.clear_data()
+					memo[key] = jm
+				jm = memo[key].copy()
+				jm = self._ankle_apply_scan_scale_mesh(bone, jm)
+			except Exception as e:
+				print(f"[関節面] {b.get('name', '')}: 関節面モデルを読めませんでした: {e}")
+				continue
+			km = kept.get(idx)
+			if km is not None and getattr(km, "n_points", 0):
+				try:
+					d = np.abs(np.asarray(pv.PolyData(np.asarray(jm.points)).compute_implicit_distance(km)["implicit_distance"]))
+					F = np.asarray(jm.faces).reshape(-1, 4)[:, 1:]
+					keepc = np.all((d < 0.8)[F], axis=1)
+					n0 = jm.n_cells
+					jm = jm.extract_cells(np.where(keepc)[0]).extract_surface()
+					jm.clear_data()
+					print(f"[関節面] {b.get('name', '')}: 骨片で削った所の関節面を落としました（{n0 - jm.n_cells} 面）")
+				except Exception as e:
+					print(f"[関節面] {b.get('name', '')}: 骨片で削った所の関節面を落とせませんでした: {e}")
+			if jm.n_points == 0:
+				continue
+			try:
+				_, ii = cKDTree(np.asarray(b["mesh"].points, dtype=float)).query(np.asarray(jm.points, dtype=float))
+				b["joint_idx"] = np.asarray(ii, dtype=np.int64)
+			except Exception:
+				b["joint_idx"] = None
+			b["joint_mesh"] = jm
+			n += 1
+		if n:
+			print(f"[関節面] 関節面モデルのある骨: {n} 本")
+
+		def _on_change(on):
+			self._ankle_view_write(tab_ref, {"ankle_joint_only": bool(on)})
+
+		try:
+			show = bool(self.ankle_joint_only.get())
+		except Exception:
+			show = False
+		return {"show": show, "on_change": _on_change}
+
+	def _ankle_load_start(self, bones_data, frame_times):
+		"""datalog の Fpd（軸力）が目標に達した最初のコマ。{"s", "t", "target", "off"} か None。
+
+		目標 = Fpd の 99% 点（100 N の試験なら 100 N）。その 97% 以上になった最初の時刻。
+		映像との時刻のずれは、切り出す前の全部の記録で決める（自動で合わせる設定なら、回転の動きを重ねる）。
+		"""
+		import numpy as np
+		try:
+			path = str(self.ankle_robot_log_path.get() or "").strip()
+			if not path or not Path(path).exists():
+				return None
+			log = self._ankle_robot_log_load(path)
+			if "Fpd" not in log["cols"]:
+				return None
+			fpd = np.asarray(log["cols"]["Fpd"], dtype=float)
+			ok = np.isfinite(fpd)
+			if ok.sum() < 10:
+				return None
+			target = float(np.percentile(fpd[ok], 99))
+			if target < 20.0:
+				return None                 # 軸力なしの試験
+			off = float(self.ankle_robot_log_offset_s.get())
+			if bool(self.ankle_robot_log_auto.get()):
+				fx = next((k for k, (idx, nm, m, Ts) in enumerate(bones_data)
+				           if (self.ankle_bones[idx] if idx < len(self.ankle_bones) else {}).get("fixed")), None)
+				cand = [k for k in range(len(bones_data)) if k != fx]
+				want = str(self.ankle_disp_bone.get() or "")
+				mk = next((k for k in cand if str(bones_data[k][1]) == want), None)
+				if mk is None and cand:
+					mk = next((k for k in cand if "脛骨" in str(bones_data[k][1])), cand[0])
+				if fx is not None and mk is not None:
+					try:
+						off, rms = self._ankle_robot_log_sync(log, bones_data[mk][3], list(frame_times))
+						self.ankle_robot_log_offset_s.set(round(off, 2))
+						self._schedule_state_autosave("ankle")
+						print(f"[datalog] 時刻を自動で合わせました: ロボット = 映像 − {off:.2f} 秒（回転の一致 RMS {rms:.2f}°）")
+					except Exception as e:
+						print(f"[datalog] 自動の時刻合わせに失敗（⑤の値 {off:.2f} 秒を使います）: {e}")
+			hit = np.where(ok & (fpd >= 0.97 * target))[0]
+			if len(hit) == 0:
+				return None
+			t_video = float(log["t"][hit[0]]) + off           # ロボットの時刻 = 映像の時刻 − ずれ
+			ft = np.asarray(frame_times, dtype=float)
+			if not (ft[0] <= t_video <= ft[-1]):
+				return None
+			s0 = int(np.searchsorted(ft, t_video))
+			return {"s": min(s0, len(ft) - 2), "t": float(ft[min(s0, len(ft) - 2)]), "target": target, "off": off}
+		except Exception as e:
+			print(f"[軸力から始める] 開始のコマを決められません: {e}")
+			return None
+
+	def _ankle_start_at_load_cfg(self, load_start, t_shift):
+		"""再生コントロールの「Fpd が … に達した時点を 0 として始める」。切り替えると可視化を開き直す。"""
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		try:
+			on = bool(self.ankle_start_at_load.get())
+		except Exception:
+			on = True
+		if load_start is not None:
+			label = (f"Fpd が {load_start['target']:.0f} N に達した時点を 0 として始める"
+			         + (f"（いまは映像の {t_shift:.1f} 秒から）" if on and t_shift > 0 else
+			            f"（映像の {load_start['t']:.1f} 秒）"))
+		else:
+			label = "Fpd（軸力）が目標に達した時点を 0 として始める（datalog に軸力が無いので使えません）"
+
+		def _toggle(v):
+			self._ankle_view_write(tab_ref, {"ankle_start_at_load": bool(v)})
+			try:
+				if tab_ref is not None and tab_ref is not self._ankle_active_tab_dict():
+					j = next((j for j, t in enumerate(self._ankle_tabs) if t is tab_ref), None)
+					if j is not None:
+						self.on_ankle_tab_select(j)
+				self.ankle_start_at_load.set(bool(v))
+			except Exception:
+				pass
+			self.on_ankle_animate()          # 開き直す（接触の結果は保存済みのものを使う）
+
+		return {"available": load_start is not None, "show": on and load_start is not None,
+		        "label": label, "on_toggle": _toggle}
+
+	def _ankle_views_path(self):
+		return Path(__file__).parent / "cache" / "ankle_saved_views.json"
+
+	def _ankle_views_cfg(self, scene_bones):
+		"""再生コントロールの「視点」: 名前を付けて保存した視点（カメラ）を読み書きする（2026-10-15）。
+		保存先は cache/ankle_saved_views.json の、骨リストの共有（無ければタブ）ごとの一覧。"""
+		import json
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		gid = self._ankle_tab_group(tab_ref) if isinstance(tab_ref, dict) else None
+		key = f"group:{gid}" if gid else f"tab:{(tab_ref or {}).get('name', '')}"
+		fixed = next((str(b.get("name", "")) for b in scene_bones
+		              if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), "")
+		path = self._ankle_views_path()
+
+		def _all():
+			try:
+				d = json.loads(path.read_text(encoding="utf-8"))
+				return d if isinstance(d, dict) else {}
+			except Exception:
+				return {}
+
+		def _load():
+			v = _all().get(key)
+			return [x for x in v if isinstance(x, dict) and x.get("name") and x.get("cam")] if isinstance(v, list) else []
+
+		def _save(items):
+			d = _all()
+			d[key] = items
+			try:
+				path.parent.mkdir(parents=True, exist_ok=True)
+				tmp = path.with_name(path.stem + ".tmp.json")
+				tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+				os.replace(str(tmp), str(path))
+			except Exception as e:
+				print(f"[視点] 保存に失敗: {e}")
+
+		return {"load": _load, "save": _save, "fixed": fixed}
+
+	def _ankle_fix_select_cfg(self, scene_bones):
+		"""再生コントロールの「固定する骨」。変えると ③の骨リストの「固定」を書き換えて、可視化を開き直す（2026-10-15）。"""
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		NONE = "（固定しない）"
+		opts = [NONE] + [str(b.get("name", "")) for b in scene_bones]
+		cur = next((str(b.get("name", "")) for b in scene_bones
+		            if (self.ankle_bones[b["_idx"]] if b["_idx"] < len(self.ankle_bones) else {}).get("fixed")), NONE)
+
+		def _change(name):
+			try:
+				if tab_ref is not None and tab_ref is not self._ankle_active_tab_dict():
+					j = next((j for j, t in enumerate(self._ankle_tabs) if t is tab_ref), None)
+					if j is not None:
+						self.on_ankle_tab_select(j)
+				for b in self.ankle_bones:
+					b["fixed"] = (name != NONE and str(b.get("name", "")) == name)
+				print(f"[骨固定] 再生コントロールから: {name}")
+				self._ankle_refresh_bone_listbox()
+				self._ankle_refresh_fix_status()
+				self._schedule_state_autosave("ankle")
+			except Exception as e:
+				print(f"[骨固定] 変更に失敗: {e}")
+				return
+			self.on_ankle_animate()          # 開き直す（接触の結果は保存済みのものを使う）
+
+		return {"options": opts, "current": cur, "on_change": _change}
+
+	def _ankle_overlay_cfg(self):
+		"""右上の数字（骨A→B の相対姿勢）の表示・非表示（再生コントロールで切り替え。タブと共有に覚える）。"""
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+
+		def _on_change(on):
+			self._ankle_view_write(tab_ref, {"ankle_overlay_show": bool(on)})
+
+		try:
+			show = bool(self.ankle_overlay_show.get())
+		except Exception:
+			show = True
+		return {"show": show, "on_change": _on_change}
+
+	_ANKLE_ALT_FAR_MM = 0.3      # 表示変更用モデルで、元の表面からこれより離れた所（埋めた穴など）は色を付けない
+
+	def _ankle_alt_model_cfg(self, scene_bones):
+		"""表示変更用モデル（臨時。2026-10-15）: 読み込んで、scene の骨に alt_mesh / alt_idx / alt_far を付ける。
+
+		ヒートマップは計算に使ったモデル（scene の骨の mesh）の点ごとにあるので、表示変更用モデルの各点には
+		いちばん近い点の値を写す。元の表面から _ANKLE_ALT_FAR_MM より離れた点（埋めた穴など）は色を付けない。
+		"""
+		import numpy as np
+		from scipy.spatial import cKDTree
+		tabs = getattr(self, "_ankle_tabs", None) or []
+		ai = int(getattr(self, "_ankle_active_tab", 0) or 0)
+		tab_ref = tabs[ai] if 0 <= ai < len(tabs) else None
+		memo = getattr(self, "_ankle_alt_memo", None)
+		if not isinstance(memo, dict):
+			memo = self._ankle_alt_memo = {}
+		n = 0
+		for b in scene_bones:
+			idx = int(b.get("_idx", -1))
+			bone = self.ankle_bones[idx] if 0 <= idx < len(self.ankle_bones) else {}
+			path = str(bone.get("display_model_path", "") or "")
+			if not path:
+				continue
+			try:
+				key = (path, os.path.getmtime(path))
+				if key not in memo:
+					am = pv.read(path).extract_surface().triangulate().clean()
+					am.clear_data()
+					memo[key] = am
+				am = memo[key].copy()
+				am = self._ankle_apply_scan_scale_mesh(bone, am)
+			except Exception as e:
+				print(f"[表示変更用モデル] {b.get('name', '')}: 読めませんでした: {e}")
+				continue
+			if am.n_points == 0:
+				continue
+			try:
+				src = b["mesh"]
+				P = np.asarray(am.points, dtype=float)
+				_, ii = cKDTree(np.asarray(src.points, dtype=float)).query(P)
+				surf = src.extract_surface().triangulate() if not isinstance(src, pv.PolyData) else src.triangulate()
+				dd = np.abs(np.asarray(pv.PolyData(P).compute_implicit_distance(surf)["implicit_distance"]))
+				b["alt_idx"] = np.asarray(ii, dtype=np.int64)
+				b["alt_far"] = dd > self._ANKLE_ALT_FAR_MM
+			except Exception as e:
+				print(f"[表示変更用モデル] {b.get('name', '')}: ヒートマップの対応づけに失敗: {e}")
+				b["alt_idx"], b["alt_far"] = None, None
+			b["alt_mesh"] = am
+			n += 1
+			try:
+				print(f"[表示変更用モデル] {b.get('name', '')}: {am.n_points:,} 点（元の表面から {self._ANKLE_ALT_FAR_MM} mm より"
+				      f"離れた点 {int(np.sum(b['alt_far']))} 点は色を付けません）")
+			except Exception:
+				pass
+
+		def _on_change(on):
+			self._ankle_view_write(tab_ref, {"ankle_alt_model": bool(on)})
+
+		try:
+			show = bool(self.ankle_alt_model.get())
+		except Exception:
+			show = False
+		return {"show": show, "on_change": _on_change}
+
 	def _ankle_bone_style_cfg(self, scene_bones):
 		"""再生コントロールの「骨の表示」で変えた色・透明度を、試験タブの骨に保存する仕掛け。"""
 		tabs = getattr(self, "_ankle_tabs", None) or []
@@ -15903,6 +19933,7 @@ class MainMenuGUI(_BaseWindow):
 					continue
 				items.append({"name": str(it.get("name", "")), "color": str(it.get("color", "#FF8800")),
 				              "radius": float(it.get("radius", 1.5)), "visible": bool(it.get("visible", True)),
+				              "chart": bool(it.get("chart", True)),
 				              "a": {"bone": sa, "point": pa}, "b": {"bone": sb, "point": pb}})
 			except Exception:
 				unresolved.append(it)
@@ -15917,7 +19948,8 @@ class MainMenuGUI(_BaseWindow):
 					             "model": _model_of(b.get("_idx", -1)),
 					             "point": [float(v) for v in it[key]["point"]]}
 				out.append({"name": it["name"], "color": it["color"], "radius": float(it["radius"]),
-				            "visible": bool(it["visible"]), "a": ends["a"], "b": ends["b"]})
+				            "visible": bool(it["visible"]), "chart": bool(it.get("chart", True)),
+				            "a": ends["a"], "b": ends["b"]})
 			out.extend(copy.deepcopy(unresolved))   # 対応が取れなかった分も消さずに残す
 			self._ankle_store_ligaments(tab_ref, out)
 
@@ -15926,7 +19958,8 @@ class MainMenuGUI(_BaseWindow):
 			note = (f"※ 骨が見つからない靭帯が {len(unresolved)} 本あります。"
 			        "表示はしていませんが、保存データには残しています（骨名を元に戻すと表示されます）。")
 		return {"items": items, "on_change": _on_change, "note": note,
-		        "title": (f"靭帯管理 — {tab_name}" if tab_name else "靭帯管理")}
+		        "title": (f"靭帯管理 — {tab_name}" if tab_name else "靭帯管理"),
+		        "on_compare": lambda: self.after(10, self._ankle_open_lig_compare)}
 
 	def _ankle_store_ligaments(self, tab_ref, items):
 		"""靭帯を、シミュレーションを開いたときの試験タブへ保存する。
@@ -15957,7 +19990,8 @@ class MainMenuGUI(_BaseWindow):
 	# 鍵 = 計算に実際に入る中身（各骨の元メッシュと、骨固定前の全フレームの姿勢）と簡略化の点数。
 	# キャリブ・④の検出・平滑化・骨リストのどれが変わっても鍵が変わるので、古い結果は使われない。
 	# 値は 0.01 mm 刻みの int16（±300 mm で打ち切り）。表示（-10〜0 mm の色・最小距離）には影響しない。
-	_ANKLE_HM_VERSION = "hm2"   # hm2: 2026-10-09 距離の向きの不具合を修正（hm1 の保存結果は使わない）
+	_ANKLE_HM_VERSION = "hm3"   # hm2: 2026-10-09 距離の向きの不具合を修正（hm1 の保存結果は使わない）
+	                            # hm3: 2026-10-14 偽のめり込み（光線が穴を抜ける）を面の向きで確かめ直す
 
 	def _ankle_heatmap_dir(self):
 		d = Path(__file__).parent / "cache" / "ankle_heatmap"
@@ -15981,6 +20015,299 @@ class MainMenuGUI(_BaseWindow):
 
 	def _ankle_heatmap_path(self, key: str):
 		return self._ankle_heatmap_dir() / f"hm_{key[:24]}.npz"
+
+	# 「まとめて解析」の一覧で、接触の計算が いまの設定で済んでいるかを、骨のモデルを読まずに
+	# 見分けるための記録（2026-10-14）。保存した結果の鍵は骨のメッシュと姿勢から作るので、一覧を
+	# 開くたびに作るのは重い。代わりに、計算に効く設定の要約（指紋）をタブごとに index.json へ残し、
+	# 一覧ではタブのいまの設定の指紋と比べる。指紋が違っても害はない（計算すると「保存済み」で省かれる）。
+	def _ankle_hm_fingerprint(self, snap, bones, cache) -> str:
+		import hashlib
+		import json
+		import numpy as np
+		snap = snap or {}
+		cache = cache or {}
+		h = hashlib.md5()
+
+		def _u(x):
+			h.update((str(x) + "|").encode("utf-8"))
+
+		_u(self._ANKLE_HM_VERSION)
+		_u(Path(str(cache.get("source", "") or "")).name)
+		_u(int(cache.get("frame_count", 0) or 0))
+		for v in (cache.get("marker_size_mm"), snap.get("ankle_marker_size_mm")):
+			try:
+				_u(f"{float(v):.4f}")
+			except Exception:
+				_u(v)
+		for k in ("ankle_scale_mode", "ankle_scan_scale_common", "ankle_self_pose_world",
+		          "ankle_ref_frame", "ankle_workflow_mode"):
+			_u(snap.get(k))
+		for var in ("ankle_smooth_enable", "ankle_smooth_cutoff_hz", "ankle_reject_outliers"):
+			try:
+				_u(getattr(self, var).get())
+			except Exception:
+				_u(None)
+		for b in (bones or []):
+			if not isinstance(b, dict):
+				continue
+			_u(b.get("name"))
+			_u(b.get("aruco_id"))
+			mp = str(b.get("model_path", "") or "")
+			_u(mp)
+			try:
+				st = os.stat(mp)
+				_u(f"{int(st.st_mtime)}:{st.st_size}")
+			except Exception:
+				_u("nofile")
+			T = b.get("marker_to_bone_T")
+			_u(None if T is None else np.round(np.asarray(T, dtype=float), 6).tolist())
+			_u(json.dumps(b.get("trim_fragments"), sort_keys=True, ensure_ascii=False, default=str))
+			_u(json.dumps(b.get("scan_scale"), sort_keys=True, ensure_ascii=False, default=str))
+		return h.hexdigest()
+
+	def _ankle_hm_index_path(self):
+		return self._ankle_heatmap_dir() / "index.json"
+
+	_ANKLE_HM_KEEP_PER_TAB = 3     # タブごとに残す接触の結果の数（補正後の値を戻したとき、計算し直さずに済むように）
+
+	def _ankle_hm_index(self) -> dict:
+		"""{タブ名: [記録, ...]}（新しく使った順）。記録 = {file, fp, time, used, N, target_verts, size_mm, basis}。"""
+		import json
+		try:
+			d = json.loads(self._ankle_hm_index_path().read_text(encoding="utf-8"))
+		except Exception:
+			return {}
+		if not isinstance(d, dict):
+			return {}
+		out = {}
+		for k, v in d.items():
+			if isinstance(v, dict):          # 2026-10-14 夜の形（1タブ1つ）
+				v = [v]
+			if isinstance(v, list):
+				out[str(k)] = [e for e in v if isinstance(e, dict) and e.get("file")]
+		return out
+
+	def _ankle_hm_index_write(self, d) -> None:
+		import json
+		p = self._ankle_hm_index_path()
+		tmp = p.with_name("index.tmp.json")
+		tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+		os.replace(str(tmp), str(p))
+
+	def _ankle_hm_tab_ctx(self, tab):
+		"""(スナップショット（共有の view を重ねたもの）, 骨リスト, ④の結果)。開いているタブは画面の値。"""
+		if tab is not None and tab is self._ankle_active_tab_dict():
+			return self._ankle_snapshot_current(), self.ankle_bones, self._ankle_get_current_cache()
+		name = str((tab or {}).get("name", ""))
+		snap = dict((tab or {}).get("snapshot") or {})
+		gid = self._ankle_tab_group(tab)
+		bones = snap.get("_bones") or []
+		if gid:
+			grp = self._ankle_bone_groups_dict()[gid]
+			bones = grp.get("bones") or bones
+			if isinstance(grp.get("view"), dict):
+				snap.update(grp["view"])
+		return snap, bones, self._ankle_pose_cache.get(name)
+
+	def _ankle_hm_sizes_ready(self, tab) -> list:
+		"""補正後の値をそれにすれば、計算し直さずに接触を表示できる記録: [(値mm, 記録), ...]（値ごとに新しい方）。
+		補正後の値以外の設定（キャリブ・骨のモデルなど）が、計算したときと同じものだけ。"""
+		name = str((tab or {}).get("name", ""))
+		ents = self._ankle_hm_index().get(name) or []
+		if not ents:
+			return []
+		snap, bones, cache = self._ankle_hm_tab_ctx(tab)
+		out, seen = [], set()
+		for e in ents:
+			try:
+				sz = float(e.get("size_mm"))
+			except Exception:
+				continue
+			if round(sz, 4) in seen or not (self._ankle_heatmap_dir() / str(e.get("file", ""))).exists():
+				continue
+			sn = dict(snap)
+			sn["ankle_marker_size_mm"] = sz
+			if e.get("fp") == self._ankle_hm_fingerprint(sn, bones, cache):
+				out.append((sz, e))
+				seen.add(round(sz, 4))
+		return out
+
+	def _ankle_hm_index_record(self, key, target_verts, N, fresh: bool = False) -> None:
+		"""いま開いているタブの接触の結果を、いまの設定の指紋と一緒に index.json に記録する。
+		fresh=True: いま計算して保存した（日時を新しくする）。False: 保存済みを使った（日時はそのまま）。"""
+		import json
+		import time as _t
+		try:
+			tab = self._ankle_current_tab_key()
+			if not tab:
+				return
+			snap = self._ankle_snapshot_current()
+			fp = self._ankle_hm_fingerprint(snap, self.ankle_bones, self._ankle_get_current_cache())
+			fname = self._ankle_heatmap_path(key).name
+			d = self._ankle_hm_index()
+			ents = d.get(tab) or []
+			old = next((e for e in ents if e.get("file") == fname), None)
+			now = _t.strftime("%Y-%m-%d %H:%M:%S")
+			try:
+				size = float(snap.get("ankle_marker_size_mm"))
+			except Exception:
+				size = None
+			ent = {"file": fname, "fp": fp, "N": int(N), "target_verts": int(target_verts),
+			       "time": (old.get("time") if (old and not fresh and old.get("time")) else now),
+			       "used": now, "size_mm": size,
+			       "basis": str(snap.get("ankle_marker_size_basis", "") or "")}
+			if old is not None and not fresh and old.get("fp") == fp and ents and ents[0] is old:
+				return                         # いちばん新しい記録のまま（書き直し不要）
+			d[tab] = [ent] + [e for e in ents if e.get("file") != fname]
+			self._ankle_hm_index_write(d)
+			try:
+				self.after(50, self._ankle_refresh_hm_sizes)
+			except Exception:
+				pass
+		except Exception as e:
+			print(f"[接触の保存結果] 一覧への記録に失敗: {e}")
+
+	def _ankle_hm_prune(self, tab_name, target_verts) -> None:
+		"""タブごとに、新しく使った順で _ANKLE_HM_KEEP_PER_TAB 個まで残し、ほかは消す（ほかのタブが使っているものは残す）。"""
+		import json
+		import numpy as np
+		try:
+			d = self._ankle_hm_index()
+			ents = d.get(tab_name) or []
+			keep_ents = ents[:self._ANKLE_HM_KEEP_PER_TAB]
+			drop = {e.get("file") for e in ents[self._ANKLE_HM_KEEP_PER_TAB:]}
+			if len(keep_ents) != len(ents):
+				d[tab_name] = keep_ents
+				self._ankle_hm_index_write(d)
+			in_use = {e.get("file") for es in d.values() for e in es}
+			for f in self._ankle_heatmap_dir().glob("hm_*.npz"):
+				if f.name.endswith(".tmp.npz") or f.name in in_use:
+					continue
+				if f.name not in drop:
+					# 一覧（index）に載っていない古い結果: 同じタブ・同じ細かさなら消す（以前のやり方）
+					try:
+						with np.load(str(f), allow_pickle=False) as z:
+							m = json.loads(str(z["meta_json"]))
+						if not (m.get("tab") == tab_name and int(m.get("target_verts", -1)) == int(target_verts)):
+							continue
+					except Exception:
+						continue
+				try:
+					f.unlink()
+				except Exception:
+					pass
+		except Exception as e:
+			print(f"[接触の保存結果] 古い結果の整理に失敗: {e}")
+
+	def _ankle_refresh_hm_sizes(self) -> None:
+		"""②の「補正後」の下: この値なら接触は計算済み（押すとその値に戻す）。"""
+		fr = getattr(self, "_ankle_hm_sizes_fr", None)
+		if fr is None:
+			return
+		self._ankle_hm_sizes_job = None
+		try:
+			for w in fr.winfo_children():
+				w.destroy()
+		except Exception:
+			return
+		try:
+			tab = self._ankle_active_tab_dict()
+			ready = self._ankle_hm_sizes_ready(tab) if tab is not None else []
+		except Exception as e:
+			print(f"[接触の保存結果] 計算済みの値を調べられません: {e}")
+			ready = []
+		try:
+			cur = float(self.ankle_marker_size_mm.get())
+		except Exception:
+			cur = None
+		if not ready:
+			ttk.Label(fr, text="接触（ヒートマップ）: いまの設定で計算済みの値はありません",
+			          foreground="gray", font=(self.ui_font_family, 8)).pack(side=tk.LEFT)
+			return
+		ttk.Label(fr, text="接触（ヒートマップ）計算済み:", foreground="#1b5e20",
+		          font=(self.ui_font_family, 9)).pack(side=tk.LEFT)
+		for sz, e in ready:
+			tm = str(e.get("time", ""))[5:16].replace("-", "/")
+			if cur is not None and abs(cur - sz) < 5e-5:
+				ttk.Label(fr, text=f"{sz:g} mm（{tm}）← いまの値", foreground="#1b5e20",
+				          font=(self.ui_font_family, 9, "bold")).pack(side=tk.LEFT, padx=(6, 0))
+			else:
+				ttk.Button(fr, text=f"{sz:g} mm（{tm}）にする",
+				           command=lambda v=sz, b=str(e.get("basis", "") or ""): self._ankle_use_hm_size(v, b)
+				           ).pack(side=tk.LEFT, padx=(6, 0))
+
+	def _ankle_schedule_hm_sizes(self) -> None:
+		job = getattr(self, "_ankle_hm_sizes_job", None)
+		if job is not None:
+			try:
+				self.after_cancel(job)
+			except Exception:
+				pass
+		try:
+			self._ankle_hm_sizes_job = self.after(400, self._ankle_refresh_hm_sizes)
+		except Exception:
+			self._ankle_hm_sizes_job = None
+
+	def _ankle_use_hm_size(self, v: float, basis: str = "") -> None:
+		"""接触を計算済みの値に「補正後」を戻す（手動。由来も、そのとき の ものに戻す）。"""
+		self.ankle_marker_size_auto.set(False)
+		self.ankle_marker_size_mm.set(float(v))
+		self.ankle_marker_size_basis.set(str(basis or ""))
+		self._ankle_size_refresh_auto()
+		self._schedule_state_autosave("ankle")
+		self._ankle_schedule_hm_sizes()
+		print(f"[マーカー実寸] 補正後を {v:g} mm（接触を計算済みの値）にしました")
+
+	def _ankle_hm_status_for_tab(self, tab, legacy=None) -> tuple:
+		"""「まとめて解析」の一覧の「接触の計算」欄: (文字, 色, 済んでいるか)。"""
+		name = str((tab or {}).get("name", ""))
+		snap = dict((tab or {}).get("snapshot") or {})
+		gid = self._ankle_tab_group(tab)
+		bones = snap.get("_bones") or []
+		if gid:
+			grp = self._ankle_bone_groups_dict()[gid]
+			bones = grp.get("bones") or bones
+			if isinstance(grp.get("view"), dict):
+				snap.update(grp["view"])
+		cache = self._ankle_pose_cache.get(name)
+		n_b = sum(1 for b in bones if isinstance(b, dict) and b.get("model_path") and b.get("marker_to_bone_T") is not None)
+		if n_b < 2:
+			return "—（骨が2本未満）", "#888888", True
+		if not cache:
+			return "未計算（④がまだ）", "#666666", False
+		ents = [e for e in (self._ankle_hm_index().get(name) or [])
+		        if (self._ankle_heatmap_dir() / str(e.get("file", ""))).exists()]
+		if ents:
+			fp = self._ankle_hm_fingerprint(snap, bones, cache)
+			hit = next((e for e in ents if e.get("fp") == fp), None)
+			if hit is not None:
+				return f"計算済み {str(hit.get('time', ''))[5:16].replace('-', '/')}", "#1b5e20", True
+			tm = str(ents[0].get("time", ""))[5:16].replace("-", "/")
+			return f"要計算（設定が変わった・前回 {tm[:5]}）", "#b35900", False
+		if legacy and name in legacy:
+			return f"保存あり {legacy[name][:5]}（いまの設定か未確認）", "#8a6d00", False
+		return "未計算", "#c62828", False
+
+	def _ankle_hm_legacy_tabs(self) -> dict:
+		"""index.json より前の保存結果: {タブ名: 'MM/DD HH:MM'}（ファイルの見出しだけ読む）。"""
+		import json
+		import numpy as np
+		out = {}
+		try:
+			for f in self._ankle_heatmap_dir().glob("hm_*.npz"):
+				if f.name.endswith(".tmp.npz"):
+					continue
+				try:
+					with np.load(str(f), allow_pickle=False) as z:
+						m = json.loads(str(z["meta_json"]))
+					if m.get("version") != self._ANKLE_HM_VERSION:
+						continue
+					out[str(m.get("tab", ""))] = str(m.get("created", ""))[5:16].replace("-", "/")
+				except Exception:
+					continue
+		except Exception:
+			pass
+		return out
 
 	def _ankle_heatmap_cache_save(self, key, heatmap_data, bones_data, target_verts) -> None:
 		"""計算結果を保存する（一時ファイルに書き切ってから差し替える。途中で落ちても前の保存は残る）。"""
@@ -16013,17 +20340,10 @@ class MainMenuGUI(_BaseWindow):
 			os.replace(str(tmp), str(path))
 			mb = path.stat().st_size / 1e6
 			self._ankle_safe_print(f"[接触の保存結果] 保存しました: {path.name}（{mb:.0f} MB）")
-			# 同じタブ・同じ細かさの古い結果は消す（条件を変えるたびに溜まらないように）
-			for f in self._ankle_heatmap_dir().glob("hm_*.npz"):
-				if f == path or f.name.endswith(".tmp.npz"):
-					continue
-				try:
-					with np.load(str(f), allow_pickle=False) as z:
-						m = json.loads(str(z["meta_json"]))
-					if m.get("tab") == meta["tab"] and int(m.get("target_verts", -1)) == int(target_verts):
-						f.unlink()
-				except Exception:
-					continue
+			self._ankle_hm_index_record(key, target_verts, N, fresh=True)
+			# 古い結果は、タブごとに新しく使った順で数を超えた分だけ消す（2026-10-15 から。以前は毎回1つだけ残していた）。
+			# 「補正後」を前の値に戻したとき、計算し直さずに表示できるように
+			self._ankle_hm_prune(meta["tab"], target_verts)
 		except Exception as e:
 			print(f"[接触の保存結果] 保存に失敗: {e}")
 
@@ -16183,6 +20503,14 @@ class MainMenuGUI(_BaseWindow):
 
 		# --- 2. 骨ごとに W系姿勢時系列を構築 ---
 		animatable, N, warns = self._ankle_build_bone_transforms(cache)
+		# 骨片つきでスキャンした骨は、最初のコマの位置で骨片と重なる部分を削る（③の設定。2026-10-13）
+		trim_notes = []
+		if animatable:
+			try:
+				animatable, trim_notes = self._ankle_apply_fragment_trim(animatable, cache)
+			except Exception as e:
+				print(f"[骨片で削る] 失敗（削らずに続けます）: {e}")
+				traceback.print_exc()
 		if not animatable:
 			if heatmap_only:
 				return {"status": "error", "msg": "アニメ可能な骨がありません: " + " / ".join(warns[:3])}
@@ -16546,6 +20874,7 @@ class MainMenuGUI(_BaseWindow):
 				if _hit is not None:
 					bones_data, heatmap_data = _hit
 					hm_from_cache = True
+					self._ankle_hm_index_record(self._ankle_heatmap_key(_bones_for_key, _tv), _tv, N)
 					self._ankle_safe_print(
 						f"[接触の保存結果] 保存済みの結果を使います（計算を省略・メッシュ {_tv:,} 点）")
 					break
@@ -16612,6 +20941,34 @@ class MainMenuGUI(_BaseWindow):
 				progress_window.destroy()
 			except Exception:
 				pass
+
+		# --- 3b. 軸力（Fpd）が目標に達した時点から始める（2026-10-15。再生コントロールで切り替え） ---
+		# 接触の結果・姿勢は全コマで計算・保存したまま、表示だけをその時点から後ろに切り出し、時刻を 0 から付け直す。
+		# 右のグラフ・移動量・2点の距離も、その時点を基準にする。datalog の時刻のずれは切り出す前の全部で決める。
+		load_start = None
+		mk_shift = 0
+		t_shift = 0.0
+		log_off_fixed = None
+		try:
+			load_start = self._ankle_load_start(bones_data, frame_times)
+		except Exception as e:
+			print(f"[軸力から始める] 失敗: {e}")
+		if load_start is not None:
+			log_off_fixed = load_start["off"]
+		try:
+			_sal_on = bool(self.ankle_start_at_load.get())
+		except Exception:
+			_sal_on = True
+		if load_start is not None and _sal_on and load_start["s"] > 0:
+			s0 = int(load_start["s"])
+			mk_shift = s0
+			t_shift = float(frame_times[s0])
+			bones_data = [(idx, name, mesh_L, np.asarray(Ts)[s0:]) for (idx, name, mesh_L, Ts) in bones_data]
+			if heatmap_data:
+				heatmap_data = heatmap_data[s0:]
+			frame_times = [float(t) - t_shift for t in frame_times[s0:]]
+			N = len(frame_times)
+			print(f"[軸力から始める] Fpd が {load_start['target']:.0f} N に達した 映像 {t_shift:.2f} 秒（コマ {s0}）を 0 として始めます")
 
 		# --- 4. シーンを組み立てて統合エンジンへ渡す ---
 		# ここから先の描画・再生・UI は hip / knee と共通の _sim_engine_run が担う。
@@ -16706,9 +21063,9 @@ class MainMenuGUI(_BaseWindow):
 				for si, (aid, acts) in mk_actors.items():
 					try:
 						poses_C = np.asarray(cache_bones_mk[aid]["poses"], dtype=float)
-						if fi >= len(poses_C):
+						if fi + mk_shift >= len(poses_C):
 							continue
-						T = poses_C[fi]
+						T = poses_C[fi + mk_shift]          # 軸力から始めるときは、切り出した分ずらす
 						m = vtk.vtkMatrix4x4()
 						for i in range(4):
 							for j in range(4):
@@ -16762,18 +21119,30 @@ class MainMenuGUI(_BaseWindow):
 		except Exception:
 			_tn = ""
 		scene = {
-			"window_title": (f"ankle: {_tn}" if _tn else "ankle: シミュレーション"),
+			"window_title": ((f"ankle: {_tn}" if _tn else "ankle: シミュレーション")
+			                 + (f"（Fpd {load_start['target']:.0f}N から）" if t_shift > 0 and load_start else "")
+			                 + ("（骨片で削った骨あり）" if any("を削りました" in n for n in trim_notes) else "")),
 			"bones": scene_bones,
 			"frame_times": frame_times,
 			"heatmap": {"enabled": heatmap_enabled, **self._ankle_hm_scene_cfg(),
 			             "title": "distance [mm]"},
 			"background_meshes": background,
 			"overlay_text": _overlay,
+			"overlay_cfg": self._ankle_overlay_cfg(),
+			"_t_shift": t_shift,                    # 軸力から始めたときの、もとの映像の時刻
+			"_log_offset": log_off_fixed,           # datalog の時刻のずれ（切り出す前の全部で決めたもの）
+			"start_at_load": self._ankle_start_at_load_cfg(load_start, t_shift),
+			"fix_select": self._ankle_fix_select_cfg(scene_bones),
+			"view_store": self._ankle_views_cfg(scene_bones),
+			# 色の帯は左下へ（右側の datalog・2点の距離のグラフ（x 0.66〜）と重ならないように。2026-10-15）
+			"scalar_bar_pos": {"position_x": 0.05, "position_y": 0.03, "width": 0.55, "height": 0.06},
 			"extra_actors": None,      # 下で、マーカー軸と方眼紙をまとめて入れる
 			"on_csv_export": (_cb_csv_export if heatmap_enabled else None),
 			"features": {"csv": heatmap_enabled, "export_model": True, "screenshot": True},
 			"ligaments": self._ankle_ligament_scene_cfg(scene_bones),
 			"bone_style": self._ankle_bone_style_cfg(scene_bones),
+			"joint_view": self._ankle_joint_view_cfg(scene_bones),
+			"alt_model": self._ankle_alt_model_cfg(scene_bones),
 		}
 		# 追加描画: マーカー軸 + 方眼紙・移動量（どちらも毎コマ更新する）
 		_grid_make = None
@@ -16783,16 +21152,24 @@ class MainMenuGUI(_BaseWindow):
 			print(f"[方眼紙] 準備に失敗: {e}")
 			traceback.print_exc()
 
-		_log_make = None
+		# 右のグラフ（靭帯の長さ・膝蓋骨・datalog）は まとめ役が並べる（再生コントロールのチェックで選ぶ。2026-10-15）
+		_charts_make = None
 		try:
-			_log_make = self._ankle_robot_log_extra(scene_bones, scene)
+			_charts_make = self._ankle_side_charts_extra(scene_bones, scene, scene.get("ligaments"))
 		except Exception as e:
-			print(f"[datalog] 準備に失敗: {e}")
+			print(f"[右のグラフ] 準備に失敗: {e}")
+			traceback.print_exc()
+
+		_pairs_make = None
+		try:
+			_pairs_make = self._ankle_pairs_extra(scene_bones, scene)
+		except Exception as e:
+			print(f"[2点の距離] 準備に失敗: {e}")
 			traceback.print_exc()
 
 		def _extra_all(plotter):
 			ups = []
-			for mk in (_make_marker_actors, _grid_make, _log_make):
+			for mk in (_make_marker_actors, _grid_make, _pairs_make, _charts_make):
 				if mk is None:
 					continue
 				try:
@@ -17228,6 +21605,186 @@ class MainMenuGUI(_BaseWindow):
 				      "(暗いと露光が伸びてモーションブラーが乗ります)")
 		except Exception as e:
 			print(f"[ankle rs] カラー露光設定エラー: {e}")
+
+	# ==================================================================
+	# 座標系だけの映像（白背景・録画と同じ視点）（2026-10-13）
+	# ==================================================================
+	# _aruco.mp4 は録画中にその場で検出して軸を描いた映像。こちらは④の姿勢（カメラから見た各マーカーの
+	# 位置と向き T_C←Mk）を、録画と同じカメラの内部パラメータ（ゆがみ込み）で白い画面に投影して描き直す。
+	# 背景を消すのではなく姿勢から描くので、視点は録画と同じになり、④の結果そのものを見ることになる。
+	# 長さ・太さ・色は _aruco.mp4 と同じ（軸の長さ = 実寸 × 0.7、x 赤・y 緑・z 青）。
+	def on_ankle_export_axes_video(self) -> None:
+		"""いまのタブの④の結果から、座標系だけの映像（mp4・白背景・録画と同じ視点）を書き出す。"""
+		import numpy as np
+		import ast
+		try:
+			import cv2
+		except Exception as e:
+			messagebox.showerror("座標系の映像", f"OpenCV を読み込めませんでした:\n{e}", parent=self)
+			return
+		if getattr(self, "_ankle_axes_export_busy", False):
+			messagebox.showinfo("座標系の映像", "いま書き出し中です。終わるまでお待ちください。", parent=self)
+			return
+		cache = self._ankle_get_current_cache()
+		if not cache or not cache.get("bones"):
+			messagebox.showinfo("座標系の映像", "このタブには④の結果（姿勢時系列）がありません。\n"
+			                    "先に④の「ArUco検出+PnP実行」をしてください。", parent=self)
+			return
+		intr = cache.get("intrinsics")
+		if isinstance(intr, str):
+			try:
+				intr = ast.literal_eval(intr)
+			except Exception:
+				intr = None
+		if not isinstance(intr, dict) or not all(k in intr for k in ("fx", "fy", "cx", "cy")):
+			messagebox.showinfo("座標系の映像", "④の結果にカメラの内部パラメータが記録されていません"
+			                    "（古い④の結果です）。④をやり直してください。", parent=self)
+			return
+		K = np.array([[float(intr["fx"]), 0.0, float(intr["cx"])],
+		              [0.0, float(intr["fy"]), float(intr["cy"])],
+		              [0.0, 0.0, 1.0]], dtype=np.float64)
+		dist = np.asarray(intr.get("dist") or [0.0] * 5, dtype=np.float64)
+		W = int(intr.get("width", 1280) or 1280)
+		H = int(intr.get("height", 720) or 720)
+		# ④を計算した実寸のまま描く（姿勢と実寸の組で、録画の画面上の位置がぴったり再現される）
+		size = float(cache.get("marker_size_mm", 0) or self.ankle_marker_size_mm.get())
+		ts = np.asarray(cache.get("timestamps", []), dtype=float)
+		N = int(cache.get("frame_count", 0) or len(ts))
+		if N <= 0:
+			messagebox.showinfo("座標系の映像", "④の結果にコマがありません。", parent=self)
+			return
+		if len(ts) < N:
+			ts = np.arange(N) / 30.0
+		dts = np.diff(ts[:N])
+		dts = dts[dts > 0]
+		fps = float(1.0 / np.median(dts)) if dts.size else 30.0
+		fps = max(1.0, min(240.0, fps))
+		src = str(cache.get("source", "") or "")
+		init_dir, init_name = "", "axes.mp4"
+		if src:
+			sp = Path(src)
+			init_dir, init_name = str(sp.parent), sp.stem + "_axes.mp4"
+		fp = filedialog.asksaveasfilename(parent=self, title="座標系だけの映像の保存先",
+		                                  defaultextension=".mp4", filetypes=[("MP4", "*.mp4")],
+		                                  initialdir=init_dir or None, initialfile=init_name)
+		if not fp:
+			return
+		bones = {}
+		for aid, b in (cache.get("bones") or {}).items():
+			try:
+				P = np.asarray(b["poses"], dtype=float)
+				D = np.asarray(b["detected"], dtype=bool)
+			except Exception:
+				continue
+			if len(P) >= N and len(D) >= N and D[:N].any():
+				bones[int(aid)] = (P, D)
+		if not bones:
+			messagebox.showinfo("座標系の映像", "④の結果に、検出できたマーカーがありません。", parent=self)
+			return
+		obj = np.asarray(self._ankle_marker_obj_points(size), dtype=np.float64)
+		ax_len = size * 0.7
+		# 一時ファイル（英数字だけの場所）に書き、最後まで書けたら保存先へ付け替える。
+		# 書き出し中の mp4 は目次（moov）がまだ無く、開くと「破損している可能性」と出る（2026-10-13 報告）。
+		# また Windows 標準の H.264 の書き出し（Media Foundation）は日本語のパスを開けない。
+		import tempfile
+		import shutil
+		tmp = os.path.join(tempfile.gettempdir(), f"frs_axes_{os.getpid()}_{int(time.time() * 1000)}.mp4")
+		writer, codec = None, ""
+		try:
+			writer = cv2.VideoWriter(tmp, cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*"H264"), fps, (W, H))
+			codec = "H.264"
+			if not writer.isOpened():
+				writer = None
+		except Exception:
+			writer = None
+		if writer is None:      # H.264 が使えないときは、これまでどおりの MPEG-4（mp4v）
+			writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+			codec = "MPEG-4"
+		if not writer.isOpened():
+			messagebox.showerror("座標系の映像", f"mp4 を書き出せませんでした:\n{tmp}", parent=self)
+			return
+		self._ankle_axes_export_busy = True
+		state = {"i": 0, "t0": time.time()}
+		ids = sorted(bones)
+		print(f"[座標系の映像] {Path(fp).name}: {N} コマ・{fps:.2f} fps・{W}x{H}・ID {ids}・実寸 {size:g} mm・"
+		      f"{codec}（一時ファイル {tmp}）")
+
+		def _frame(t):
+			img = np.full((H, W, 3), 255, dtype=np.uint8)
+			for aid in ids:
+				P, D = bones[aid]
+				T = P[t]
+				if not D[t] or not np.all(np.isfinite(T)):
+					continue
+				rvec, _ = cv2.Rodrigues(np.ascontiguousarray(T[:3, :3]))
+				tvec = np.ascontiguousarray(T[:3, 3]).reshape(3, 1)
+				try:
+					pts, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+					pts = pts.reshape(-1, 2)
+					cv2.polylines(img, [np.round(pts).astype(np.int32)], True, (200, 200, 200), 1, cv2.LINE_AA)
+					cv2.drawFrameAxes(img, K, dist, rvec, tvec, ax_len, 3)
+					c = pts.mean(axis=0)
+					cv2.putText(img, f"id={aid}", (int(c[0]) + 10, int(c[1]) - 10),
+					            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2, cv2.LINE_AA)
+				except Exception:
+					continue
+			cv2.putText(img, f"t = {ts[t] - ts[0]:7.2f} s   frame {t + 1}/{N}", (10, 25),
+			            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 1, cv2.LINE_AA)
+			return img
+
+		def _finish(ok, msg):
+			self._ankle_axes_export_busy = False
+			try:
+				writer.release()
+			except Exception:
+				pass
+			if ok:
+				# 最後まで書けたら保存先へ付け替える（同じ名前のファイルをプレーヤーで開いていると失敗する）
+				try:
+					if os.path.exists(fp):
+						os.remove(fp)
+					shutil.move(tmp, fp)
+				except Exception as e:
+					ok = False
+					msg = (f"書き出しはできましたが、保存先に置けませんでした:\n{fp}\n\n"
+					       f"同じ名前のファイルをメディアプレーヤーなどで開いていたら、閉じてからもう一度押してください。\n"
+					       f"（書き出したファイルはここに残してあります: {tmp}）\n{e}")
+			else:
+				try:
+					os.remove(tmp)      # 途中までのファイルは残さない
+				except Exception:
+					pass
+			try:
+				self.ankle_rs_status.set(msg)
+			except Exception:
+				pass
+			print(f"[座標系の映像] {msg}")
+			if ok:
+				messagebox.showinfo("座標系の映像", msg, parent=self)
+			else:
+				messagebox.showerror("座標系の映像", msg, parent=self)
+
+		def _step():
+			i = state["i"]
+			try:
+				end = min(N, i + 60)
+				for t in range(i, end):
+					writer.write(_frame(t))
+				state["i"] = end
+			except Exception as e:
+				traceback.print_exc()
+				_finish(False, f"書き出しの途中で失敗しました（{state['i']}/{N} コマで止まりました）:\n{e}")
+				return
+			if end < N:
+				try:
+					self.ankle_rs_status.set(f"座標系だけの映像を書き出し中… {end}/{N} コマ")
+				except Exception:
+					pass
+				self.after(1, _step)
+			else:
+				_finish(True, f"座標系だけの映像を書き出しました（{N} コマ・{fps:.1f} fps・{codec}・"
+				              f"{time.time() - state['t0']:.0f} 秒）:\n{fp}")
+		self.after(1, _step)
 
 	def on_ankle_rs_test_connection(self) -> None:
 		"""D405の接続を確認し、シリアル/内部パラメータ/深度スケールを表示。"""
@@ -37122,7 +41679,7 @@ class MainMenuGUI(_BaseWindow):
 			return fallback
 
 	def _precompute_heatmaps_o3d(self, prox_joint_region, dist_surface, prox_points, transform_data,
-	                             update_progress, cancel_var):
+	                             update_progress, cancel_var, sign_check: bool = False):
 		"""全フレームの符号付き距離ヒートマップを Open3D の BVH(RaycastingScene) で高速計算する。
 
 		BVHにより O(N log M) で、GPU総当たり(O(N×M))やVTK per-frameより大幅に高速。
@@ -37146,6 +41703,23 @@ class MainMenuGUI(_BaseWindow):
 		scene.add_triangles(o3d.t.geometry.TriangleMesh(
 			o3d.core.Tensor(dverts, o3d.core.float32),
 			o3d.core.Tensor(dfaces, o3d.core.int32)))
+		# 符号の確かめ直し（sign_check。ankle。2026-10-14）:
+		# compute_signed_distance は「点から出した光線が面を何回横切るか」で中/外を決めるので、スキャンの穴
+		# （骨幹の切り口など）を光線が抜けると、外の点を「中」と誤り、−40mm のような偽のめり込みが出る
+		# （261007_AP_FE60_軸力なし_ACL切 の 9000〜12000 コマ、脛骨 ↔ 大腿骨。実際は +2.6mm 離れていた）。
+		# 光線を増やす（nsamples）では直らなかった。→「中」と出た点だけ、いちばん近い面の外向き（向きを
+		# そろえた法線）で確かめ直し、面の外側なら符号を + に戻す。VTK の面の向きの方式と 92〜100% 一致、
+		# 本当の浅いめり込みは消さない（261007 で 80 コマ、消した本当のめり込み 0 点）。
+		tri_n = None
+		if sign_check:
+			try:
+				_o = dm.compute_normals(cell_normals=True, point_normals=False, consistent_normals=True,
+				                        auto_orient_normals=True, split_vertices=False)
+				_tn = np.asarray(_o.cell_data["Normals"], dtype=np.float64)
+				if len(_tn) == len(dfaces):
+					tri_n = _tn
+			except Exception as e:
+				print(f"[ヒートマップ] 面の向きをそろえられませんでした（符号の確かめ直しを省略）: {e}")
 
 		pts = np.asarray(prox_points) if prox_points is not None else np.asarray(prox_joint_region.points)
 		n_pts = len(pts)
@@ -37168,6 +41742,15 @@ class MainMenuGUI(_BaseWindow):
 				Tinv = np.linalg.inv(np.asarray(tf['matrix'], dtype=float))
 				big[k * n_pts:(k + 1) * n_pts] = (Tinv @ homog.T).T[:, :3].astype(np.float32)
 			sd = scene.compute_signed_distance(o3d.core.Tensor(big, o3d.core.float32)).numpy()
+			if tri_n is not None:
+				neg = np.where(sd < 0)[0]
+				if neg.size:
+					cp = scene.compute_closest_points(o3d.core.Tensor(big[neg], o3d.core.float32))
+					pid = cp["primitive_ids"].numpy().astype(np.int64)
+					pp = cp["points"].numpy()
+					outside = np.einsum("ij,ij->i", big[neg] - pp, tri_n[pid]) > 0
+					sd = np.array(sd, copy=True)
+					sd[neg[outside]] = -sd[neg[outside]]
 			for k in range(len(chunk)):
 				# float32で保持（可視化には十分。容量・保存/読込時間を半減）。viewでなくcopyで独立化
 				results_d[start + k] = np.array(sd[k * n_pts:(k + 1) * n_pts], dtype=np.float32)
