@@ -29,6 +29,7 @@ def walk(w):
 TAB = "261007_FE_軸力100_ACL切"
 app.on_ankle_tab_select(next(i for i, t in enumerate(app._ankle_tabs) if t["name"] == TAB)); pump(app, 0.5)
 L0 = copy.deepcopy(app.ankle_ligaments[0]); L0["name"] = "ACL"; L0.pop("chart", None)
+L0["visible"] = True                   # 本物の状態で隠してあっても、表示した状態から始める
 L1 = copy.deepcopy(L0); L1["name"] = "PCL"; L1["color"] = "#1F77B4"
 app.ankle_ligaments = [L0, L1]
 def lig_charts(p):

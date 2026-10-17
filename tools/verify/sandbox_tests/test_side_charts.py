@@ -29,6 +29,8 @@ def walk(w):
 TAB = "261007_AP_FE60_軸力100"
 app.on_ankle_tab_select(next(i for i, t in enumerate(app._ankle_tabs) if t["name"] == TAB)); pump(app, 0.5)
 app.ankle_side_charts.set("lig"); app.ankle_robot_log_items.set("AP,Fap,Fpd"); app.ankle_robot_log_show.set(True)
+app.ankle_chart_order.set("")          # 並び順は決まった順から（本物の状態で並べ替えてあっても）
+app.ankle_lig_wrap.set(False); app.ankle_lig_mode.set("stage1")   # 靭帯は段階1・直線（グラフの名前が変わらないように）
 app.on_ankle_animate(); pump(app, 2.0)
 v = app._sim_viewers_alive()[-1]; p = v["plotter"]
 cv = v["ctrl"]["chart_vars"]

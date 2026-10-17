@@ -1,0 +1,262 @@
+{
+  "format": "FRS-SIMULATOR ligaments",
+  "version": 1,
+  "note": "point は各骨のモデルファイル座標 (mm)。2026-10-16 時点の付着部の点のバックアップ（段階2の付着部の面を作る目安に使う）。靭帯管理の「ファイルから読込…」でも読める",
+  "exported": "2026-10-16T18:41:15",
+  "bone_group": "g8a86693d",
+  "tabs": [
+    "261007_FE_軸力無し",
+    "261007_FE_軸力無し_ACL切",
+    "261007_FE_軸力100",
+    "261007_FE_軸力100_ACL切",
+    "261007_AP_FE60_軸力なし",
+    "261007_AP_FE60_軸力なし_ACL切",
+    "261007_AP_FE60_軸力100",
+    "261007_AP_FE60_軸力100_ACL切"
+  ],
+  "ligaments": [
+    {
+      "name": "ACL",
+      "color": "#FF8800",
+      "radius": 1.5,
+      "visible": false,
+      "chart": false,
+      "a": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          73.11635967927577,
+          115.52775970953557,
+          644.5292699522679
+        ]
+      },
+      "b": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          100.39506136048911,
+          131.82077131128028,
+          597.5025280665989
+        ]
+      }
+    },
+    {
+      "name": "PCL",
+      "color": "#1F77B4",
+      "radius": 1.5,
+      "visible": false,
+      "chart": false,
+      "a": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          70.53838423274871,
+          114.67568810403951,
+          650.4931198018812
+        ]
+      },
+      "b": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          107.43346351321406,
+          127.63807339367929,
+          594.6608827140749
+        ]
+      }
+    },
+    {
+      "name": "ACL付着部間距離",
+      "color": "#2CA02C",
+      "radius": 1.5,
+      "visible": false,
+      "chart": false,
+      "a": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          73.11635967927577,
+          115.52775970953557,
+          644.5292699522679
+        ]
+      },
+      "b": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          100.39506136048911,
+          131.82077131128028,
+          597.5025280665989
+        ]
+      }
+    },
+    {
+      "name": "ACL(AM)",
+      "color": "#D62728",
+      "radius": 1.5,
+      "visible": false,
+      "chart": true,
+      "a": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          80.87915144131529,
+          133.1226721185953,
+          600.9190675036513
+        ]
+      },
+      "b": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          69.03484894949455,
+          106.20482383095373,
+          648.3698840881817
+        ]
+      }
+    },
+    {
+      "name": "ACL(PL)",
+      "color": "#9467BD",
+      "radius": 1.5,
+      "visible": false,
+      "chart": true,
+      "a": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          87.52721028599709,
+          130.38882988110367,
+          596.5137986320728
+        ]
+      },
+      "b": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          68.55518478084426,
+          109.69953162829053,
+          644.7227057058103
+        ]
+      }
+    },
+    {
+      "name": "靭帯6",
+      "color": "#8C564B",
+      "radius": 1.5,
+      "visible": false,
+      "chart": false,
+      "a": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          109.79546537059673,
+          104.84642550568992,
+          603.2742668415536
+        ]
+      },
+      "b": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          66.0694573627407,
+          110.47935649726345,
+          650.9813087982985
+        ]
+      }
+    },
+    {
+      "name": "靭帯7",
+      "color": "#E377C2",
+      "radius": 1.5,
+      "visible": false,
+      "chart": false,
+      "a": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          112.19292039489738,
+          112.87071286265319,
+          604.1391049108634
+        ]
+      },
+      "b": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          67.72124226567942,
+          114.63005625108511,
+          650.3607943205104
+        ]
+      }
+    },
+    {
+      "name": "PCL",
+      "color": "#17BECF",
+      "radius": 1.5,
+      "visible": true,
+      "chart": true,
+      "a": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          77.00016110910835,
+          129.7915831438955,
+          648.3170679863598
+        ]
+      },
+      "b": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          113.10920562583209,
+          108.40046907778691,
+          600.1768721986823
+        ]
+      }
+    },
+    {
+      "name": "PCL（複製）",
+      "color": "#FF8800",
+      "radius": 1.5,
+      "visible": true,
+      "chart": true,
+      "a": {
+        "bone_name": "大腿骨",
+        "bone_index": 0,
+        "model": "femur_ 表示用（仮）.obj",
+        "point": [
+          64.03076488637572,
+          115.06567966816819,
+          648.880546067259
+        ]
+      },
+      "b": {
+        "bone_name": "脛骨",
+        "bone_index": 1,
+        "model": "tibia_ 表示用.obj",
+        "point": [
+          112.06115576943051,
+          109.4558268435274,
+          603.5512558601624
+        ]
+      }
+    }
+  ]
+}
