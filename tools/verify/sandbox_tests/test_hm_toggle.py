@@ -15,6 +15,7 @@ def pump(app, sec=0.0):
 		app.tk.dooneevent(frs.tk._tkinter.DONT_WAIT)
 		if time.time() >= t: break
 app = frs.MainMenuGUI(); app.update()
+app.ankle_dilate_mm.set(0.0); app.ankle_cp_on.set(False)   # 膨張・接触圧なし（本物の状態で使っていても）
 
 times = [i / 30 for i in range(60)]
 box = pv.Cube(x_length=30, y_length=20, z_length=10).triangulate().subdivide(2)
@@ -64,7 +65,9 @@ check(cb is not None, "再生コントロールに「ヒートマップを表示
 check(cb is not None and "disabled" not in cb.state() and v["ctrl"]["hm_show_var"].get(), "最初はオン（押せる）")
 check(bool(actor(v).GetMapper().GetScalarVisibility()) and has_bar(v), "オン: 距離の色と色の帯")
 # 骨の表示の枠の下にあるか
-kids = v["ctrl"]["window"].pack_slaves()
+_w0 = v["ctrl"]["window"]
+_cv0 = [c for c in _w0.winfo_children() if c.winfo_class() == "Canvas"]
+kids = (_cv0[0].winfo_children()[0] if _cv0 else _w0).pack_slaves()     # 欄はスクロールする枠の中に並ぶ
 i_style = next((i for i, c in enumerate(kids) if c.winfo_class() == "TLabelframe" and "骨の表示" in str(c.cget("text"))), None)
 i_tog = next((i for i, c in enumerate(kids) if cb is not None and str(cb).startswith(str(c) + ".")), None)
 check(i_style is not None and i_tog == i_style + 1, f"「骨の表示」の枠のすぐ下（{i_style} → {i_tog}）")
@@ -95,7 +98,12 @@ before = scalars_now(v)
 v["seek"](times[40]); pump(app, 0.2)
 check(np.allclose(scalars_now(v), before), "オフの間はコマが進んでも塗り替えない（軽い）")
 # オフの間に範囲を変えても帯は出ない
-hr = [c for c in v["ctrl"]["window"].winfo_children() if c.winfo_class() == "TLabelframe" and "範囲" in str(c.cget("text"))][0]
+def _desc(w):
+	"""窓の中の部品すべて（再生コントロールはスクロールする枠の中に並ぶので、直下だけでは見つからない）"""
+	for c in w.winfo_children():
+		yield c
+		yield from _desc(c)
+hr = [c for c in _desc(v["ctrl"]["window"]) if c.winfo_class() == "TLabelframe" and "範囲" in str(c.cget("text"))][0]
 ents = [c for c in hr.winfo_children() if c.winfo_class() == "TEntry"]
 ents[0].delete(0, "end"); ents[0].insert(0, "1"); ents[1].delete(0, "end"); ents[1].insert(0, "0.5")
 [c for c in hr.winfo_children() if c.winfo_class() == "TButton" and c.cget("text") == "適用"][0].invoke(); pump(app, 0.2)

@@ -116,7 +116,8 @@ rb.invoke(); pump(app, 0.4)
 check(av.get() == "alt" and vis(alt_k) and not vis(base_k), "「表示変更用モデル」を選ぶと、その骨だけ差し替わる")
 check(all(vis(f"bone_{j}") for j in range(len(app.ankle_bones)) if f"bone_{j}" in names and j != bi_), "ほかの骨は元のまま")
 check(app.ankle_alt_model.get() is True, "選んだ状態はタブ（と共有）に覚える")
-# 色: 元の表面に乗っている点は、いちばん近い元の点の値／離れた点（足した板）は骨の色（範囲より上）
+# 色: 元の表面に乗っている点は、いちばん近い三角形の上の値（3 頂点を重心座標で混ぜる。2026-10-19 から。
+# いちばん近い点の値だと縁がギザギザになった）／離れた点（足した板）は骨の色（範囲より上）
 from vtk.util.numpy_support import vtk_to_numpy
 from scipy.spatial import cKDTree
 ts = np.asarray(app._ankle_get_current_cache()["timestamps"]); v["seek"](float(ts[300] - ts[0])); pump(app, 0.4)
@@ -125,10 +126,23 @@ P_alt = vtk_to_numpy(a_alt.GetMapper().GetInput().GetPoints().GetData()).astype(
 S_alt = vtk_to_numpy(a_alt.GetMapper().GetInput().GetPointData().GetScalars()).astype(float)
 P_base = vtk_to_numpy(a_base.GetMapper().GetInput().GetPoints().GetData()).astype(float)
 S_base = vtk_to_numpy(a_base.GetMapper().GetInput().GetPointData().GetScalars()).astype(float)
-_, ii = cKDTree(P_base).query(P_alt)
 far = S_alt > 1e5
-ok_near = np.allclose(S_alt[~far], S_base[ii][~far], atol=1e-5)
-check(ok_near, f"元の表面に乗っている点は、計算済みの値をそのまま写す（{int((~far).sum()):,} 点）")
+import vtk as _vtk
+_bt = pv.wrap(a_base.GetMapper().GetInput()).triangulate()
+_loc = _vtk.vtkCellLocator(); _loc.SetDataSet(_bt); _loc.BuildLocator()
+_rng = np.random.default_rng(0)
+_sel = _rng.choice(np.nonzero(~far)[0], size=min(800, int((~far).sum())), replace=False)
+_err = []
+for _i in _sel:
+	_cp = [0.0, 0.0, 0.0]; _cid = _vtk.reference(0); _sid = _vtk.reference(0); _d2 = _vtk.reference(0.0)
+	_loc.FindClosestPoint(P_alt[_i].tolist(), _cp, _cid, _sid, _d2)
+	_cell = _bt.GetCell(int(_cid)); _w = [0.0] * _cell.GetNumberOfPoints(); _pc = [0.0, 0.0, 0.0]
+	_cell.EvaluatePosition(_cp, [0.0, 0.0, 0.0], _vtk.reference(0), _pc, _vtk.reference(0.0), _w)
+	_ids = [_cell.GetPointId(k) for k in range(_cell.GetNumberOfPoints())]
+	_err.append(abs(S_alt[_i] - sum(w * S_base[j] for w, j in zip(_w, _ids))))
+check(float(np.max(_err)) < 1e-3, f"元の表面に乗っている点は、いちばん近い三角形の上の値（重心座標で混ぜる）を写す（{len(_sel)} 点を確かめた・最大の差 {float(np.max(_err)):.2e} mm）")
+_, ii = cKDTree(P_base).query(P_alt)
+check(not np.allclose(S_alt[~far], S_base[ii][~far], atol=1e-5), "いちばん近い点の値をそのまま写すのではない（縁が滑らか）")
 pd = pv.PolyData(P_alt); patch_pts = np.abs(np.asarray(pd.compute_implicit_distance(a_base.GetMapper().GetInput())["implicit_distance"])) > 0.3
 check(far.sum() > 0 and np.array_equal(far, patch_pts), f"元の表面から離れた所（足した板 {int(far.sum())} 点）は色を付けない（骨の色）")
 mj, mf = a_alt.GetUserMatrix(), a_base.GetUserMatrix()

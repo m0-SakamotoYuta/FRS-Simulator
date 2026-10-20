@@ -45,7 +45,7 @@ def scl(a): return vtk_to_numpy(a.GetMapper().GetInput().GetPointData().GetScala
 
 TAB = "261007_AP_FE60_軸力100"
 app.on_ankle_tab_select(next(i for i, t in enumerate(app._ankle_tabs) if t["name"] == TAB)); pump(app, 0.5)
-app.ankle_dilate_mm.set(0.0); app.ankle_joint_only.set(False); app.ankle_alt_model.set(False); app.ankle_hm_show.set(True)
+app.ankle_dilate_mm.set(0.0); app.ankle_dil_title_on.set(True); app.ankle_joint_only.set(False); app.ankle_alt_model.set(False); app.ankle_hm_show.set(True)   # 色の帯の膨張の値は 10/20 から既定で出さない（ここでは出して確かめる）
 sp5 = [w for w in walk(app) if w.winfo_class() == "TSpinbox" and str(w.cget("textvariable")) == str(app.ankle_dilate_mm)]
 check(len(sp5) == 1, "⑤に「骨の膨張（臨時）δ」の欄")
 
@@ -62,7 +62,7 @@ n_calc = calc["n"]
 # 再生コントロールで 0.1
 ctrl["dl_var"].set("0.1")
 btn = [w for w in walk(ctrl["window"]) if w.winfo_class() == "TButton" and str(w.cget("text")) == "適用"
-       and "膨張" in str(w.master.cget("text"))]
+       and w.master.winfo_class() == "TLabelframe" and "膨張" in str(w.master.cget("text"))]
 check(len(btn) == 1, "膨張の「適用」ボタン")
 btn[0].invoke(); pump(app, 0.4)
 P1 = {k: pts(acts[k]) for k in keys + alt_keys}; S1 = {k: scl(acts[k]) for k in keys + alt_keys}
@@ -146,7 +146,7 @@ check(np.allclose(scl(acts[k0])[fin], S0[k0][fin] - 0.2, atol=1e-4), "開いた�
 # 0 で元どおり
 ctrl["dl_var"].set("0")
 [w for w in walk(ctrl["window"]) if w.winfo_class() == "TButton" and str(w.cget("text")) == "適用"
- and "膨張" in str(w.master.cget("text"))][0].invoke(); pump(app, 0.4)
+ and w.master.winfo_class() == "TLabelframe" and "膨張" in str(w.master.cget("text"))][0].invoke(); pump(app, 0.4)
 check(all(np.allclose(pts(acts[k]), P0[k], atol=1e-4) for k in keys + alt_keys), "0 にすると形が元どおり")
 check(np.allclose(scl(acts[k0])[fin], S0[k0][fin], atol=1e-5), "0 にすると色も元どおり")
 check(not any("dilated" in b for b in p.scalar_bars.keys()), "0 のとき色の帯の題名は元のまま")

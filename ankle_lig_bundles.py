@@ -33,7 +33,9 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = 1
+VERSION = 3          # 2: 付着部の楕円を、楕円の面の法線の向きに骨の面へ落とす（2026-10-20。線維の端が変わる）
+                     # 3: 束どうしの当たり（外形どうし）と、自然長の基準のコマ（2026-10-20）
+ELL_V = 2            # 保存してある楕円の当てはめ方の版（古いものは外周の点から当てはめ直す）
 PALETTE = ("#FF8800", "#D62728", "#1F77B4", "#2CA02C", "#9467BD", "#8C564B", "#E377C2", "#17BECF")
 
 
@@ -73,6 +75,28 @@ class _Bones:
 		d = np.linalg.norm(dq, axis=1)
 		sd = np.where(np.einsum("ij,ij->i", dq, o["tn"][pid]) >= 0, d, -d)
 		return cpp, ns, sd
+
+	def onto(self, i, P, n, R=15.0):
+		"""点 P (m,3) を、向き n の直線に沿って骨 i の面へ落とす（その直線と面の交点のうち P にいちばん近いもの）。
+		±R mm の中に交点が無い点は、いちばん近い面の点。返り値: (面の上の点, なめらかな外向きの法線)。
+		（いちばん近い面の点へ落とすと、面が傾いた所・凹凸のある所で横へずれた。2026-10-20）"""
+		o = self.obs[int(i)]
+		P = np.asarray(P, dtype=float).reshape(-1, 3)
+		n = np.asarray(n, dtype=float)
+		n = n / max(float(np.linalg.norm(n)), 1e-12)
+		out = self.closest(i, P)[0].copy()
+		best = np.full(len(P), np.inf)
+		for sgn in (1.0, -1.0):
+			org = P + sgn * R * n
+			d = np.tile(-sgn * n, (len(P), 1))
+			rays = np.c_[org, d].astype(np.float32)
+			t = o["sc"].cast_rays(self.o3d.core.Tensor(rays))["t_hit"].numpy().astype(float)
+			dd = np.abs(t - R)
+			ok = np.isfinite(t) & (dd <= R) & (dd < best)
+			out[ok] = org[ok] + t[ok, None] * d[ok]
+			best[ok] = dd[ok]
+		_cp, ns, _sd = self.closest(i, out)
+		return out, ns
 
 	def push_out(self, P, Ts_f, clr):
 		"""世界座標の点 P (n,3) を、どの骨からも clr (n,) 以上離す（その場で書き換え）。"""
@@ -167,6 +191,86 @@ def _sheath(X, foot_r, AB, rf):
 			             + (q2[out] / sc[out])[:, None] * e2)
 
 
+def _envelopes(X, rf):
+	"""束 X (F,K,3) の外形: 各所の楕円の断面（皮と同じ作り方）。返り値: C, t, e1, e2 (K,3), r1, r2 (K,)。"""
+	F, K, _ = X.shape
+	C = X.mean(axis=0)
+	kk = np.arange(K)
+	t = C[np.minimum(kk + 1, K - 1)] - C[np.maximum(kk - 1, 0)]
+	t /= np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-9)
+	Q = X - C[None]
+	Q = Q - np.einsum("fki,ki->fk", Q, t)[:, :, None] * t[None]
+	if F >= 2:
+		_w, V = np.linalg.eigh(np.einsum("fki,fkj->kij", Q, Q))
+		e1 = V[:, :, -1]
+	else:
+		e1 = np.cross(t, [1.0, 0.0, 0.0])
+	e1 = e1 - np.einsum("ki,ki->k", e1, t)[:, None] * t
+	bad = np.linalg.norm(e1, axis=1) < 1e-6
+	if bad.any():
+		e1[bad] = np.cross(t[bad], [0.0, 1.0, 0.0])
+	e1 /= np.maximum(np.linalg.norm(e1, axis=1, keepdims=True), 1e-12)
+	e2 = np.cross(t, e1)
+	r1 = np.abs(np.einsum("fki,ki->fk", Q, e1)).max(axis=0) + rf
+	r2 = np.abs(np.einsum("fki,ki->fk", Q, e2)).max(axis=0) + rf
+	return C, t, e1, e2, r1, r2
+
+
+def _bundle_contact(Xs, rfs, end_frac=0.08, M=12, gain=0.5):
+	"""束どうしの当たり（外形どうし。その場で書き換え）: 束 B の外形の縁（皮と同じ楕円の断面の縁、M 点）が束 A の外形の中にあれば、
+	その断面の線維をまとめて、A の外形の縁まで gain だけずらす（A・B を入れ替えても行うので、両方がよける）。
+	線維の点だけで判定すると、表示の皮（楕円の縁は点の集まりより角がふくらむ）どうしの重なりが残った。
+	両端の end_frac の長さは除く（付着部は動かない・隣り合う付着部の近くは重なってよい）。返り値: 外形の中にあった縁の点の数。"""
+	from scipy.spatial import cKDTree
+	nb = len(Xs)
+	if nb < 2:
+		return 0
+	env = [_envelopes(X, rf) for X, rf in zip(Xs, rfs)]
+	th = np.linspace(0.0, 2.0 * np.pi, M, endpoint=False)
+	cs, sn = np.cos(th)[None, :, None], np.sin(th)[None, :, None]
+	moves = [np.zeros((X.shape[1], 3)) for X in Xs]
+	cnt = 0
+	for a in range(nb):
+		C, t, e1, e2, r1, r2 = env[a]
+		K = len(C)
+		half = 0.75 * max(float(np.linalg.norm(np.diff(C, axis=0), axis=1).mean()), 1e-6)
+		k0 = max(1, int(round(end_frac * (K - 1))))
+		tree = cKDTree(C)
+		for b in range(nb):
+			if b == a:
+				continue
+			Cb, tb, e1b, e2b, r1b, r2b = env[b]
+			Kb = len(Cb)
+			kb0 = max(1, int(round(end_frac * (Kb - 1))))
+			kbs = np.arange(kb0, Kb - kb0)
+			if len(kbs) == 0:
+				continue
+			R = (Cb[kbs, None] + cs * r1b[kbs, None, None] * e1b[kbs, None] + sn * r2b[kbs, None, None] * e2b[kbs, None])
+			Pr = R.reshape(-1, 3)
+			_d, k = tree.query(Pr)
+			q = Pr - C[k]
+			along = np.einsum("ij,ij->i", q, t[k])
+			ok = (k >= k0) & (k <= K - 1 - k0) & (np.abs(along) <= half)
+			if not ok.any():
+				continue
+			qp = q - along[:, None] * t[k]
+			u1, u2 = np.einsum("ij,ij->i", qp, e1[k]), np.einsum("ij,ij->i", qp, e2[k])
+			ins = ok & (np.sqrt((u1 / r1[k]) ** 2 + (u2 / r2[k]) ** 2) < 1.0)
+			if not ins.any():
+				continue
+			nq = np.linalg.norm(qp, axis=1)
+			dirv = np.where((nq > 1e-6)[:, None], qp / np.maximum(nq, 1e-9)[:, None], e1[k])
+			c1, c2 = np.einsum("ij,ij->i", dirv, e1[k]), np.einsum("ij,ij->i", dirv, e2[k])
+			rb = 1.0 / np.sqrt((c1 / r1[k]) ** 2 + (c2 / r2[k]) ** 2)          # その向きの、A の外形の縁までの距離
+			dv = (((rb - nq)[:, None] * dirv) * ins[:, None]).reshape(len(kbs), M, 3)
+			jm = np.argmax(np.linalg.norm(dv, axis=2), axis=1)                 # 断面ごとに、いちばん深い縁の点
+			moves[b][kbs] += gain * dv[np.arange(len(kbs)), jm]
+			cnt += int(ins.sum())
+	for X, m in zip(Xs, moves):
+		X[:, 1:-1] += m[None, 1:-1]
+	return cnt
+
+
 def sunflower(n):
 	"""楕円（単位円）の中に均一に n 点。1点目は中心（中心の線維）。"""
 	n = max(1, int(n))
@@ -179,15 +283,22 @@ def sunflower(n):
 	return np.array(out[:n], dtype=float)
 
 
+def ell_normal(bones, bone_idx, ell):
+	"""楕円の面の法線 u × v（骨の外向きにそろえる）。"""
+	c = np.asarray(ell["center"], float)
+	n = np.cross(np.asarray(ell["u"], float), np.asarray(ell["v"], float))
+	n /= max(float(np.linalg.norm(n)), 1e-12)
+	_cp, ns, _ = bones.closest(bone_idx, c[None])
+	return n if float(n @ ns[0]) >= 0 else -n
+
+
 def fiber_ends(bones, bone_idx, ell, uv):
-	"""楕円の中の位置 uv (n,2) → 骨の面の上の点（モデル座標）。"""
+	"""楕円の中の位置 uv (n,2) → 骨の面の上の点（モデル座標）。楕円の面の法線の向きに落とす。"""
 	c = np.asarray(ell["center"], float)
 	u = np.asarray(ell["u"], float)
 	v = np.asarray(ell["v"], float)
-	cpp, ns, _ = bones.closest(bone_idx, c[None])
-	nrm = ns[0]
-	P = cpp[0] + uv[:, :1] * float(ell["ra"]) * u + uv[:, 1:] * float(ell["rb"]) * v + 2.0 * nrm
-	return bones.closest(bone_idx, P)[0]
+	P = c + uv[:, :1] * float(ell["ra"]) * u + uv[:, 1:] * float(ell["rb"]) * v
+	return bones.onto(bone_idx, P, ell_normal(bones, bone_idx, ell))[0]
 
 
 # ======================================================================== 計算の本体
@@ -252,21 +363,29 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 	iters = int(params.get("iters", 12))
 	inner = int(params.get("inner", 6))
 	bend = float(params.get("bend", 0.05))
+	contact = bool(params.get("bundle_contact", True))
 	nb = len(bundles)
 
 	def world(i, P, f):
 		T = Ts[int(i)][f]
 		return np.asarray(P, float) @ T[:3, :3].T + T[:3, 3]
 
-	# --- 自然長: 表示の始まりのコマで、骨を避けて張った長さ × 係数。形もそこから始める ---
+	# --- 自然長: 基準のコマ（指定が無ければ表示の始まりのコマ）で、骨を避けて張った長さ × 係数。形は表示の始まりから ---
 	Xs, seg0, Ks, rfs = [], [], [], []
 	f0 = frames[0]
+	fref = params.get("rest_frame")
+	fref = int(fref) if fref is not None and 0 <= int(fref) < N else f0
 	for b in bundles:
 		A, B = world(b["a"], b["pa"], f0), world(b["b"], b["pb"], f0)
 		F = len(A)
 		Kt = 33
 		Xt = _taut_paths(bones, Ts, f0, A, B, Kt, np.full(F, float(b["rf"])), maxit=3000)
-		Lt = np.linalg.norm(np.diff(Xt, axis=1), axis=2).sum(axis=1)
+		if fref != f0:
+			Ar, Br = world(b["a"], b["pa"], fref), world(b["b"], b["pb"], fref)
+			Xr = _taut_paths(bones, Ts, fref, Ar, Br, Kt, np.full(F, float(b["rf"])), maxit=3000)
+			Lt = np.linalg.norm(np.diff(Xr, axis=1), axis=2).sum(axis=1)
+		else:
+			Lt = np.linalg.norm(np.diff(Xt, axis=1), axis=2).sum(axis=1)
 		L0 = Lt * scale
 		K = int(np.clip(round(float(L0.max()) / max(1.2, 2.5 * float(b["rf"]))) + 1, 15, 33))
 		Xs.append(_resample(Xt, K))
@@ -309,6 +428,9 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 				X[:, 1:-1] += bend * (0.5 * (X[:, :-2] + X[:, 2:]) - X[:, 1:-1])
 				if bundles[j].get("sheath"):
 					_sheath(X, bundles[j]["foot_r"], bundles[j]["sheath"], rfs[j])
+			# 束どうし（外形どうし。線維の点どうしだけだと、束の外形が重なった。2026-10-20）
+			if contact:
+				_bundle_contact(Xs, rfs)
 			# 線維どうし
 			P = np.concatenate([X.reshape(-1, 3) for X in Xs], axis=0)
 			pr = cKDTree(P).query_pairs(2.0 * rmax, output_type="ndarray")
@@ -331,6 +453,18 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 			Q = P[inner_pts].copy()
 			bones.push_out(Q, Ts_f, rad[inner_pts])
 			P[inner_pts] = Q
+			for j in range(nb):
+				Xs[j] = P[offs[j]:offs[j + 1]].reshape(Xs[j].shape)
+		# 仕上げ: 束どうしの当たりだけを数回（線維は少し伸びてよける。伸びない糸のままだと、張った束どうしは長さの制約に
+		# まっすぐ戻されてよけられなかった）。そのあと骨の外へ
+		if contact:
+			for _k in range(6):
+				if _bundle_contact(Xs, rfs) == 0:
+					break
+			P = np.concatenate([X.reshape(-1, 3) for X in Xs], axis=0)
+			Q = P[~is_end].copy()
+			bones.push_out(Q, Ts_f, rad[~is_end])
+			P[~is_end] = Q
 			for j in range(nb):
 				Xs[j] = P[offs[j]:offs[j + 1]].reshape(Xs[j].shape)
 
@@ -382,6 +516,7 @@ class Stage2:
 		self.store = Path(base_dir) / "cache" / "ankle_lig_bundles" / f"{store_key}.json"
 		self.res_dir = self.store.parent / "results"
 		self.data = self._load()
+		self._refit_old()
 		self.bones = None
 		self.results = {}            # 束の id → 結果
 		self.listeners = []          # 右のグラフの描き直し
@@ -392,7 +527,9 @@ class Stage2:
 		self.pend = []               # 外周を打っている点のアクター
 		self.win = None
 		self.w = {}
-		self.st = {"mode": None, "clicks": [], "press": None, "poll": None, "obs": [], "replace": None}
+		# clicks: ("R"|"L", x, y)。右 = 点を打つ、左 = 打った点を選ぶ。sel = 選んでいる点の番号
+		self.st = {"mode": None, "clicks": [], "press": None, "lpress": None, "poll": None, "obs": [], "replace": None,
+		           "sel": None}
 		self._load_cached_results()
 
 	# ---------------------------------------------------------------- 保存
@@ -407,6 +544,23 @@ class Stage2:
 			pass
 		return {"version": VERSION, "bundles": [], "params": {}, "guide_file": ""}
 
+	def _refit_old(self):
+		"""古いやり方で決めた楕円（中心をいちばん近い面の点へ動かしていた）を、保存してある外周の点から当てはめ直す。"""
+		n = 0
+		for b in self.data.get("bundles", []):
+			for end in ("a", "b"):
+				e = b.get(end) or {}
+				if e.get("ellipse") and e.get("outline") and int(e.get("ell_v", 1)) < ELL_V:
+					try:
+						e["ellipse"] = fit_ellipse(e["outline"])
+						e["ell_v"] = ELL_V
+						n += 1
+					except Exception as ex:
+						print(f"[靭帯の束] {b.get('name', '')} の楕円を当てはめ直せません: {ex}")
+		if n:
+			self._save()
+			print(f"[靭帯の束] 古いやり方の楕円 {n} 個を、保存してある外周の点から当てはめ直しました（中心のずれを直す）")
+
 	def _save(self):
 		try:
 			self.store.parent.mkdir(parents=True, exist_ok=True)
@@ -417,7 +571,8 @@ class Stage2:
 			print(f"[靭帯の束] 保存に失敗: {e}")
 
 	def params(self):
-		p = {"rest_scale": 1.0, "gravity": 0.02, "iters": 12, "inner": 6, "bend": 0.05, "stride": 3, "view": "both"}
+		p = {"rest_scale": 1.0, "gravity": 0.02, "iters": 12, "inner": 6, "bend": 0.05, "stride": 3, "view": "both",
+		     "lig_opacity": 1.0}
 		p.update(self.data.get("params") or {})
 		return p
 
@@ -490,6 +645,8 @@ class Stage2:
 		pp = self.params()
 		h.update(json.dumps({k: pp[k] for k in ("rest_scale", "gravity", "iters", "inner", "bend", "stride")},
 		                    sort_keys=True).encode())
+		h.update(json.dumps({"rest_frame": self._rest_frame(), "contact": bool(pp.get("bundle_contact", True))},
+		                    sort_keys=True).encode())
 		for b in ready:
 			h.update(json.dumps({"a": b["a"], "b": b["b"], "n": int(b.get("n_fibers", 10)),
 			                     "r": round(self._rf(b), 6), "xs": self._xsec(b)}, sort_keys=True).encode())
@@ -522,7 +679,8 @@ class Stage2:
 		try:
 			upd(0.0, "骨の形と線維の端を準備しています…")
 			rts = [self._runtime(b) for b in ready]
-			res = simulate(self.app, self.bones_full, rts, self.s0, self.params(), progress=upd, cancelled=cancelled,
+			res = simulate(self.app, self.bones_full, rts, self.s0, dict(self.params(), rest_frame=self._rest_frame()),
+			               progress=upd, cancelled=cancelled,
 			               bones=self._ensure_bones())
 		finally:
 			close()
@@ -689,7 +847,7 @@ class Stage2:
 						print(f"[靭帯の束] 付着部の輪郭を骨の面に落とせません（平らな楕円で描きます）: {ex}")
 					pd_e = self._ring_poly(ring["out_calc"]) if ring is not None else self._ellipse_poly(e["ellipse"])
 					act = self._line_actor(pd_e, col, 3.0)
-					act.SetVisibility(vis and bool(self.params().get("show_outline", True)))
+					act.SetVisibility(vis and self._outline_on() and not self._drawing(b, end))
 					a[f"e{end}_act"] = act
 					a[f"e{end}_si"] = si
 					a[f"e{end}_ring"] = ring
@@ -698,7 +856,7 @@ class Stage2:
 			if self._xsec(b) is not None and self._ready(b):
 				xpd = self._ring_poly(np.zeros((48, 3)))
 				xact = self._line_actor(xpd, col, 2.0)
-				xact.SetVisibility(vis and bool(self.params().get("show_xsec", True)))
+				xact.SetVisibility(vis and bool(self.params().get("show_xsec", True)) and view != "foot")
 				a.update(xs_act=xact, xs_pd=xpd)
 			r = self.results.get(b.get("id"))
 			if r is not None:
@@ -724,14 +882,16 @@ class Stage2:
 				fact.SetMapper(mp)
 				fact.PickableOff()
 				fact.GetProperty().SetColor(*self._rgb(col))
+				fact.GetProperty().SetOpacity(self._lig_opacity())
 				fact.SetVisibility(vis and view in ("fibers", "both"))
 				self.plotter.renderer.AddActor(fact)
 				# 皮: 経路に沿って楕円の輪をつなぐ
-				M = 24
+				M = int(self.SKIN_M)
+				Ks = (K - 1) * int(self.SKIN_UP) + 1          # 皮の輪の数（線維の点の間に補間）
 				spd = vtk.vtkPolyData()
 				spts = vtk.vtkPoints()
 				NS = len(self.SKIN_CAP_SCALES)
-				spts.SetNumberOfPoints(K * M + 2 * NS * M)
+				spts.SetNumberOfPoints(Ks * M + 2 * NS * M)
 				polys = vtk.vtkCellArray()
 
 				def _band(r0, r1):
@@ -743,11 +903,11 @@ class Stage2:
 						q.GetPointIds().SetId(2, r1 + (m + 1) % M)
 						q.GetPointIds().SetId(3, r1 + m)
 						polys.InsertNextCell(q)
-				for k in range(K - 1):
+				for k in range(Ks - 1):
 					_band(k * M, (k + 1) * M)
 				# 両端のふた: 付着部の楕円を同心の輪に分けて骨の面へ落としたもの（骨の面に沿う。平らな板だと、
 				# 凹んだ付着部（顆間窩の壁など）で板が骨から浮いて見えた）
-				for kk, base in ((0, K * M), (K - 1, K * M + NS * M)):
+				for kk, base in ((0, Ks * M), (Ks - 1, Ks * M + NS * M)):
 					_band(kk * M, base)
 					for j in range(NS - 1):
 						_band(base + j * M, base + (j + 1) * M)
@@ -765,12 +925,12 @@ class Stage2:
 				sp.SetColor(*self._rgb(col))
 				# 皮だけのときは不透明（少しでも透明だと、骨に入っている端の奥が透けて、端が骨から浮いて見えた）。
 				# 「両方」のときは中の線維が見えるように半透明
-				sp.SetOpacity(0.55 if view == "both" else 1.0)
+				sp.SetOpacity((0.55 if view == "both" else 1.0) * self._lig_opacity())
 				sp.SetInterpolationToPhong()
 				sact.SetVisibility(vis and view in ("skin", "both"))
 				self.plotter.renderer.AddActor(sact)
 				a.update(fib_act=fact, fib_pd=pd, fib_pts=pts, skin_act=sact, skin_pd=spd, skin_pts=spts,
-				         F=Fn, K=K, M=M, r=r, rf=self._rf(b))
+				         F=Fn, K=K, Ks=Ks, M=M, r=r, rf=self._rf(b))
 				try:
 					a["foot"] = (self._foot_ring(b["a"], M), self._foot_ring(b["b"], M))
 				except Exception as e:
@@ -799,13 +959,18 @@ class Stage2:
 	SKIN_SINK = 0.3        # mm。付着部の輪を骨の中へ入れる量（輪の間で骨の面が曲がっていてもすき間を見せない）
 	SKIN_BLEND = 0.2       # 長さに対する割合
 	SKIN_CAP_SCALES = (0.7, 0.4, 0.0)    # ふたの同心の輪（付着部の楕円に対する大きさ。0 は中心）
+	SKIN_CLR = 0.25        # mm。見えている骨の面から皮をこれだけ外へ（骨が皮を突き抜けて見えないように。2026-10-20）
+	SKIN_SINK_LEN = 1.5    # mm。付く骨の端から、皮が骨の中へ入るのを許す長さ（以前は長さの 20%＝こぶが突き抜けた）
+	FIB_SINK_LEN = 3.0     # mm。線維で同じ
+	SKIN_UP = 2            # 皮の輪を、線維の点の間に補間して何倍にするか（骨の細かい凹凸を点の間から出さない）
+	SKIN_M = 24            # 皮の輪のまわりの点の数
 
 	def _shown(self, si):
 		"""骨 si でいま見えているモデル: "alt"（表示変更用モデル）か "calc"（計算に使ったモデル・関節面）。"""
 		if self.plotter is None:
 			return "calc"
 		try:
-			act = self.plotter.renderer.actors.get(f"bone_{si}_alt")
+			act = self._actors().get(f"bone_{si}_alt")
 			if act is not None and act.GetVisibility():
 				return "alt"
 		except Exception:
@@ -844,6 +1009,481 @@ class Stage2:
 		cp = sc.compute_closest_points(o3d.core.Tensor(np.asarray(P, np.float32)))
 		return cp["points"].numpy().astype(float)
 
+	# ---------------------------------------------------------------- 見えている骨から皮・線維を押し出す（表示だけ）
+	def _skin_push_on(self):
+		return bool(self.params().get("skin_push", True))
+
+	def _disp_ob(self, si):
+		"""いま見えている骨 si の形（モデル座標）と、いちばん近い点を探す仕組み。見えていなければ None。
+		表示変更用モデルが見えていればそれ、そうでなければ画面に出ている骨（関節面だけの表示でも骨全体）。"""
+		if self.plotter is None:
+			return None
+		acts = self._actors()
+
+		def _vis(nm):
+			a_ = acts.get(nm)
+			try:
+				return a_ is not None and bool(a_.GetVisibility()) and float(a_.GetProperty().GetOpacity()) > 0.02
+			except Exception:
+				return False
+		if _vis(f"bone_{si}_alt"):
+			kind = "alt"
+		elif _vis(f"bone_{si}") or _vis(f"bone_{si}_joint"):
+			kind = "calc"
+		else:
+			return None
+		cache = self.__dict__.setdefault("_disp_obs", {})
+		key = (int(si), kind)
+		if key not in cache:
+			cache[key] = None
+			try:
+				import pyvista as pv
+				import open3d as o3d
+				act = acts.get(f"bone_{si}_alt" if kind == "alt" else f"bone_{si}")
+				tri = pv.wrap(act.GetMapper().GetInput()).extract_surface().triangulate()
+				T0 = self.poses[si][0]                      # 表示の骨 = UserMatrix × 最初のコマの姿勢 × モデル座標
+				Pv = (np.asarray(tri.points, float) - T0[:3, 3]) @ T0[:3, :3]
+				F = np.asarray(tri.faces).reshape(-1, 4)[:, 1:].astype(np.int32)
+				mm = pv.PolyData(Pv, np.c_[np.full(len(F), 3), F].ravel())
+				nm = mm.compute_normals(cell_normals=True, point_normals=True, consistent_normals=True,
+				                        auto_orient_normals=True, split_vertices=False)
+				F2 = np.asarray(nm.faces).reshape(-1, 4)[:, 1:].astype(np.int32)
+				sc = o3d.t.geometry.RaycastingScene()
+				sc.add_triangles(o3d.t.geometry.TriangleMesh(o3d.core.Tensor(Pv.astype(np.float32)), o3d.core.Tensor(F2)))
+				cache[key] = dict(sc=sc, F=F2, tn=np.asarray(nm.cell_data["Normals"], float),
+				                  vn=np.asarray(nm.point_data["Normals"], float), lo=Pv.min(axis=0), hi=Pv.max(axis=0))
+			except Exception as e:
+				print(f"[靭帯の束] 見えている骨の形を使えません（{self.names[si] if si < len(self.names) else si}）: {e}")
+		return cache[key]
+
+	@staticmethod
+	def _ob_closest(o, q):
+		"""_Bones.closest と同じ（いちばん近い面の点, なめらかな外向きの法線, 符号つき距離）。"""
+		import open3d as o3d
+		q = np.asarray(q, dtype=np.float32).reshape(-1, 3)
+		cp = o["sc"].compute_closest_points(o3d.core.Tensor(q))
+		cpp = cp["points"].numpy().astype(float)
+		pid = cp["primitive_ids"].numpy().astype(np.int64)
+		uv = cp["primitive_uvs"].numpy().astype(float)
+		Fi = o["F"][pid]
+		ns = ((1.0 - uv[:, :1] - uv[:, 1:]) * o["vn"][Fi[:, 0]] + uv[:, :1] * o["vn"][Fi[:, 1]] + uv[:, 1:] * o["vn"][Fi[:, 2]])
+		ns /= np.maximum(np.linalg.norm(ns, axis=1, keepdims=True), 1e-9)
+		dq = q - cpp
+		d = np.linalg.norm(dq, axis=1)
+		sd = np.where(np.einsum("ij,ij->i", dq, o["tn"][pid]) >= 0, d, -d)
+		return cpp, ns, sd
+
+	def _push_disp(self, P, c_of, fi, groups=None):
+		"""世界座標の点 P (n,3) を、見えている骨 si の面から c_of(si) (n,) mm 以上外へ（その場で書き換え。nan は動かさない）。
+		groups (n,) があれば、同じ組（皮の輪など）の点は、その組の骨の法線の平均の向きへ、骨の外へ出るまで持ち上げる
+		（いちばん近い面へ出すと、骨のこぶに当たった点がこぶの横へ逃げて、点の間の面がこぶを貫いた。2026-10-20）。"""
+		if groups is not None:
+			return self._push_disp_dir(P, c_of, fi, np.asarray(groups, int))
+		for si in range(len(self.poses)):
+			o = self._disp_ob(si)
+			if o is None:
+				continue
+			c = np.asarray(c_of(si), float)
+			T = self.poses[si][fi]
+			R, t = T[:3, :3], T[:3, 3]
+			q = (P - t) @ R
+			near = np.all((q > o["lo"] - 3.0) & (q < o["hi"] + 3.0), axis=1) & np.isfinite(c)
+			if not near.any():
+				continue
+			cpp, ns, sd = self._ob_closest(o, q[near])
+			cc = c[near]
+			bad = sd < cc
+			if bad.any():
+				ii = np.where(near)[0][bad]
+				P[ii] = (cpp[bad] + cc[bad, None] * ns[bad]) @ R.T + t
+		return P
+
+	def _push_disp_dir(self, P, c_of, fi, groups):
+		import open3d as o3d
+		ng = int(groups.max()) + 1 if len(groups) else 0
+		self._psd = {}                                          # 骨 → 押し出した後の距離（おおよそ。遠い点は inf）
+		for si in range(len(self.poses)):
+			o = self._disp_ob(si)
+			if o is None:
+				continue
+			c = np.asarray(c_of(si), float)
+			T = self.poses[si][fi]
+			R, t = T[:3, :3], T[:3, 3]
+			q = (P - t) @ R
+			near = np.all((q > o["lo"] - 3.0) & (q < o["hi"] + 3.0), axis=1) & np.isfinite(c)
+			if not near.any():
+				continue
+			ii = np.where(near)[0]
+			cpp, ns, sd = self._ob_closest(o, q[ii])
+			cc = c[ii]
+			bad = sd < cc
+			sda = np.full(len(P), np.inf)
+			sda[ii] = np.maximum(sd, cc)
+			self._psd[si] = sda
+			if not bad.any():
+				continue
+			# 組ごとの向き（その組の、骨の近く（5mm 以内）の点の法線の平均）
+			g = groups[ii]
+			wgt = (np.abs(sd) < 5.0).astype(float)[:, None]
+			acc = np.zeros((ng, 3))
+			np.add.at(acc, g, ns * wgt)
+			nrm = np.linalg.norm(acc, axis=1, keepdims=True)
+			dg = acc / np.maximum(nrm, 1e-9)
+			d = dg[g]
+			okd = (nrm[g, 0] > 1e-6) & (np.einsum("ij,ij->i", d, ns) > -0.2)
+			jj = np.where(bad)[0]
+			newq = cpp[jj] + cc[jj, None] * ns[jj]                       # 向きが決まらない点は、いちばん近い面へ
+			use = okd[jj]
+			if use.any():
+				k_ = jj[use]
+				org = q[ii][k_]
+				dd = d[k_]
+				inside = sd[k_] < 0.0
+				r = np.zeros(len(k_))
+				if inside.any():
+					rays = np.c_[org[inside], dd[inside]].astype(np.float32)
+					th = o["sc"].cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy().astype(float)
+					r[inside] = np.where(np.isfinite(th) & (th < 15.0), th, np.nan)
+				# 骨の外（0 ≤ 距離 < c）は、足りない分だけ（向きが面に斜めなら、そのぶん長く）。面に沿う向きなら使わない
+				cos_ = np.einsum("ij,ij->i", dd, ns[k_])
+				r[~inside] = np.where(cos_[~inside] > 0.2, 0.0, np.nan)
+				step = np.where(inside, cc[k_], (cc[k_] - sd[k_]) / np.maximum(cos_, 0.3))
+				cand = org + (r + step)[:, None] * dd
+				ok = np.isfinite(r)
+				newq[np.where(use)[0][ok]] = cand[ok]
+			# 確かめ: まだ c に足りない点（向きが面とほぼ平行・薄い所を抜けた など）は、その場所からいちばん近い面の外へ
+			cp2, ns2, sd2 = self._ob_closest(o, newq)
+			short = sd2 < cc[jj] - 0.02
+			if short.any():
+				newq[short] = cp2[short] + cc[jj][short, None] * ns2[short]
+			P[ii[jj]] = newq @ R.T + t
+		return P
+
+	@staticmethod
+	def _end_ramp(Cl, lo, hi, L):
+		"""中心の線 Cl (K,3) に沿った、1点目側・2点目側それぞれの「許す距離」: 端で lo、端から長さ L mm から先は hi（なめらか）。"""
+		sl = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(Cl, axis=0), axis=1))]
+
+		def _r(d):
+			w = np.clip(d / max(float(L), 1e-6), 0.0, 1.0)
+			w = w * w * (3.0 - 2.0 * w)
+			return lo + (hi - lo) * w
+		return _r(sl), _r(sl[-1] - sl)
+
+	@staticmethod
+	def _upsample(W, Ks):
+		"""線維 W (F,K,3) を長さ方向に Ks 点へ（Catmull-Rom。元の点を通る）。"""
+		F, K, _ = W.shape
+		if Ks <= K or K < 2:
+			return W
+		t = np.linspace(0.0, K - 1.0, Ks)
+		i1 = np.clip(np.floor(t).astype(int), 0, K - 2)
+		u = (t - i1)[None, :, None]
+		i0, i2, i3 = np.clip(i1 - 1, 0, K - 1), i1 + 1, np.clip(i1 + 2, 0, K - 1)
+		p0, p1, p2, p3 = W[:, i0], W[:, i1], W[:, i2], W[:, i3]
+		return 0.5 * ((2.0 * p1) + (-p0 + p2) * u + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u ** 2
+		              + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u ** 3)
+
+	QUAD_EXTRA = 0.3       # mm。皮の四角形の中心を、骨の面から SKIN_CLR よりこれだけ余分に離す
+
+	def _update_lig(self, jobs, fi):
+		"""束の線維と皮を描き直す。骨の外へ出すのは、全部の束をまとめて骨ごとに1回ずつ問い合わせる
+		（1回に渡す点が多いほど1点あたりが速い。束ごと・段階ごとに分けると1コマ36回で 40ms 以上かかった）。"""
+		from vtk.util.numpy_support import vtk_to_numpy
+		push = self._skin_push_on()
+		Ws = [W for (_b, _a, W) in jobs]
+		fj = [j for j, (_b, a, _W) in enumerate(jobs) if a["fib_act"].GetVisibility()]   # 線維が見えている束だけ
+		if push and fj:
+			try:
+				Wp = self._push_many([Ws[j] for j in fj], [self._fib_spec(jobs[j][2], jobs[j][1], jobs[j][0]) for j in fj], fi)
+				for j, W in zip(fj, Wp):
+					Ws[j] = W
+			except Exception as e:
+				traceback.print_exc()
+				print(f"[靭帯の束] 線維を骨の外へ出せません: {e}")
+				push = False
+		skins = []
+		for (b, a, _W), W in zip(jobs, Ws):
+			if a["fib_act"].GetVisibility():
+				vtk_to_numpy(a["fib_pts"].GetData())[:] = W.reshape(-1, 3)
+				a["fib_pts"].Modified()
+				a["fib_pd"].Modified()
+			if a["skin_act"].GetVisibility():
+				foot = None
+				if a.get("foot"):
+					foot = []
+					for f_, si_f in a["foot"]:
+						alt_ = self._shown(si_f) == "alt" and f_.get("alt") is not None
+						Tf = self.poses[si_f][fi]
+						ring_ = f_["alt"] if alt_ else f_["calc"]
+						cap_ = f_.get("cap_alt") if alt_ else f_.get("cap_calc")
+						foot.append({"ring": ring_ @ Tf[:3, :3].T + Tf[:3, 3],
+						             "cap": (None if cap_ is None else np.asarray(cap_) @ Tf[:3, :3].T + Tf[:3, 3])})
+					foot = tuple(foot)
+				skins.append((b, a, self._skin_points(self._upsample(W, int(a.get("Ks", W.shape[1]))), a["rf"], a["M"], foot)))
+		if push and skins:
+			try:
+				specs = [self._skin_spec(S, a, b) for (b, a, S) in skins]
+				Ss = self._push_many([S for (_b, _a, S) in skins], specs, fi)
+				Ss = self._lift_many(Ss, specs, fi)
+				skins = [(b, a, S) for (b, a, _S), S in zip(skins, Ss)]
+			except Exception as e:
+				traceback.print_exc()
+				print(f"[靭帯の束] 皮を骨の外へ出せません: {e}")
+		for (b, a, S) in skins:
+			vtk_to_numpy(a["skin_pts"].GetData())[:] = S
+			a["skin_pts"].Modified()
+			a["skin_pd"].Modified()
+
+	def _fib_spec(self, W, a, b):
+		"""線維の押し出しの条件: {"c": 骨 → (n,) 許す距離（nan は動かさない）, "g": 組（線維の同じ番号の点）}。両端の点は動かさない。"""
+		Fn, K, _ = W.shape
+		rf = float(a.get("rf", 0.4))
+		ra, rb = self._end_ramp(W.mean(axis=0), -rf, rf, self.FIB_SINK_LEN)
+		sia, sib = a["r"]["sia"], self._si_of_name(b["b"]["bone_name"])
+		kk = np.tile(np.arange(K), Fn)
+		cs = {}
+		for si in range(len(self.poses)):
+			c = np.full(K, rf)
+			if si == sia:
+				c = np.minimum(c, ra)
+			if si == sib:
+				c = np.minimum(c, rb)
+			c = c.copy()
+			c[0] = c[-1] = np.nan
+			cs[si] = c[kk]
+		return {"c": cs, "g": kk}
+
+	def _skin_spec(self, S, a, b):
+		"""皮の押し出しの条件（筒だけ。ふたは動かさない）。K（輪の数）・M・輪ごとの c も。"""
+		K, M = int(a.get("Ks", a["K"])), int(a["M"])
+		clr = float(self.SKIN_CLR)
+		ra, rb = self._end_ramp(S[:K * M].reshape(K, M, 3).mean(axis=1), -float(self.SKIN_SINK), clr, self.SKIN_SINK_LEN)
+		sia, sib = a["r"]["sia"], self._si_of_name(b["b"]["bone_name"])
+		n_cap = len(S) - K * M
+		cs, cr = {}, {}
+		for si in range(len(self.poses)):
+			c = np.full(K, clr)
+			if si == sia:
+				c = np.minimum(c, ra)
+			if si == sib:
+				c = np.minimum(c, rb)
+			cr[si] = c
+			cs[si] = np.concatenate([np.repeat(c, M), np.full(n_cap, np.nan)])
+		g = np.concatenate([np.repeat(np.arange(K), M), np.zeros(n_cap, int)])
+		return {"c": cs, "g": g, "K": K, "M": M, "c_ring": cr}
+
+	def _push_many(self, Ps, specs, fi):
+		"""いくつもの点の組 Ps を、まとめて骨の外へ（骨ごとに1回ずつ問い合わせる）。返り値: 押し出した Ps（形はそのまま）。"""
+		flat = [np.asarray(P, float).reshape(-1, 3).copy() for P in Ps]
+		off = np.r_[0, np.cumsum([len(f) for f in flat])]
+		goff = np.r_[0, np.cumsum([int(sp["g"].max()) + 1 if len(sp["g"]) else 0 for sp in specs])]
+		Pall = np.concatenate(flat, axis=0)
+		gall = np.concatenate([sp["g"] + goff[j] for j, sp in enumerate(specs)])
+		call = {si: np.concatenate([sp["c"][si] for sp in specs]) for si in range(len(self.poses))}
+		self._push_disp(Pall, lambda si: call[si], fi, groups=gall)
+		psd = self.__dict__.get("_psd") or {}
+		for j, sp in enumerate(specs):
+			sp["psd"] = {si: v[off[j]:off[j + 1]] for si, v in psd.items()}
+		return [Pall[off[j]:off[j + 1]].reshape(np.shape(P)) for j, P in enumerate(Ps)]
+
+	def _lift_many(self, Ss, specs, fi, iters=3):
+		"""皮の筒の四角形の中心が骨の面から c より近ければ、その四隅を筒の外向きに持ち上げる（全部の束をまとめて）。
+		点がすべて骨の外でも、とがったこぶの先が四角形の真ん中から出た（PCL の脛骨の付着部の上）。下側は動かさない。"""
+		Ss = [np.asarray(S, float).copy() for S in Ss]
+		active = None                                 # 2回目からは、前に持ち上げた四角形だけを確かめ直す
+		for _it in range(iters):
+			Qs, Rqs = [], []
+			for S, sp in zip(Ss, specs):
+				K, M = sp["K"], sp["M"]
+				tube = S[:K * M].reshape(K, M, 3)
+				Cl = tube.mean(axis=1)
+				A_, B_ = tube[:-1], tube[1:]
+				Q = 0.25 * (A_ + B_ + np.roll(A_, -1, axis=1) + np.roll(B_, -1, axis=1))
+				rq = Q - (0.5 * (Cl[:-1] + Cl[1:]))[:, None]
+				rq /= np.maximum(np.linalg.norm(rq, axis=2, keepdims=True), 1e-9)
+				Qs.append(Q.reshape(-1, 3))
+				Rqs.append(rq.reshape(-1, 3))
+			off = np.r_[0, np.cumsum([len(q) for q in Qs])]
+			Qa, Ra = np.concatenate(Qs), np.concatenate(Rqs)
+			lift = np.zeros(len(Qa))
+			for si in range(len(self.poses)):
+				o = self._disp_ob(si)
+				if o is None:
+					continue
+				cq_l, cand_l = [], []
+				for sp in specs:
+					K, M = sp["K"], sp["M"]
+					cr = np.asarray(sp["c_ring"][si], float)
+					crq = 0.5 * (cr[:-1] + cr[1:])
+					# 四角形の中心は少し余分に離す（中心だけ確かめるので、とがったこぶの先が中心と角の間から出ないように）。
+					# 付着部の近く（骨の中へ入るのを許す所）では、その割合に合わせて小さく
+					crq = crq + self.QUAD_EXTRA * np.clip((crq + self.SKIN_SINK) / (self.SKIN_CLR + self.SKIN_SINK), 0.0, 1.0)
+					cand = np.repeat(np.isfinite(crq), M)
+					psd = (sp.get("psd") or {}).get(si)
+					if psd is not None and len(psd) >= K * M:
+						sc_ = psd[:K * M].reshape(K, M)
+						qmin = np.minimum(np.minimum(sc_[:-1], sc_[1:]),
+						                  np.minimum(np.roll(sc_[:-1], -1, axis=1), np.roll(sc_[1:], -1, axis=1)))
+						cand &= (qmin < crq[:, None] + 1.5).reshape(-1)      # 四隅のどれかが骨に近い四角形だけ
+					cq_l.append(np.repeat(crq, M))
+					cand_l.append(cand)
+				cqa, ca = np.concatenate(cq_l), np.concatenate(cand_l)
+				if active is not None:
+					ca &= active
+				T = self.poses[si][fi]
+				R, t = T[:3, :3], T[:3, 3]
+				q = (Qa - t) @ R
+				ca &= np.all((q > o["lo"] - 3.0) & (q < o["hi"] + 3.0), axis=1)
+				if not ca.any():
+					continue
+				ii = np.where(ca)[0]
+				_cp, ns, sd = self._ob_closest(o, q[ii])
+				cos_ = np.einsum("ij,ij->i", Ra[ii], ns @ R.T)
+				dfc = cqa[ii] - sd
+				ok = (dfc > 0) & (cos_ > 0.2) & (dfc < 6.0)
+				if ok.any():
+					v = np.zeros(len(Qa))
+					v[ii[ok]] = dfc[ok] / np.maximum(cos_[ok], 0.3)
+					lift = np.maximum(lift, v)
+			if not (lift > 1e-4).any():
+				break
+			active = lift > 1e-4
+			for j, (S, sp) in enumerate(zip(Ss, specs)):
+				K, M = sp["K"], sp["M"]
+				lj = lift[off[j]:off[j + 1]].reshape(K - 1, M)
+				if not (lj > 1e-4).any():
+					continue
+				tube = S[:K * M].reshape(K, M, 3)
+				Cl = tube.mean(axis=1)
+				lv = np.zeros((K, M))
+				for dk, dm in ((0, 0), (1, 0), (0, 1), (1, 1)):
+					lv[dk:K - 1 + dk] = np.maximum(lv[dk:K - 1 + dk], np.roll(lj, dm, axis=1))
+				rv = tube - Cl[:, None]
+				rv /= np.maximum(np.linalg.norm(rv, axis=2, keepdims=True), 1e-9)
+				S[:K * M] = (tube + lv[:, :, None] * rv).reshape(-1, 3)
+				mv = sp.setdefault("moved", np.zeros(K * M, bool))
+				mv |= (lv > 1e-4).reshape(-1)
+		# 確かめ: 持ち上げで動いた点（四隅は筒の外向きに動かすので、骨に接している側の角が骨へ入ることがある）を、骨の外へ
+		for si in range(len(self.poses)):
+			o = self._disp_ob(si)
+			if o is None:
+				continue
+			sel = [(j, np.where(sp.get("moved", np.zeros(0, bool)))[0]) for j, sp in enumerate(specs)]
+			sel = [(j, ix) for j, ix in sel if len(ix)]
+			if not sel:
+				continue
+			Pm = np.concatenate([Ss[j][ix] for j, ix in sel])
+			cm = np.concatenate([np.asarray(specs[j]["c"][si], float)[ix] for j, ix in sel])
+			T = self.poses[si][fi]
+			R, t = T[:3, :3], T[:3, 3]
+			q = (Pm - t) @ R
+			okm = np.isfinite(cm) & np.all((q > o["lo"] - 3.0) & (q < o["hi"] + 3.0), axis=1)
+			if not okm.any():
+				continue
+			kk = np.where(okm)[0]
+			cp_, ns_, sd_ = self._ob_closest(o, q[kk])
+			short = sd_ < cm[kk] - 0.02
+			if not short.any():
+				continue
+			q[kk[short]] = cp_[short] + cm[kk[short], None] * ns_[short]
+			Pm2 = q @ R.T + t
+			o_ = 0
+			for j, ix in sel:
+				Ss[j][ix] = Pm2[o_:o_ + len(ix)]
+				o_ += len(ix)
+		return Ss
+
+	def _push_fibers(self, W, a, b, fi):
+		"""線維 W (F,K,3)（世界座標）を見えている骨の外へ。両端の点は動かさない。"""
+		Fn, K, _ = W.shape
+		rf = float(a.get("rf", 0.4))
+		ra, rb = self._end_ramp(W.mean(axis=0), -rf, rf, self.FIB_SINK_LEN)
+		sia, sib = a["r"]["sia"], self._si_of_name(b["b"]["bone_name"])
+		kk = np.tile(np.arange(K), Fn)
+
+		def c_of(si):
+			c = np.full(K, rf)
+			if si == sia:
+				c = np.minimum(c, ra)
+			if si == sib:
+				c = np.minimum(c, rb)
+			c = c.copy()
+			c[0] = c[-1] = np.nan
+			return c[kk]
+		P = W.reshape(-1, 3).copy()
+		self._push_disp(P, c_of, fi, groups=kk)
+		return P.reshape(W.shape)
+
+	def _push_skin(self, S, a, b, fi):
+		"""皮の点 S（K*M の筒 + 両端のふた）を見えている骨の外へ。ふたは動かさない。"""
+		K, M = int(a.get("Ks", a["K"])), int(a["M"])
+		clr = float(self.SKIN_CLR)
+		ra, rb = self._end_ramp(S[:K * M].reshape(K, M, 3).mean(axis=1), -float(self.SKIN_SINK), clr, self.SKIN_SINK_LEN)
+		sia, sib = a["r"]["sia"], self._si_of_name(b["b"]["bone_name"])
+		n_cap = len(S) - K * M
+
+		def c_of(si):
+			c = np.full(K, clr)
+			if si == sia:
+				c = np.minimum(c, ra)
+			if si == sib:
+				c = np.minimum(c, rb)
+			return np.concatenate([np.repeat(c, M), np.full(n_cap, np.nan)])
+		grp = np.concatenate([np.repeat(np.arange(K), M), np.zeros(n_cap, int)])
+		self._push_disp(S, c_of, fi, groups=grp)
+		self._lift_quads(S, K, M, {si: c_of(si)[:K * M:M] for si in range(len(self.poses))}, fi)
+		return S
+
+	def _lift_quads(self, S, K, M, c_ring, fi, iters=2):
+		"""皮の筒の四角形の中心が骨の面から c（輪ごと）より近ければ、その四隅を筒の外向きに持ち上げる（その場で書き換え）。
+		点の間から骨のとがった所が出ないように。下側（筒の外向きが骨の中を向く所）は動かさない。"""
+		for _it in range(iters):
+			tube = S[:K * M].reshape(K, M, 3)
+			Cl = tube.mean(axis=1)
+			A_, B_ = tube[:-1], tube[1:]
+			Q = 0.25 * (A_ + B_ + np.roll(A_, -1, axis=1) + np.roll(B_, -1, axis=1))          # (K-1, M, 3)
+			Cq = 0.5 * (Cl[:-1] + Cl[1:])
+			rq = Q - Cq[:, None]
+			rq /= np.maximum(np.linalg.norm(rq, axis=2, keepdims=True), 1e-9)
+			lift = np.zeros((K - 1, M))
+			for si in range(len(self.poses)):
+				o = self._disp_ob(si)
+				if o is None:
+					continue
+				cr = np.asarray(c_ring[si], float)
+				cq = 0.5 * (cr[:-1] + cr[1:])
+				T = self.poses[si][fi]
+				R, t = T[:3, :3], T[:3, 3]
+				q = (Q.reshape(-1, 3) - t) @ R
+				near = np.all((q > o["lo"] - 3.0) & (q < o["hi"] + 3.0), axis=1) & np.repeat(np.isfinite(cq), M)
+				psd = (self.__dict__.get("_psd") or {}).get(si)
+				if psd is not None and len(psd) >= K * M:
+					sc_ = psd[:K * M].reshape(K, M)
+					qmin = np.minimum(np.minimum(sc_[:-1], sc_[1:]), np.minimum(np.roll(sc_[:-1], -1, axis=1), np.roll(sc_[1:], -1, axis=1)))
+					near &= (qmin < cq[:, None] + 1.5).reshape(-1)          # 四隅のどれかが骨に近い四角形だけ
+				if not near.any():
+					continue
+				ii = np.where(near)[0]
+				_cp, ns, sd = self._ob_closest(o, q[ii])
+				nsw = ns @ R.T
+				cos_ = np.einsum("ij,ij->i", rq.reshape(-1, 3)[ii], nsw)
+				dfc = np.repeat(cq, M)[ii] - sd
+				ok = (dfc > 0) & (cos_ > 0.2) & (dfc < 6.0)
+				if ok.any():
+					v = np.zeros(len(Q.reshape(-1, 3)))
+					v[ii[ok]] = dfc[ok] / np.maximum(cos_[ok], 0.3)
+					lift = np.maximum(lift, v.reshape(K - 1, M))
+			if not (lift > 1e-4).any():
+				break
+			lv = np.zeros((K, M))
+			for dk, dm in ((0, 0), (1, 0), (0, 1), (1, 1)):
+				lv[dk:K - 1 + dk] = np.maximum(lv[dk:K - 1 + dk], np.roll(lift, dm, axis=1))
+			rv = tube - Cl[:, None]
+			rv /= np.maximum(np.linalg.norm(rv, axis=2, keepdims=True), 1e-9)
+			S[:K * M] = (tube + lv[:, :, None] * rv).reshape(-1, 3)
+		return S
+
 	def _foot_ring(self, end, M):
 		"""付着部の楕円を骨の面へ落とした輪（M 点・その骨のモデル座標）。
 		返り値: ({"calc": 骨の少し中, "alt": 表示変更用モデルの少し中 or None, "out_calc"/"out_alt": 面の少し外（輪郭の線）}, 骨の番号)"""
@@ -853,10 +1493,10 @@ class Stage2:
 		idx = self.idx_of[si]
 		c = np.asarray(ell["center"], float)
 		u, v = np.asarray(ell["u"], float), np.asarray(ell["v"], float)
-		_cp, ns, _sd = bones.closest(idx, c[None])
+		nE = ell_normal(bones, idx, ell)                 # 楕円の面の法線の向きに骨の面へ落とす
 		th = np.linspace(0.0, 2.0 * np.pi, M, endpoint=False)
-		P = c + np.outer(np.cos(th) * float(ell["ra"]), u) + np.outer(np.sin(th) * float(ell["rb"]), v) + 2.0 * ns[0]
-		cpp, ns2, _sd2 = bones.closest(idx, P)
+		P = c + np.outer(np.cos(th) * float(ell["ra"]), u) + np.outer(np.sin(th) * float(ell["rb"]), v)
+		cpp, ns2 = bones.onto(idx, P, nE)
 		out = {"calc": cpp - self.SKIN_SINK * ns2, "out_calc": cpp + 0.05 * ns2, "alt": None, "out_alt": None}
 		ca = self._onto_alt(si, cpp)
 		if ca is not None:
@@ -865,8 +1505,8 @@ class Stage2:
 		# ふたの同心の輪（骨の面へ落として、少し中へ）
 		caps_c, caps_a = [], []
 		for sc_ in self.SKIN_CAP_SCALES:
-			Ps = c + sc_ * (np.outer(np.cos(th) * float(ell["ra"]), u) + np.outer(np.sin(th) * float(ell["rb"]), v)) + 2.0 * ns[0]
-			cps, nss, _sd3 = bones.closest(idx, Ps)
+			Ps = c + sc_ * (np.outer(np.cos(th) * float(ell["ra"]), u) + np.outer(np.sin(th) * float(ell["rb"]), v))
+			cps, nss = bones.onto(idx, Ps, nE)
 			caps_c.append(cps - self.SKIN_SINK * nss)
 			if ca is not None:
 				cas = self._onto_alt(si, cps)
@@ -894,29 +1534,30 @@ class Stage2:
 		foot=({"ring": 1点目の付着部の輪, "cap": ふたの輪}, {2点目…})（世界座標）があれば、皮の両端をそれに合わせる。"""
 		Fn, K, _ = W.shape
 		C = W.mean(axis=0)
-		out = np.zeros((K, M, 3))
 		th = np.linspace(0, 2 * np.pi, M, endpoint=False)
-		prev = None
-		for k in range(K):
-			t = C[min(k + 1, K - 1)] - C[max(k - 1, 0)]
-			t /= max(np.linalg.norm(t), 1e-9)
-			Q = W[:, k] - C[k]
-			Q = Q - np.outer(Q @ t, t)
-			if Fn >= 2:
-				_u, s, vt = np.linalg.svd(Q, full_matrices=False)
-				e1 = vt[0] - (vt[0] @ t) * t
-			else:
-				e1 = np.cross(t, [1.0, 0.0, 0.0])
-			if np.linalg.norm(e1) < 1e-6:
-				e1 = np.cross(t, [0.0, 1.0, 0.0])
-			e1 /= np.linalg.norm(e1)
-			if prev is not None and e1 @ prev < 0:
-				e1 = -e1
-			prev = e1
-			e2 = np.cross(t, e1)
-			r1 = float(np.abs(Q @ e1).max()) + rf if Fn else rf
-			r2 = float(np.abs(Q @ e2).max()) + rf if Fn else rf
-			out[k] = C[k] + np.outer(np.cos(th) * r1, e1) + np.outer(np.sin(th) * r2, e2)
+		# 全部の輪をまとめて（以前は輪ごとの SVD のループ。皮を細かくしたら遅くなった）
+		kk = np.arange(K)
+		t = C[np.minimum(kk + 1, K - 1)] - C[np.maximum(kk - 1, 0)]
+		t /= np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-9)
+		Q = W - C[None]
+		Q = Q - np.einsum("fki,ki->fk", Q, t)[:, :, None] * t[None]
+		if Fn >= 2:
+			_w, V = np.linalg.eigh(np.einsum("fki,fkj->kij", Q, Q))      # 線維の広がりの主成分（SVD と同じ向き）
+			e1 = V[:, :, -1]
+		else:
+			e1 = np.cross(t, [1.0, 0.0, 0.0])
+		e1 = e1 - np.einsum("ki,ki->k", e1, t)[:, None] * t
+		bad = np.linalg.norm(e1, axis=1) < 1e-6
+		if bad.any():
+			e1[bad] = np.cross(t[bad], [0.0, 1.0, 0.0])
+		e1 /= np.maximum(np.linalg.norm(e1, axis=1, keepdims=True), 1e-12)
+		dd = np.einsum("ki,ki->k", e1[1:], e1[:-1])
+		e1 *= np.r_[1.0, np.cumprod(np.where(dd < 0, -1.0, 1.0))][:, None]   # 向きをなめらかにつなぐ（裏返さない）
+		e2 = np.cross(t, e1)
+		r1 = np.abs(np.einsum("fki,ki->fk", Q, e1)).max(axis=0) + rf
+		r2 = np.abs(np.einsum("fki,ki->fk", Q, e2)).max(axis=0) + rf
+		out = (C[:, None] + (np.cos(th)[None, :, None] * r1[:, None, None]) * e1[:, None]
+		       + (np.sin(th)[None, :, None] * r2[:, None, None]) * e2[:, None])
 		NS = len(self.SKIN_CAP_SCALES)
 		caps = []
 		tk = np.linspace(0.0, 1.0, K)
@@ -976,10 +1617,28 @@ class Stage2:
 		except Exception:
 			return None
 
+	def _actors(self):
+		"""画面の部品の一覧（名前 → アクター）。更新の間は1回だけ取り出したものを使う（呼ぶたびに作り直すので遅い）。"""
+		a_ = self.__dict__.get("_acts_now")
+		if a_ is not None:
+			return a_
+		return self.plotter.renderer.actors if self.plotter is not None else {}
+
 	def update(self, fi, render=False):
+		try:
+			self._acts_now = self.plotter.renderer.actors if self.plotter is not None else None
+		except Exception:
+			self._acts_now = None
+		try:
+			return self._update_impl(fi, render)
+		finally:
+			self._acts_now = None
+
+	def _update_impl(self, fi, render=False):
 		try:
 			self.fi = int(fi)
 			fi = max(0, min(int(fi), self.n_view - 1)) if self.n_view else 0
+			jobs = []
 			for b in self.data["bundles"]:
 				a = self.actors.get(b.get("id"))
 				if not a:
@@ -1018,26 +1677,10 @@ class Stage2:
 						if Palt is not None and self._shown(si_e) == "alt":
 							Te = self.poses[si_e][fi]
 							W[:, col_] = Palt @ Te[:3, :3].T + Te[:3, 3]
-				from vtk.util.numpy_support import vtk_to_numpy
-				if a["fib_act"].GetVisibility():
-					vtk_to_numpy(a["fib_pts"].GetData())[:] = W.reshape(-1, 3)
-					a["fib_pts"].Modified()
-					a["fib_pd"].Modified()
-				if a["skin_act"].GetVisibility():
-					foot = None
-					if a.get("foot"):
-						foot = []
-						for f_, si_f in a["foot"]:
-							alt_ = self._shown(si_f) == "alt" and f_.get("alt") is not None
-							Tf = self.poses[si_f][fi]
-							ring_ = f_["alt"] if alt_ else f_["calc"]
-							cap_ = f_.get("cap_alt") if alt_ else f_.get("cap_calc")
-							foot.append({"ring": ring_ @ Tf[:3, :3].T + Tf[:3, 3],
-							             "cap": (None if cap_ is None else np.asarray(cap_) @ Tf[:3, :3].T + Tf[:3, 3])})
-						foot = tuple(foot)
-					vtk_to_numpy(a["skin_pts"].GetData())[:] = self._skin_points(W, a["rf"], a["M"], foot)
-					a["skin_pts"].Modified()
-					a["skin_pd"].Modified()
+				if a["fib_act"].GetVisibility() or a["skin_act"].GetVisibility():
+					jobs.append((b, a, W))                       # 線維・皮は、全部の束をまとめて描き直す（下）
+			if jobs:
+				self._update_lig(jobs, fi)
 			for act, si in self.guides:
 				act.SetUserMatrix(self._mat(self.poses[si][fi]))
 			for act, si in self.pend:
@@ -1116,12 +1759,13 @@ class Stage2:
 
 	# ---------------------------------------------------------------- 管理の画面
 	def _say(self, text, color="gray"):
-		lbl = self.w.get("status")
-		try:
-			if lbl is not None and lbl.winfo_exists():
-				lbl.config(text=str(text), foreground=color)
-		except Exception:
-			pass
+		for key in ("status", "ol_msg"):
+			lbl = self.w.get(key)
+			try:
+				if lbl is not None and lbl.winfo_exists():
+					lbl.config(text=str(text), foreground=color)
+			except Exception:
+				pass
 		print(f"[靭帯の束] {text}")
 
 	def open_window(self):
@@ -1151,6 +1795,9 @@ class Stage2:
 		self.w["guide_lbl"] = ttk.Label(top, text=os.path.basename(str(self.data.get("guide_file") or "（まだ読み込んでいません）")),
 		                                foreground="gray")
 		self.w["guide_lbl"].pack(side="left", padx=6)
+		# バックアップ（2026-10-20）
+		ttk.Button(top, text="バックアップから読み込む…", command=self._backup_import_clicked).pack(side="right", padx=4, pady=4)
+		ttk.Button(top, text="💾 バックアップを書き出す…", command=self._backup_export_clicked).pack(side="right", padx=4, pady=4)
 
 		mid = ttk.LabelFrame(win, text="束（例: ACL を AM・PL の2束、PCL を AL・PM の2束）")
 		mid.pack(fill="both", expand=True, padx=8, pady=4)
@@ -1158,34 +1805,73 @@ class Stage2:
 		self.w["rows"].pack(fill="both", expand=True, padx=4, pady=4)
 		ttk.Button(mid, text="＋ 束を追加", command=self._add_bundle).pack(anchor="w", padx=6, pady=(0, 6))
 
-		ol = ttk.LabelFrame(win, text="付着部の面を描く（骨の上で外周を右クリック。5 点以上。右ドラッグのズームは従来どおり）")
+		ol = ttk.LabelFrame(win, text="付着部の面を描く（骨の上で外周を右クリック。5 点以上。打った点は左クリックで選べます。右ドラッグのズームは従来どおり）")
 		ol.pack(fill="x", padx=8, pady=4)
 		self.w["ol_lbl"] = ttk.Label(ol, text="（束の行の「面を描く」を押すと始まります）", foreground="gray")
 		self.w["ol_lbl"].pack(anchor="w", padx=6)
+		self.w["ol_msg"] = ttk.Label(ol, text="", foreground="gray", wraplength=980, justify="left")
+		self.w["ol_msg"].pack(anchor="w", padx=6)
 		olr = ttk.Frame(ol)
 		olr.pack(fill="x", padx=6, pady=4)
 		self.w["ol_list"] = tk.Listbox(olr, height=4, width=46, exportselection=False)
 		self.w["ol_list"].pack(side="left")
+		self.w["ol_list"].bind("<<ListboxSelect>>", lambda e: self._ol_on_list_select())
 		bf = ttk.Frame(olr)
 		bf.pack(side="left", padx=8)
 		ttk.Button(bf, text="最後の点を取り消す", command=self._ol_undo).grid(row=0, column=0, sticky="ew", padx=2, pady=1)
 		ttk.Button(bf, text="選んだ点を打ち直す", command=self._ol_replace).grid(row=0, column=1, sticky="ew", padx=2, pady=1)
 		ttk.Button(bf, text="選んだ点を消す", command=self._ol_delete).grid(row=1, column=0, sticky="ew", padx=2, pady=1)
 		ttk.Button(bf, text="すべて消す", command=self._ol_clear).grid(row=1, column=1, sticky="ew", padx=2, pady=1)
-		ttk.Button(bf, text="✅ 楕円を当てはめて決める", command=self._ol_commit).grid(row=2, column=0, sticky="ew", padx=2, pady=1)
-		ttk.Button(bf, text="やめる", command=self._ol_cancel).grid(row=2, column=1, sticky="ew", padx=2, pady=1)
+		ttk.Button(bf, text="① 楕円を当てはめる", command=self._ol_fit).grid(row=2, column=0, sticky="ew", padx=2, pady=1)
+		ttk.Button(bf, text="② この楕円で決める（保存）", command=self._ol_commit).grid(row=2, column=1, sticky="ew", padx=2, pady=1)
+		ttk.Button(bf, text="前の点を読み込む（直すとき）", command=self._ol_load_prev).grid(row=3, column=0, sticky="ew", padx=2, pady=1)
+		ttk.Button(bf, text="やめる", command=self._ol_cancel).grid(row=3, column=1, sticky="ew", padx=2, pady=1)
+		cf = ttk.Frame(ol)
+		cf.pack(fill="x", padx=6, pady=(0, 2))
+		ttk.Label(cf, text="ノギスで測った値（端から端）: 長径").pack(side="left")
+		for k, lab_ in (("cal_L", "mm　短径"), ("cal_S", "mm（入れると①の結果との差を出します。空でも可）")):
+			e_ = ttk.Entry(cf, width=7)
+			e_.pack(side="left", padx=(2, 2))
+			for sq_ in ("<KeyRelease>", "<FocusOut>", "<Return>"):
+				e_.bind(sq_, lambda ev: self._ol_dims())
+			self.w[k] = e_
+			ttk.Label(cf, text=lab_).pack(side="left")
+		self.w["ol_dims"] = ttk.Label(ol, text="", font=("", 11, "bold"))
+		self.w["ol_dims"].pack(anchor="w", padx=6, pady=(0, 4))
+
+		# 付着部の楕円を動かす（平行移動。2026-10-20）
+		mv = ttk.LabelFrame(win, text="付着部の楕円を動かす（平行移動。いまの視点で見た上下左右に、楕円の面の中で）")
+		mv.pack(fill="x", padx=8, pady=4)
+		mvr = ttk.Frame(mv)
+		mvr.pack(fill="x", padx=6, pady=4)
+		ttk.Label(mvr, text="動かす楕円").pack(side="left")
+		self.w["mv_target"] = tk.StringVar(win, value="")
+		self.w["mv_combo"] = ttk.Combobox(mvr, textvariable=self.w["mv_target"], state="readonly", width=34)
+		self.w["mv_combo"].pack(side="left", padx=(4, 10))
+		self.w["mv_combo"].bind("<Button-1>", lambda e: self._mv_refresh_targets())
+		ttk.Label(mvr, text="1 回").pack(side="left")
+		self.w["mv_step"] = tk.StringVar(win, value="0.5")
+		ttk.Spinbox(mvr, from_=0.1, to=10.0, increment=0.1, width=5, textvariable=self.w["mv_step"]).pack(side="left", padx=2)
+		ttk.Label(mvr, text="mm").pack(side="left", padx=(0, 8))
+		for lab_, dx_, dy_ in (("↑", 0, 1), ("↓", 0, -1), ("←", -1, 0), ("→", 1, 0)):
+			ttk.Button(mvr, text=lab_, width=3, command=lambda dx=dx_, dy=dy_: self._mv_click(dx, dy)).pack(side="left", padx=1)
+		ttk.Button(mvr, text="動かす前に戻す", command=self._mv_undo).pack(side="left", padx=(10, 0))
+		self.w["mv_lbl"] = ttk.Label(mv, text="（束の面を決めると選べます。動かすと計算の結果は外れるので、もう一度「▶ 計算する」）",
+		                             foreground="gray")
+		self.w["mv_lbl"].pack(anchor="w", padx=6, pady=(0, 4))
+		self._mv_refresh_targets()
 
 		bot = ttk.Frame(win)
 		bot.pack(fill="x", padx=8, pady=(4, 8))
 		pp = self.params()
 		ttk.Label(bot, text="表示:").pack(side="left")
 		self.w["view_var"] = tk.StringVar(win, value=str(pp.get("view", "both")))
-		for v_, t_ in (("fibers", "線維"), ("skin", "楕円の皮"), ("both", "両方")):
+		for v_, t_ in (("fibers", "線維"), ("skin", "楕円の皮"), ("both", "両方"), ("foot", "付着部の楕円だけ")):
 			ttk.Radiobutton(bot, text=t_, value=v_, variable=self.w["view_var"], command=self._set_view).pack(side="left")
 		ttk.Label(bot, text="　自然長 ×").pack(side="left")
 		self.w["scale_var"] = tk.StringVar(win, value=f"{100.0 * float(pp.get('rest_scale', 1.0)):g}")
 		ttk.Spinbox(bot, from_=80, to=120, increment=1, width=5, textvariable=self.w["scale_var"]).pack(side="left")
-		ttk.Label(bot, text="%（表示の始まりのコマで張った長さに対して）").pack(side="left")
+		ttk.Label(bot, text="%（自然長の基準のコマで張った長さに対して）").pack(side="left")
 		self.w["grav_var"] = tk.BooleanVar(win, value=float(pp.get("gravity", 0.02)) > 0)
 		ttk.Checkbutton(bot, text="たるみを下へ（弱い重さ）", variable=self.w["grav_var"]).pack(side="left", padx=8)
 		self.w["outline_var"] = tk.BooleanVar(win, value=bool(pp.get("show_outline", True)))
@@ -1195,6 +1881,48 @@ class Stage2:
 		ttk.Checkbutton(bot, text="断面のめやす", variable=self.w["xsec_var"],
 		                command=lambda: self._set_param_view("show_xsec", bool(self.w["xsec_var"].get()))).pack(side="left", padx=4)
 		ttk.Button(bot, text="▶ 計算する", command=self._compute_clicked).pack(side="right", padx=4)
+		# 自然長の基準のコマ・束どうしの当たり（2026-10-20。どちらも計算の結果が変わる）
+		bot3 = ttk.Frame(win)
+		bot3.pack(fill="x", padx=8, pady=(0, 4))
+		ttk.Label(bot3, text="自然長の基準:").pack(side="left")
+		self.w["ref_lbl"] = ttk.Label(bot3, text="", width=38)
+		self.w["ref_lbl"].pack(side="left", padx=(2, 4))
+		ttk.Button(bot3, text="いまのコマを基準にする", command=self._rest_here).pack(side="left", padx=2)
+		ttk.Button(bot3, text="自動（初期状態）に戻す", command=self._rest_reset).pack(side="left", padx=2)
+		self.w["contact_var"] = tk.BooleanVar(win, value=bool(pp.get("bundle_contact", True)))
+		ttk.Checkbutton(bot3, text="束どうしの当たり（外形どうしがめり込まない）", variable=self.w["contact_var"],
+		                command=self._contact_toggle).pack(side="left", padx=(14, 4))
+		ttk.Label(bot3, text="（どちらも変えると計算し直しが要ります）", foreground="gray").pack(side="left", padx=4)
+		self._rest_label()
+		# 靭帯（線維・皮）だけの不透明度（骨・付着部の楕円は変えない。2026-10-20）
+		bot2 = ttk.Frame(win)
+		bot2.pack(fill="x", padx=8, pady=(0, 6))
+		ttk.Label(bot2, text="靭帯の不透明度（線維・皮だけ）").pack(side="left")
+		self.w["op_var"] = tk.DoubleVar(win, value=round(100.0 * self._lig_opacity()))
+		self.w["op_lbl"] = ttk.Label(bot2, text=f"{int(round(100.0 * self._lig_opacity()))} %", width=6)
+
+		def _op_move(v):
+			try:
+				val = float(v) / 100.0
+			except ValueError:
+				return
+			self.data.setdefault("params", {})["lig_opacity"] = max(0.0, min(1.0, val))
+			self.w["op_lbl"].config(text=f"{int(round(100.0 * self._lig_opacity()))} %")
+			self._apply_lig_opacity()
+		sc_ = ttk.Scale(bot2, from_=0, to=100, orient="horizontal", length=220, variable=self.w["op_var"], command=_op_move)
+		sc_.pack(side="left", padx=6)
+		sc_.bind("<ButtonRelease-1>", lambda e: self._save())          # 離したときに覚える
+		self.w["op_scale"] = sc_
+		self.w["op_lbl"].pack(side="left")
+		self.w["push_var"] = tk.BooleanVar(win, value=self._skin_push_on())
+
+		def _push_toggle():
+			self.data.setdefault("params", {})["skin_push"] = bool(self.w["push_var"].get())
+			self._save()
+			self.update(self.fi, render=True)
+		ttk.Checkbutton(bot2, text="骨が靭帯を突き抜けないように（皮・線維を見えている骨の外へ。表示だけ）",
+		                variable=self.w["push_var"], command=_push_toggle).pack(side="left", padx=(12, 4))
+		ttk.Label(bot2, text="（「付着部の楕円だけ」で靭帯を隠し、付着部の楕円だけを出せます）", foreground="gray").pack(side="left", padx=6)
 		self.w["status"] = ttk.Label(win, text="", foreground="gray", wraplength=1000, justify="left")
 		self.w["status"].pack(fill="x", padx=10, pady=(0, 6))
 		self._rows()
@@ -1396,6 +2124,96 @@ class Stage2:
 		self.compute(parent=self.win)
 		self._rows()
 
+	# ---------------------------------------------------------------- 自然長の基準のコマ・束どうしの当たり
+	def _rec_id(self):
+		"""この記録（タブ）の指紋。束のデータは骨リストを共有するタブで共有されるが、自然長の基準のコマは記録ごとに違うので、
+		記録ごとに覚える（骨の姿勢の始め・終わりとコマの数から）。"""
+		rid = self.__dict__.get("_rid")
+		if rid is None:
+			h = hashlib.sha1()
+			h.update(f"{self.n_view}|{self.s0}|".encode())
+			for P_ in self.poses:
+				h.update(np.round(np.asarray(P_[[0, -1]], float), 2).tobytes())
+			rid = self._rid = h.hexdigest()[:12]
+		return rid
+
+	def _rest_manual(self):
+		"""この記録で手で選んだ自然長の基準のコマ（絶対のコマ番号）。無ければ None。"""
+		g = (self.params().get("rest_frames") or {}).get(self._rec_id())
+		return int(g) if g is not None else None
+
+	def _auto_rest(self):
+		"""初期状態の終わりの 1 秒前のコマ（絶対）。試験の段階（発表用の表示の phase_at）から:
+		最初に前方（+1）か後方（−1）の引張が始まる前の、初期状態（0）の続き。見つからなければ None。"""
+		memo = self.__dict__.get("_auto_rest_memo", "none")
+		if not (isinstance(memo, str) and memo == "none"):
+			return memo
+		val = None
+		try:
+			fn = (self.scene.get("pres_overlay") or {}).get("phase_at")
+			if callable(fn) and self.n_view > 10:
+				codes = []
+				for fi in range(self.n_view):
+					r_ = fn(fi)
+					codes.append(None if r_ is None else int(r_[0]))
+				pulls = [i for i, c in enumerate(codes) if c in (1, -1)]
+				if pulls:
+					fa = pulls[0]
+					known = [c for c in codes[:fa] if c is not None]
+					if fa > 1 and known and all(c == 0 for c in known):
+						times = np.asarray(self.scene.get("frame_times") or [], float)[:self.n_view]
+						dt = float(np.median(np.diff(times))) if len(times) > 2 else 1.0 / 30.0
+						back = int(round(1.0 / max(dt, 1e-3)))
+						fi = max(0, fa - 1 - back)
+						val = int(self.s0 + fi)
+		except Exception as e:
+			print(f"[靭帯の束] 初期状態を見つけられません（表示の始まりのコマを自然長の基準にします）: {e}")
+			val = None
+		self._auto_rest_memo = val
+		return val
+
+	def _rest_frame(self):
+		"""この記録の、自然長の基準のコマ（絶対のコマ番号）: 手で選んだコマ → 初期状態（自動）→ None（表示の始まりのコマ）。"""
+		g = self._rest_manual()
+		return g if g is not None else self._auto_rest()
+
+	def _rest_label(self):
+		lb = self.w.get("ref_lbl")
+		if lb is None:
+			return
+		g = self._rest_frame()
+		if g is None:
+			lb.config(text="表示の始まりのコマ（初期状態が見つからない）", foreground="black")
+			return
+		times = list(self.scene.get("frame_times") or [])
+		fi = int(g) - self.s0
+		ts = f"・{float(times[fi]):.1f} 秒" if 0 <= fi < len(times) else ""
+		if self._rest_manual() is not None:
+			lb.config(text=f"コマ {fi}{ts}（手で選んだ）", foreground="#0b5394")
+		else:
+			lb.config(text=f"初期状態（自動）コマ {fi}{ts}", foreground="#1b5e20")
+
+	def _rest_here(self):
+		g = int(self.s0 + max(0, min(int(self.fi), self.n_view - 1)))
+		self.data.setdefault("params", {}).setdefault("rest_frames", {})[self._rec_id()] = g
+		self._save()
+		self._invalidate(rows=True)
+		self._rest_label()
+		self._say("いまのコマ（その時の、骨を避けて張った長さ × 自然長の %）を自然長にしました。「▶ 計算する」で計算し直してください。", "blue")
+
+	def _rest_reset(self):
+		(self.data.setdefault("params", {}).get("rest_frames") or {}).pop(self._rec_id(), None)
+		self._save()
+		self._invalidate(rows=True)
+		self._rest_label()
+		self._say("自然長の基準を自動（初期状態の終わりの 1 秒前）に戻しました。「▶ 計算する」で計算し直してください。", "blue")
+
+	def _contact_toggle(self):
+		self.data.setdefault("params", {})["bundle_contact"] = bool(self.w["contact_var"].get())
+		self._save()
+		self._invalidate(rows=True)
+		self._say("束どうしの当たりを変えました。「▶ 計算する」で計算し直してください。", "blue")
+
 	def _choose_guide(self):
 		from tkinter import filedialog
 		fp = filedialog.askopenfilename(parent=self.win, title="付着部の点のファイル（段階1の靭帯のファイル）",
@@ -1413,6 +2231,187 @@ class Stage2:
 		self._load_guides()
 		self._say(f"付着部の点を表示しました（{os.path.basename(fp)}）。点のまわりを右クリックして面を作ってください。", "blue")
 
+	# ---------------------------------------------------------------- バックアップ（書き出す・読み込む）
+	BACKUP_FORMAT = "ankle_lig_bundles_backup"
+
+	def _base_dir(self):
+		return self.store.parents[2]                      # FRS-SIMULATOR.py のフォルダ
+
+	def _result_file(self):
+		"""いまの束の計算の結果のファイル（全部の束が計算済みのときだけ）。無ければ None。"""
+		ready = [b for b in self.data["bundles"] if self._ready(b)]
+		if not ready or any(self.results.get(b["id"]) is None for b in ready):
+			return None, None
+		key = self._key(ready)
+		fp = self.res_dir / f"lb_{key}.npz"
+		return (fp, key) if fp.exists() else (None, None)
+
+	def export_backup(self, fp):
+		"""いまの束を zip 1つに書き出す。返り値: 説明の辞書（info）。"""
+		import zipfile
+		fp = Path(fp)
+		rfp, rkey = self._result_file()
+		ready = [b for b in self.data["bundles"] if self._ready(b)]
+		info = {"format": self.BACKUP_FORMAT, "format_version": 1, "version": VERSION,
+		        "created": time.strftime("%Y-%m-%d %H:%M:%S"), "store_key": self.store.stem,
+		        "bones": self.names, "s0": self.s0, "n_frames": int(self.n_view),
+		        "bundles": [{"name": b.get("name", ""), "n_fibers": int(b.get("n_fibers", 10)),
+		                     "a": (b.get("a") or {}).get("bone_name", ""), "b": (b.get("b") or {}).get("bone_name", ""),
+		                     "faces": sum(1 for e in ("a", "b") if (b.get(e) or {}).get("ellipse"))}
+		                    for b in self.data["bundles"]],
+		        "n_ready": len(ready), "result_key": rkey, "has_results": rfp is not None, "guide": ""}
+		gf = str(self.data.get("guide_file") or "")
+		fp.parent.mkdir(parents=True, exist_ok=True)
+		tmp = fp.with_name(fp.stem + ".tmp.zip")
+		with zipfile.ZipFile(str(tmp), "w", compression=zipfile.ZIP_DEFLATED) as z:
+			z.writestr("bundles.json", json.dumps(self.data, ensure_ascii=False, indent=1))
+			if rfp is not None:
+				z.write(str(rfp), "results.npz")
+			if gf and os.path.isfile(gf):
+				info["guide"] = os.path.basename(gf)
+				z.write(gf, "guide/" + os.path.basename(gf))
+			z.writestr("info.json", json.dumps(info, ensure_ascii=False, indent=1))
+		os.replace(str(tmp), str(fp))
+		return info
+
+	def import_backup(self, fp, auto_backup=True):
+		"""zip から束を読み込んで、いまの束と置き換える。返り値: (info, 結果を戻せたか, 自動バックアップのパス, 骨の無い名前)。"""
+		import zipfile
+		with zipfile.ZipFile(str(fp), "r") as z:
+			names = set(z.namelist())
+			info = json.loads(z.read("info.json").decode("utf-8")) if "info.json" in names else {}
+			if "bundles.json" not in names or info.get("format", self.BACKUP_FORMAT) != self.BACKUP_FORMAT:
+				raise ValueError("靭帯の束のバックアップのファイルではありません")
+			data = json.loads(z.read("bundles.json").decode("utf-8"))
+			res_bytes = z.read("results.npz") if "results.npz" in names else None
+			guides = {n_: z.read(n_) for n_ in names if n_.startswith("guide/") and not n_.endswith("/")}
+		if not isinstance(data, dict) or not isinstance(data.get("bundles"), list):
+			raise ValueError("束の定義が読めません")
+		data.setdefault("params", {})
+		auto = None
+		if auto_backup and self.data.get("bundles"):
+			auto = self.store.parent / "backup" / f"自動_読み込む前_{self.store.stem}_{time.strftime('%Y%m%d_%H%M%S')}.zip"
+			self.export_backup(auto)
+		if self.st.get("mode"):
+			self._ol_cancel(quiet=True)
+		self.__dict__.pop("_mv_undo_store", None)
+		# 段階1の目安の点のファイル: 元の場所に無ければ、zip の中のものを cache/ankle_lig_bundles/guides/ へ出して使う
+		gf = str(data.get("guide_file") or "")
+		if guides and not (gf and os.path.isfile(gf)):
+			gdir = self.store.parent / "guides"
+			gdir.mkdir(parents=True, exist_ok=True)
+			n_, by = next(iter(guides.items()))
+			out = gdir / os.path.basename(n_)
+			out.write_bytes(by)
+			data["guide_file"] = str(out)
+		self.data = data
+		self._refit_old()
+		self._save()
+		# 計算の結果: 骨の形・動き・設定・束が書き出したときと同じなら戻す
+		got = False
+		ready = [b for b in self.data["bundles"] if self._ready(b)]
+		if res_bytes is not None and ready and info.get("result_key") and self._key(ready) == info.get("result_key"):
+			try:
+				self.res_dir.mkdir(parents=True, exist_ok=True)
+				dst = self.res_dir / f"lb_{info['result_key']}.npz"
+				if not dst.exists():
+					tmp = self.res_dir / "lb_tmp_import.npz"
+					tmp.write_bytes(res_bytes)
+					os.replace(str(tmp), str(dst))
+			except Exception as e:
+				print(f"[靭帯の束] バックアップの計算の結果を戻せません: {e}")
+		self._load_cached_results()
+		got = bool(ready) and all(self.results.get(b["id"]) is not None for b in ready)
+		missing = sorted({(b.get(e) or {}).get("bone_name", "") for b in self.data["bundles"] for e in ("a", "b")
+		                  if (b.get(e) or {}).get("bone_name") and self._si_of_name((b.get(e) or {}).get("bone_name")) is None})
+		try:
+			self._load_guides()
+		except Exception:
+			pass
+		self._rebuild_actors()
+		self._notify()
+		try:
+			self._rows()
+			self._mv_refresh_targets()
+		except Exception:
+			pass
+		return info, got, auto, missing
+
+	def _backup_export_clicked(self):
+		from tkinter import filedialog, messagebox
+		if not self.data.get("bundles"):
+			self._say("書き出す束がありません。", "#a06000")
+			return
+		pp = self.data.setdefault("params", {})
+		idir = str(pp.get("backup_dir") or "") or str(self._base_dir() / "backup" / "lig_bundles_store")
+		try:
+			os.makedirs(idir, exist_ok=True)
+		except Exception:
+			pass
+		nm = "_".join(str(b.get("name", "")) for b in self.data["bundles"])[:40]
+		nm = "".join(ch if (ch.isalnum() or ch in "()_-") else "_" for ch in nm)
+		fp = filedialog.asksaveasfilename(parent=self.win, title="靭帯の束のバックアップを書き出す", initialdir=idir,
+		                                  initialfile=f"靭帯の束_{nm}_{time.strftime('%Y%m%d_%H%M%S')}.zip",
+		                                  defaultextension=".zip", filetypes=[("靭帯の束のバックアップ (zip)", "*.zip")])
+		if not fp:
+			return
+		try:
+			info = self.export_backup(fp)
+		except Exception as e:
+			traceback.print_exc()
+			messagebox.showerror("バックアップ", f"書き出せませんでした:\n{e}", parent=self.win)
+			return
+		pp["backup_dir"] = os.path.dirname(fp)
+		self._save()
+		res = ("計算の結果も入れました" if info["has_results"]
+		       else "計算の結果は入っていません（まだ計算していない・計算し直しが要る束がある）")
+		self._say(f"束 {len(info['bundles'])} 個を書き出しました（{res}）: {fp}", "#1b5e20")
+
+	def _backup_import_clicked(self):
+		import zipfile
+		from tkinter import filedialog, messagebox
+		pp = self.data.get("params") or {}
+		idir = str(pp.get("backup_dir") or "") or str(self._base_dir() / "backup" / "lig_bundles_store")
+		fp = filedialog.askopenfilename(parent=self.win, title="靭帯の束のバックアップを読み込む", initialdir=idir,
+		                                filetypes=[("靭帯の束のバックアップ (zip)", "*.zip"), ("すべてのファイル", "*.*")])
+		if not fp:
+			return
+		try:
+			with zipfile.ZipFile(fp, "r") as z:
+				info = json.loads(z.read("info.json").decode("utf-8")) if "info.json" in z.namelist() else {}
+		except Exception as e:
+			messagebox.showerror("バックアップ", f"読めませんでした:\n{e}", parent=self.win)
+			return
+		lst = "\n".join(f"・{b.get('name', '')}（{b.get('a', '')}→{b.get('b', '')}、面 {b.get('faces', 0)}/2）"
+		                for b in (info.get("bundles") or [])[:12])
+		msg = (f"{os.path.basename(fp)}（{info.get('created', '日時不明')}）の束 {len(info.get('bundles') or [])} 個で、"
+		       f"いまの束 {len(self.data.get('bundles') or [])} 個を置き換えます。\n\n{lst}\n\n"
+		       "いまの束は、置き換える前に自動でバックアップを書き出します"
+		       "（cache/ankle_lig_bundles/backup/）。よろしいですか？")
+		if not messagebox.askyesno("バックアップから読み込む", msg, parent=self.win):
+			return
+		try:
+			info, got, auto, missing = self.import_backup(fp)
+		except Exception as e:
+			traceback.print_exc()
+			messagebox.showerror("バックアップ", f"読み込めませんでした（いまの束はそのまま）:\n{e}", parent=self.win)
+			return
+		self.data.setdefault("params", {})["backup_dir"] = os.path.dirname(fp)
+		self._save()
+		# 表示の設定も読み込んだものにするため、画面を開き直す
+		self._close_window()
+		self.open_window()
+		parts = [f"束 {len(self.data['bundles'])} 個を読み込みました。"]
+		if got:
+			parts.append("計算の結果も戻しました（計算し直しは要りません）。")
+		elif any(self._ready(b) for b in self.data["bundles"]):
+			parts.append("計算の結果は使えません（このタブの骨の形・動きが書き出したときと違う、または結果が入っていない）。「▶ 計算する」を押してください。")
+		if missing:
+			parts.append(f"このタブに無い骨: {', '.join(missing)}（その束は出ません）。")
+		if auto:
+			parts.append(f"前の束は {auto.name} に書き出してあります。")
+		self._say(" ".join(parts), "#1b5e20" if not missing else "#a06000")
+
 	def _toggle_guide(self):
 		self.data["guide_show"] = bool(self.w["guide_var"].get())
 		self._save()
@@ -1421,16 +2420,84 @@ class Stage2:
 	# ---------------------------------------------------------------- 外周を打つ（右クリック）
 	def _ol_start(self, b, end):
 		self._ol_cancel(quiet=True)
-		self.st["mode"] = {"b": b, "end": end, "si": None, "pts": []}
-		# 前に描いた外周があれば、そこから直せるようにする
+		self.st["mode"] = {"b": b, "end": end, "si": None, "pts": [], "prev": None}
+		# 新しく描くときは空から。前に描いた外周は「前の点を読み込む」で読み込める（直すとき）。
+		# （以前は自動で読み込んでいたので、新しく打った点が前の点と混ざって楕円が当てはめられ、思った楕円にならなかった。2026-10-19）
 		e = b.get(end) or {}
 		si = self._si_of_name(e.get("bone_name"))
 		if e.get("outline") and si is not None:
-			self.st["mode"]["si"] = si
-			self.st["mode"]["pts"] = [np.asarray(p, float) for p in e["outline"]]
+			self.st["mode"]["prev"] = (si, [np.asarray(p, float) for p in e["outline"]])
+		cal = e.get("caliper") or [None, None]
+		for k, v in zip(("cal_L", "cal_S"), cal):
+			try:
+				self.w[k].delete(0, "end")
+				if v is not None:
+					self.w[k].insert(0, f"{float(v):g}")
+			except Exception:
+				pass
 		self._install_observers()
 		self._ol_refresh()
-		self._say(f"「{b.get('name', '')}」の{'1' if end == 'a' else '2'}点目の骨の面: 付着部の外周を右クリックで 5 点以上打ってください。", "blue")
+		nm = f"「{b.get('name', '')}」の{'1' if end == 'a' else '2'}点目の骨の面"
+		steps = "外周を右クリックで 5 点以上 → ①「楕円を当てはめる」で長径・短径を確かめる → よければ ②「この楕円で決める」。"
+		if self.st["mode"]["prev"] is not None:
+			self._say(f"{nm}: {steps}前の面（赤い輪）は①を押すまで出したまま、①で黄色の輪に替わります（やめると戻ります）。"
+			          f"前の {len(self.st['mode']['prev'][1])} 点を直したいときは「前の点を読み込む（直すとき）」。", "blue")
+		else:
+			self._say(f"{nm}: {steps}", "blue")
+
+	def _ol_load_prev(self):
+		"""前に描いた外周の点を読み込む（いま打っている点とは入れ替える）。"""
+		m = self.st.get("mode")
+		if not m:
+			self._say("先に束の行の「面を描く」を押してください。", "#a06000")
+			return
+		if m.get("prev") is None:
+			self._say("前に描いた外周はありません。", "#a06000")
+			return
+		si, pts = m["prev"]
+		m["si"] = si
+		m["pts"] = [np.asarray(p, float).copy() for p in pts]
+		self.st["replace"] = None
+		self.st["sel"] = None
+		self._ol_refresh()
+		self._say(f"前の外周の {len(pts)} 点を読み込みました。点は 3D の画面で左クリック（または一覧）で選んで、消す・打ち直すができます。", "blue")
+
+	def _ol_set_sel(self, k):
+		"""点 k を選ぶ（一覧も選び、3D の点の色を変える）。None で選びを外す。"""
+		m = self.st.get("mode")
+		if not m or k is None or not (0 <= int(k) < len(m["pts"])):
+			k = None
+		self.st["sel"] = None if k is None else int(k)
+		lb = self.w.get("ol_list")
+		try:
+			if lb is not None and lb.winfo_exists():
+				lb.selection_clear(0, "end")
+				if k is not None:
+					lb.selection_set(int(k))
+					lb.see(int(k))
+		except Exception:
+			pass
+		self._draw_pending()
+
+	def _ol_on_list_select(self):
+		lb = self.w.get("ol_list")
+		try:
+			cur = lb.curselection()
+		except Exception:
+			cur = ()
+		if cur and int(cur[0]) != self.st.get("sel"):
+			self.st["sel"] = int(cur[0])
+			self._draw_pending()
+
+	def _ol_sel_index(self):
+		"""選んでいる点の番号（一覧の選び、無ければ 3D で選んだ点）。"""
+		lb = self.w.get("ol_list")
+		try:
+			if lb is not None and lb.curselection():
+				return int(lb.curselection()[0])
+		except Exception:
+			pass
+		return self.st.get("sel")
 
 	def _ol_refresh(self):
 		m = self.st.get("mode")
@@ -1440,6 +2507,12 @@ class Stage2:
 			if m:
 				for k, p in enumerate(m["pts"]):
 					lb.insert("end", f"{k + 1}: ({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f})")
+			sel = self.st.get("sel")
+			if m and sel is not None and 0 <= sel < len(m["pts"]):
+				lb.selection_set(sel)
+				lb.see(sel)
+			else:
+				self.st["sel"] = None
 		if self.w.get("ol_lbl") is not None:
 			if m:
 				bone = self.names[m["si"]] if m["si"] is not None else "（最初の点の骨）"
@@ -1452,9 +2525,170 @@ class Stage2:
 				self.w["ol_lbl"].config(text="（束の行の「面を描く」を押すと始まります）", foreground="gray")
 		self._draw_pending()
 
+	def _drawing(self, b, end):
+		"""いまこの束のこの端の面を描いていて、①「楕円を当てはめる」を押した後か（そのときだけ前の面の輪を隠す）。
+		（描いている間は前の輪を見せたまま、当てはめたら黄色の輪に替える。2026-10-20 ユーザーの要望）"""
+		m = self.st.get("mode") if isinstance(getattr(self, "st", None), dict) else None
+		return bool(m) and m.get("b") is b and m.get("end") == end and bool(m.get("fitted"))
+
+	# ---------------------------------------------------------------- 付着部の楕円を動かす（平行移動）
+	def _mv_targets(self):
+		"""動かせる楕円: [(表示名, 束, 端)]。"""
+		out = []
+		for b in self.data.get("bundles", []):
+			for end in ("a", "b"):
+				e = b.get(end) or {}
+				if e.get("ellipse") and self._si_of_name(e.get("bone_name")) is not None:
+					out.append((f"{b.get('name', '')}・{'1' if end == 'a' else '2'}点目（{e.get('bone_name', '')}）", b, end))
+		return out
+
+	def _mv_refresh_targets(self):
+		cb = self.w.get("mv_combo")
+		if cb is None:
+			return
+		try:
+			labs = [t[0] for t in self._mv_targets()]
+			cb.configure(values=labs)
+			if labs and self.w["mv_target"].get() not in labs:
+				self.w["mv_target"].set(labs[0])
+			elif not labs:
+				self.w["mv_target"].set("")
+		except Exception:
+			pass
+
+	def _mv_selected(self):
+		lab = str(self.w["mv_target"].get()) if self.w.get("mv_target") is not None else ""
+		return next(((b, end) for (l_, b, end) in self._mv_targets() if l_ == lab), (None, None))
+
+	def _screen_dirs(self):
+		"""いまの視点の、画面の右向き・上向き（世界座標の単位ベクトル）。"""
+		cam = self.plotter.camera
+		dop = np.asarray(cam.GetDirectionOfProjection(), float)
+		up = np.asarray(cam.GetViewUp(), float)
+		right = np.cross(dop, up)
+		right /= max(float(np.linalg.norm(right)), 1e-12)
+		up2 = np.cross(right, dop)
+		up2 /= max(float(np.linalg.norm(up2)), 1e-12)
+		return right, up2
+
+	def move_ellipse(self, b, end, dx, dy, step):
+		"""束 b の端 end の楕円を、画面の右 dx・上 dy の向きに step mm 動かす（楕円の面の中で）。返り値: 動かした量（mm, 骨の座標）。"""
+		e = b.get(end) or {}
+		ell = e.get("ellipse")
+		si = self._si_of_name(e.get("bone_name"))
+		if not ell or si is None or self.plotter is None:
+			return None
+		bones = self._ensure_bones()
+		idx = self.idx_of[si]
+		right, up = self._screen_dirs()
+		w = float(dx) * right + float(dy) * up
+		fi = max(0, min(int(self.fi), self.n_view - 1)) if self.n_view else 0
+		T = self.poses[si][fi]
+		lv = T[:3, :3].T @ w                                   # 骨の座標へ
+		n = ell_normal(bones, idx, ell)
+		lv = lv - float(lv @ n) * n                            # 楕円の面の中へ
+		ln = float(np.linalg.norm(lv))
+		if ln < 1e-9:
+			return None
+		d = lv / ln * float(step)
+		key = (id(b), end)
+		und = self.__dict__.setdefault("_mv_undo_store", {})
+		if key not in und:
+			und[key] = json.loads(json.dumps(e))               # 動かす前（この画面を開いている間の最初）
+		ell["center"] = (np.asarray(ell["center"], float) + d).tolist()
+		if e.get("outline"):
+			O = np.asarray(e["outline"], float) + d
+			e["outline"] = bones.onto(idx, O, n)[0].tolist()
+		self._save()
+		self._invalidate()
+		self._mv_refresh_targets()
+		return d
+
+	def _mv_click(self, dx, dy):
+		b, end = self._mv_selected()
+		if b is None:
+			self._say("動かす楕円を選んでください（束の面を決めると選べます）。", "#a06000")
+			return
+		try:
+			step = float(self.w["mv_step"].get())
+		except ValueError:
+			step = 0.5
+		if self.st.get("mode"):
+			self._ol_cancel(quiet=True)
+		d = self.move_ellipse(b, end, dx, dy, step)
+		if d is None:
+			self._say("動かせませんでした（いまの視点では、その向きは楕円の面に垂直です）。", "#a06000")
+			return
+		e0 = (self.__dict__.get("_mv_undo_store") or {}).get((id(b), end))
+		tot = float(np.linalg.norm(np.asarray(b[end]["ellipse"]["center"], float) - np.asarray(e0["ellipse"]["center"], float))) if e0 else 0.0
+		msg = f"{self.w['mv_target'].get()} を {step:g} mm 動かしました（動かす前から {tot:.1f} mm）。計算の結果は外れました。"
+		self.w["mv_lbl"].config(text=msg, foreground="#0b5394")
+		self._say(msg, "blue")
+
+	def _mv_undo(self):
+		b, end = self._mv_selected()
+		und = self.__dict__.get("_mv_undo_store") or {}
+		if b is None or (id(b), end) not in und:
+			self._say("戻す楕円がありません（この画面で動かした楕円だけ戻せます）。", "#a06000")
+			return
+		b[end] = und.pop((id(b), end))
+		self._save()
+		self._invalidate()
+		self._mv_refresh_targets()
+		self.w["mv_lbl"].config(text=f"{self.w['mv_target'].get()} を動かす前に戻しました。", foreground="#1b5e20")
+
+	def _outline_on(self):
+		"""付着部の楕円を出すか（「付着部の楕円」のチェック、または表示が「付着部の楕円だけ」）。"""
+		pp = self.params()
+		return bool(pp.get("show_outline", True)) or str(pp.get("view", "both")) == "foot"
+
+	def _lig_opacity(self):
+		try:
+			return float(min(1.0, max(0.0, float(self.params().get("lig_opacity", 1.0)))))
+		except Exception:
+			return 1.0
+
+	def _apply_lig_opacity(self, render=True):
+		"""線維と皮の不透明度だけを変える（作り直さない）。"""
+		op = self._lig_opacity()
+		view = str(self.params().get("view", "both"))
+		for a in self.actors.values():
+			if a.get("fib_act") is not None:
+				a["fib_act"].GetProperty().SetOpacity(op)
+			if a.get("skin_act") is not None:
+				a["skin_act"].GetProperty().SetOpacity((0.55 if view == "both" else 1.0) * op)
+		if render and self.plotter is not None:
+			try:
+				self.plotter.render()
+			except Exception:
+				pass
+
+	def _old_ring_vis(self):
+		"""前の面の輪の見え方を、いまの状態（表示・付着部の楕円・描いている端）に合わせる。"""
+		show_ol = self._outline_on()
+		for b in self.data["bundles"]:
+			a = self.actors.get(b.get("id")) or {}
+			for end in ("a", "b"):
+				act = a.get(f"e{end}_act")
+				if act is not None:
+					act.SetVisibility(bool(b.get("visible", True)) and show_ol and not self._drawing(b, end))
+
+	def _preview_ring(self, si, pts):
+		"""打った点に当てはめた楕円を、決めたあとと同じく骨の面へ落とした輪（モデル座標）。できなければ平らな楕円。"""
+		ell = fit_ellipse(pts)
+		try:
+			# 中心は打った点の平面の上のまま（いちばん近い面の点へ動かすと横へずれた。2026-10-20）
+			ring, _si = self._foot_ring({"ellipse": ell, "bone_name": self.names[si]}, 48)
+			P_ = ring["out_alt"] if (self._shown(si) == "alt" and ring.get("out_alt") is not None) else ring["out_calc"]
+			return self._ring_poly(P_)
+		except Exception as e:
+			print(f"[靭帯の束] 見本の輪を骨の面に落とせません（平らな楕円で描きます）: {e}")
+			return self._ellipse_poly(ell)
+
 	def _draw_pending(self):
 		if self.plotter is None:
 			return
+		self._old_ring_vis()
 		vtk = self._vtk()
 		for act, _si in self.pend:
 			try:
@@ -1464,26 +2698,69 @@ class Stage2:
 		self.pend = []
 		m = self.st.get("mode")
 		if m and m["si"] is not None:
-			for p in m["pts"]:
+			sel = self.st.get("sel")
+			for k_, p in enumerate(m["pts"]):
+				is_sel = (k_ == sel)
 				src = vtk.vtkSphereSource()
 				src.SetCenter(*[float(x) for x in p])
-				src.SetRadius(0.5)
+				src.SetRadius(0.9 if is_sel else 0.5)
 				mp = vtk.vtkPolyDataMapper()
 				mp.SetInputConnection(src.GetOutputPort())
 				act = vtk.vtkActor()
 				act.SetMapper(mp)
 				act.PickableOff()
-				act.GetProperty().SetColor(1.0, 0.83, 0.0)
+				# 選んだ点 = 赤紫、ほか = 黄
+				act.GetProperty().SetColor(*((1.0, 0.0, 1.0) if is_sel else (1.0, 0.83, 0.0)))
 				self.plotter.renderer.AddActor(act)
 				self.pend.append((act, m["si"]))
-			if len(m["pts"]) >= 5:
+			if m.get("fitted") and len(m["pts"]) >= 5:
 				try:
-					ell = fit_ellipse(m["pts"])
-					act = self._line_actor(self._ellipse_poly(ell), "#FFD400", 2.0)
+					# 決めたあとの輪と同じ形（骨の面へ落とした輪）で見せる。点を直すとその場で当てはめ直す
+					act = self._line_actor(self._preview_ring(m["si"], m["pts"]), "#FFD400", 3.0)
 					self.pend.append((act, m["si"]))
 				except Exception:
 					pass
+		self._ol_dims()
 		self.update(self.fi, render=True)
+
+	def _caliper_vals(self):
+		"""ノギスの長径・短径（mm）。入っていない・数でなければ None。"""
+		out = []
+		for k in ("cal_L", "cal_S"):
+			try:
+				v = float(str(self.w[k].get()).strip())
+				out.append(v if v > 0 else None)
+			except Exception:
+				out.append(None)
+		return out
+
+	def _ol_dims(self):
+		"""①で当てはめた楕円の長径・短径（端から端 = 2 × 半径）を出す。ノギスの値があれば差も。"""
+		lbl = self.w.get("ol_dims")
+		try:
+			if lbl is None or not lbl.winfo_exists():
+				return
+		except Exception:
+			return
+		m = self.st.get("mode")
+		if not m or not m.get("fitted"):
+			lbl.config(text="")
+			return
+		if len(m["pts"]) < 5:
+			lbl.config(text="当てはめた楕円: 点が 5 点より少ないので当てはめられません", foreground="#a06000")
+			return
+		try:
+			ell = fit_ellipse(m["pts"])
+		except Exception as e:
+			lbl.config(text=f"当てはめた楕円: 当てはめられません（{e}）", foreground="red")
+			return
+		L, S = 2.0 * float(ell["ra"]), 2.0 * float(ell["rb"])
+		cL, cS = self._caliper_vals()
+
+		def _cmp(v, c):
+			return f"{v:.1f} mm" + (f"（ノギス {c:g} mm、差 {v - c:+.1f}）" if c is not None else "")
+		lbl.config(text=f"当てはめた楕円（{len(m['pts'])} 点）: 長径 {_cmp(L, cL)}　短径 {_cmp(S, cS)}"
+		                + "　→ よければ ②「この楕円で決める」", foreground="#0b5394")
 
 	def _ol_undo(self):
 		m = self.st.get("mode")
@@ -1492,26 +2769,32 @@ class Stage2:
 			if not m["pts"]:
 				m["si"] = None
 			self.st["replace"] = None
+			if self.st.get("sel") is not None and self.st["sel"] >= len(m["pts"]):
+				self.st["sel"] = None
 			self._ol_refresh()
 
 	def _ol_delete(self):
 		m = self.st.get("mode")
-		lb = self.w.get("ol_list")
-		if not m or lb is None or not lb.curselection():
+		k = self._ol_sel_index()
+		if not m or k is None or not (0 <= k < len(m["pts"])):
+			self._say("消す点を、3D の画面で左クリック（または一覧）で選んでください。", "#a06000")
 			return
-		del m["pts"][int(lb.curselection()[0])]
+		del m["pts"][k]
 		if not m["pts"]:
 			m["si"] = None
 		self.st["replace"] = None
+		self.st["sel"] = None
 		self._ol_refresh()
+		self._say(f"{k + 1} 番目の点を消しました（残り {len(m['pts'])} 点）。", "blue")
 
 	def _ol_replace(self):
 		m = self.st.get("mode")
-		lb = self.w.get("ol_list")
-		if not m or lb is None or not lb.curselection():
-			self._say("打ち直す点を一覧で選んでください。", "#a06000")
+		k = self._ol_sel_index()
+		if not m or k is None or not (0 <= k < len(m["pts"])):
+			self._say("打ち直す点を、3D の画面で左クリック（または一覧）で選んでください。", "#a06000")
 			return
-		self.st["replace"] = int(lb.curselection()[0])
+		self.st["replace"] = k
+		self.st["sel"] = k
 		self._ol_refresh()
 
 	def _ol_clear(self):
@@ -1520,7 +2803,23 @@ class Stage2:
 			m["pts"] = []
 			m["si"] = None
 			self.st["replace"] = None
+			self.st["sel"] = None
 			self._ol_refresh()
+
+	def _ol_fit(self):
+		"""① 楕円を当てはめる: 黄色の輪（骨の面へ落とした形）を出し、前の赤い輪を隠し、長径・短径を出す。まだ保存しない。"""
+		m = self.st.get("mode")
+		if not m:
+			self._say("先に束の行の「面を描く」を押してください。", "#a06000")
+			return
+		if len(m["pts"]) < 5:
+			self._say("外周の点が 5 点より少ないので、楕円を当てはめられません。", "#a06000")
+			return
+		m["fitted"] = True
+		self._draw_pending()
+		self._say("楕円を当てはめました（黄色の輪）。長径・短径をノギスの値と比べて、よければ ②「この楕円で決める」。"
+		          "違えば、点を 3D の画面で左クリックして選び、「選んだ点を消す」（または Delete キー）・「選んだ点を打ち直す」"
+		          "で直すと、楕円と長径・短径がその場で変わります。", "blue")
 
 	def _ol_commit(self):
 		m = self.st.get("mode")
@@ -1529,26 +2828,50 @@ class Stage2:
 			return
 		try:
 			ell = fit_ellipse(m["pts"])
-			# 中心は骨の面の上へ
-			bones = self._ensure_bones()
-			cpp, _ns, _sd = bones.closest(self.idx_of[m["si"]], np.asarray(ell["center"], float)[None])
-			ell["center"] = cpp[0].tolist()
+			# 中心は打った点の平面の上のまま（骨の面へは、輪・線維の端を描くときに楕円の法線の向きに落とす）
 		except Exception as e:
 			self._say(f"楕円を当てはめられません: {e}", "red")
 			return
 		b, end = m["b"], m["end"]
+		same = False
+		try:
+			old = (b.get(end) or {}).get("ellipse")
+			if old and (b.get(end) or {}).get("bone_name") == self.names[m["si"]]:
+				same = (float(np.linalg.norm(np.asarray(old["center"], float) - np.asarray(ell["center"], float))) < 0.3
+				        and abs(float(old["ra"]) - float(ell["ra"])) < 0.3 and abs(float(old["rb"]) - float(ell["rb"])) < 0.3)
+		except Exception:
+			same = False
 		b[end] = {"bone_name": self.names[m["si"]], "bone_index": self.idx_of[m["si"]],
-		          "outline": [list(map(float, p)) for p in m["pts"]], "ellipse": ell}
+		          "outline": [list(map(float, p)) for p in m["pts"]], "ellipse": ell, "ell_v": ELL_V}
+		cL, cS = self._caliper_vals()
+		if cL is not None or cS is not None:
+			b[end]["caliper"] = [cL, cS]
 		self._save()
 		self._ol_cancel(quiet=True)
 		self._invalidate()
+		try:
+			self._mv_refresh_targets()
+		except Exception:
+			pass
 		self._say(f"「{b.get('name', '')}」の{'1' if end == 'a' else '2'}点目の面を決めました（{self.names[self._si_of_name(b[end]['bone_name'])]}・"
-		          f"{2 * ell['ra']:.1f}×{2 * ell['rb']:.1f}mm）。両方の面ができたら「▶ 計算する」。", "#1b5e20")
+		          f"長径 {2 * ell['ra']:.1f} × 短径 {2 * ell['rb']:.1f} mm）。"
+		          + ("※ 前の面とほぼ同じ楕円です（点が前とほぼ同じため。描き直すなら「面を描く」のあと、前の点は読み込まずに打ってください）。"
+		             if same else "")
+		          + "両方の面ができたら「▶ 計算する」。", "#a06000" if same else "#1b5e20")
 
 	def _ol_cancel(self, quiet=False):
 		self.st["mode"] = None
 		self.st["replace"] = None
+		self.st["sel"] = None
 		self._remove_observers()
+		try:
+			self._old_ring_vis()            # ①で隠した前の輪を戻す
+		except Exception:
+			pass
+		try:
+			self._ol_dims()
+		except Exception:
+			pass
 		try:
 			self._ol_refresh()
 		except Exception:
@@ -1561,7 +2884,9 @@ class Stage2:
 			return
 		try:
 			it = self.plotter.iren.interactor
-			for ev, fn in (("RightButtonPressEvent", self._on_press), ("RightButtonReleaseEvent", self._on_release)):
+			for ev, fn in (("RightButtonPressEvent", self._on_press), ("RightButtonReleaseEvent", self._on_release),
+			               ("LeftButtonPressEvent", self._on_lpress), ("LeftButtonReleaseEvent", self._on_lrelease),
+			               ("KeyPressEvent", self._on_key)):
 				oid = it.AddObserver(ev, fn, 10.0)
 				try:
 					it.GetCommand(oid).SetPassiveObserver(True)
@@ -1596,7 +2921,31 @@ class Stage2:
 		x, y = self._pos(obj)
 		if abs(x - press[0]) > 4 or abs(y - press[1]) > 4:
 			return
-		self.st["clicks"].append((int(x), int(y)))
+		self.st["clicks"].append(("R", int(x), int(y)))
+
+	def _on_key(self, obj, ev):
+		"""3D の画面で Delete キー → 選んだ点を消す（VTK の中では積むだけ）。"""
+		if not self.st.get("mode"):
+			return
+		try:
+			key = str(self.plotter.iren.interactor.GetKeySym())
+		except Exception:
+			return
+		if key in ("Delete", "BackSpace"):
+			self.st["clicks"].append(("D", 0, 0))
+
+	def _on_lpress(self, obj, ev):
+		self.st["lpress"] = self._pos(obj) if self.st.get("mode") else None
+
+	def _on_lrelease(self, obj, ev):
+		"""左クリック（ドラッグで回したときは除く）→ 打った点を選ぶ。"""
+		press, self.st["lpress"] = self.st.get("lpress"), None
+		if press is None or not self.st.get("mode"):
+			return
+		x, y = self._pos(obj)
+		if abs(x - press[0]) > 4 or abs(y - press[1]) > 4:
+			return
+		self.st["clicks"].append(("L", int(x), int(y)))
 
 	def _start_poll(self):
 		self._stop_poll()
@@ -1615,9 +2964,15 @@ class Stage2:
 		if self.win is None:
 			return
 		while self.st["clicks"]:
-			x, y = self.st["clicks"].pop(0)
+			btn, x, y = self.st["clicks"].pop(0)
 			try:
-				self._pick(x, y)
+				if btn == "L":
+					self._select_near(x, y)
+				elif btn == "D":
+					if self.st.get("sel") is not None:
+						self._ol_delete()
+				else:
+					self._pick(x, y)
 			except Exception as e:
 				print(f"[靭帯の束] ピックに失敗: {e}")
 		try:
@@ -1656,6 +3011,31 @@ class Stage2:
 		local = (np.linalg.inv(M @ self.poses[si][0]) @ np.append(world, 1.0))[:3]
 		self.add_point(si, local)
 
+	SELECT_PX = 12          # 左クリックで点を選ぶときの、画面の上での近さ（px）
+
+	def _select_near(self, x, y):
+		"""画面の (x, y) にいちばん近い、打った点を選ぶ（SELECT_PX 以内）。返り値: 選んだ番号 or None。"""
+		m = self.st.get("mode")
+		if not m or m["si"] is None or not m["pts"] or self.plotter is None:
+			return None
+		ren = self.plotter.renderer
+		T = self.poses[m["si"]][max(0, min(int(self.fi), self.n_view - 1)) if self.n_view else 0]
+		best, bk = None, None
+		for k, p in enumerate(m["pts"]):
+			w = T[:3, :3] @ np.asarray(p, float) + T[:3, 3]
+			ren.SetWorldPoint(float(w[0]), float(w[1]), float(w[2]), 1.0)
+			ren.WorldToDisplay()
+			dx, dy, _dz = ren.GetDisplayPoint()
+			d = float(np.hypot(dx - x, dy - y))
+			if best is None or d < best:
+				best, bk = d, k
+		if best is None or best > self.SELECT_PX:
+			return None
+		self._ol_set_sel(bk)
+		p = m["pts"][bk]
+		self._say(f"{bk + 1} 番目の点を選びました（{p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}）。「選んだ点を消す」「選んだ点を打ち直す」が使えます。", "blue")
+		return bk
+
 	def add_point(self, si, local):
 		"""外周の点を足す（テストからも呼ぶ）。最初の点の骨と違う骨なら断る。"""
 		m = self.st.get("mode")
@@ -1669,6 +3049,7 @@ class Stage2:
 		if rp is not None and 0 <= rp < len(m["pts"]):
 			m["pts"][rp] = np.asarray(local, float)
 			self.st["replace"] = None
+			self.st["sel"] = rp
 		else:
 			m["pts"].append(np.asarray(local, float))
 		self._ol_refresh()

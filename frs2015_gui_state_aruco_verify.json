@@ -1,6 +1,6 @@
 {
   "aruco_dict": "DICT_4X4_100",
-  "marker_size_mm": 20.0,
+  "marker_size_mm": 15.0,
   "id_lin": 1,
   "id_rot": 2,
   "stride": 1,
@@ -12,37 +12,37 @@
       "commanded": 50.0,
       "feed": 5.0,
       "accel": 5.0,
-      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/X/ankle_d405_20260907_134453.db3"
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/X/ankle_d405_20260908_153311.db3"
     },
     "Y": {
       "commanded": 50.0,
       "feed": 5.0,
       "accel": 5.0,
-      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/Y/ankle_d405_20260907_134913.db3"
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/Y/ankle_d405_20260908_153817.db3"
     },
     "Z": {
       "commanded": 50.0,
       "feed": 5.0,
       "accel": 5.0,
-      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/Z/ankle_d405_20260907_135335.db3"
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/Z/ankle_d405_20260908_154020.db3"
     },
     "U": {
       "commanded": 20.0,
       "feed": 1.0,
       "accel": 1.0,
-      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/U/ankle_d405_20260907_135724.db3"
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/U/ankle_d405_20260908_162120.db3"
     },
     "V": {
       "commanded": 20.0,
       "feed": 1.0,
       "accel": 1.0,
-      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/V/ankle_d405_20260907_135938.db3"
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/V/ankle_d405_20260908_155000.db3"
     },
     "W": {
       "commanded": 20.0,
       "feed": 1.0,
       "accel": 1.0,
-      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260907_ArUco精度検証_斜め45°から_距離10cm/W/ankle_d405_20260907_140058.db3"
+      "bag": "C:/Users/yutas/Desktop/ankle simulator用ファイル/260908_ArUco精度検証_15×15/W/ankle_d405_20260908_155157.db3"
     }
   },
   "tabs": [
@@ -408,5 +408,5 @@
       }
     }
   ],
-  "active": 2
+  "active": 5
 }
