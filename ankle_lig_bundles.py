@@ -33,8 +33,9 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = 3          # 2: 付着部の楕円を、楕円の面の法線の向きに骨の面へ落とす（2026-10-20。線維の端が変わる）
+VERSION = 4          # 2: 付着部の楕円を、楕円の面の法線の向きに骨の面へ落とす（2026-10-20。線維の端が変わる）
                      # 3: 束どうしの当たり（外形どうし）と、自然長の基準のコマ（2026-10-20）
+                     # 4: 束どうしの当たりを中心線どうしの距離で（跳ばない。2026-10-21）
 ELL_V = 2            # 保存してある楕円の当てはめ方の版（古いものは外周の点から当てはめ直す）
 PALETTE = ("#FF8800", "#D62728", "#1F77B4", "#2CA02C", "#9467BD", "#8C564B", "#E377C2", "#17BECF")
 
@@ -216,58 +217,91 @@ def _envelopes(X, rf):
 	return C, t, e1, e2, r1, r2
 
 
-def _bundle_contact(Xs, rfs, end_frac=0.08, M=12, gain=0.5):
-	"""束どうしの当たり（外形どうし。その場で書き換え）: 束 B の外形の縁（皮と同じ楕円の断面の縁、M 点）が束 A の外形の中にあれば、
-	その断面の線維をまとめて、A の外形の縁まで gain だけずらす（A・B を入れ替えても行うので、両方がよける）。
-	線維の点だけで判定すると、表示の皮（楕円の縁は点の集まりより角がふくらむ）どうしの重なりが残った。
-	両端の end_frac の長さは除く（付着部は動かない・隣り合う付着部の近くは重なってよい）。返り値: 外形の中にあった縁の点の数。"""
-	from scipy.spatial import cKDTree
+def _closest_on_polyline(C, P):
+	"""点 P (n,3) に、折れ線 C (K,3) の上でいちばん近い点。返り値: 点 (n,3)・区間の番号 i (n,)・区間の中の割合 u (n,)。"""
+	A, B = C[:-1], C[1:]
+	AB = B - A
+	L2 = np.maximum((AB ** 2).sum(1), 1e-12)
+	u = np.clip(np.einsum("nsi,si->ns", P[:, None, :] - A[None], AB) / L2[None], 0.0, 1.0)
+	Q = A[None] + u[:, :, None] * AB[None]
+	i = np.argmin(((P[:, None, :] - Q) ** 2).sum(2), axis=1)
+	r = np.arange(len(P))
+	return Q[r, i], i, u[r, i]
+
+
+def _support(dirv, t, e1, e2, r1, r2):
+	"""楕円の断面（e1・e2 の向きに半径 r1・r2）の、向き dirv（断面の面へ落とす）の半径。"""
+	dp = dirv - np.einsum("ni,ni->n", dirv, t)[:, None] * t
+	dp = dp / np.maximum(np.linalg.norm(dp, axis=1), 1e-9)[:, None]
+	c1, c2 = np.einsum("ni,ni->n", dp, e1), np.einsum("ni,ni->n", dp, e2)
+	return 1.0 / np.sqrt((c1 / r1) ** 2 + (c2 / r2) ** 2)
+
+
+def _ramp(x, w):
+	"""0 → 1 のなめらかな立ち上がり（x ≤ 0 で 0、x ≥ w で 1）。"""
+	t = np.clip(np.asarray(x, float) / max(float(w), 1e-9), 0.0, 1.0)
+	return t * t * (3.0 - 2.0 * t)
+
+
+def _bundle_contact(Xs, rfs, end_frac=0.08, gain=0.5, margin=1.1, ramp=3.0):
+	"""束どうしの当たり（その場で書き換え）: 中心線どうしの距離で離す（カプセル同士の当たり）。
+	束 B の各断面の中心から束 A の中心線へのいちばん近い点を結ぶ向きで、両方の外形（皮と同じ楕円の断面）のその向きの半径の和 × margin
+	より近ければ、その差の gain/2 ずつ離す（A の側は近い区間の両端に割合で分ける。A・B を入れ替えても行う）。
+	両端の end_frac の長さは除き、そこから ramp 区間かけてなめらかに効かせる（付着部は動かない・隣り合う付着部の近くは重なってよい）。
+	以前（10/20）は外形の縁のいちばん深い点で断面ごと押していたので、選ばれる点がコマごとに入れ替わって外形が跳んだ。
+	返り値: 近すぎた断面の数。"""
 	nb = len(Xs)
 	if nb < 2:
 		return 0
 	env = [_envelopes(X, rf) for X, rf in zip(Xs, rfs)]
-	th = np.linspace(0.0, 2.0 * np.pi, M, endpoint=False)
-	cs, sn = np.cos(th)[None, :, None], np.sin(th)[None, :, None]
 	moves = [np.zeros((X.shape[1], 3)) for X in Xs]
 	cnt = 0
 	for a in range(nb):
-		C, t, e1, e2, r1, r2 = env[a]
-		K = len(C)
-		half = 0.75 * max(float(np.linalg.norm(np.diff(C, axis=0), axis=1).mean()), 1e-6)
-		k0 = max(1, int(round(end_frac * (K - 1))))
-		tree = cKDTree(C)
+		CA, tA, e1A, e2A, r1A, r2A = env[a]
+		KA = len(CA)
+		ka0 = max(1, int(round(end_frac * (KA - 1))))
 		for b in range(nb):
 			if b == a:
 				continue
-			Cb, tb, e1b, e2b, r1b, r2b = env[b]
-			Kb = len(Cb)
-			kb0 = max(1, int(round(end_frac * (Kb - 1))))
-			kbs = np.arange(kb0, Kb - kb0)
+			CB, tB, e1B, e2B, r1B, r2B = env[b]
+			KB = len(CB)
+			kb0 = max(1, int(round(end_frac * (KB - 1))))
+			kbs = np.arange(kb0, KB - kb0)
 			if len(kbs) == 0:
 				continue
-			R = (Cb[kbs, None] + cs * r1b[kbs, None, None] * e1b[kbs, None] + sn * r2b[kbs, None, None] * e2b[kbs, None])
-			Pr = R.reshape(-1, 3)
-			_d, k = tree.query(Pr)
-			q = Pr - C[k]
-			along = np.einsum("ij,ij->i", q, t[k])
-			ok = (k >= k0) & (k <= K - 1 - k0) & (np.abs(along) <= half)
-			if not ok.any():
+			Pb = CB[kbs]
+			Q, i, u = _closest_on_polyline(CA, Pb)
+			ia0, ia1 = i, i + 1
+			# 端の近くは、当たりをなめらかに弱める（急に入ったり切れたりすると跳ぶ）
+			sa = ia0 + u
+			wa = _ramp(sa - ka0, ramp) * _ramp((KA - 1 - ka0) - sa, ramp)
+			wb = _ramp(kbs - kb0 + 1.0, ramp) * _ramp((KB - 1 - kb0) - kbs + 1.0, ramp)
+			ok = wa > 0
+			d = Pb - Q
+			dist = np.linalg.norm(d, axis=1)
+			dirv = d / np.maximum(dist, 1e-9)[:, None]
+			w = u[:, None]
+			tA_ = (1 - w) * tA[ia0] + w * tA[ia1]
+			tA_ /= np.maximum(np.linalg.norm(tA_, axis=1, keepdims=True), 1e-9)
+			e1A_ = (1 - w) * e1A[ia0] + w * e1A[ia1]
+			e1A_ = e1A_ - np.einsum("ni,ni->n", e1A_, tA_)[:, None] * tA_
+			e1A_ /= np.maximum(np.linalg.norm(e1A_, axis=1, keepdims=True), 1e-9)
+			e2A_ = np.cross(tA_, e1A_)
+			ra = _support(dirv, tA_, e1A_, e2A_, (1 - u) * r1A[ia0] + u * r1A[ia1], (1 - u) * r2A[ia0] + u * r2A[ia1])
+			rb = _support(-dirv, tB[kbs], e1B[kbs], e2B[kbs], r1B[kbs], r2B[kbs])
+			pen = (margin * (ra + rb) - dist) * wa * wb
+			hit = ok & (pen > 0) & (dist > 1e-6)
+			if not hit.any():
 				continue
-			qp = q - along[:, None] * t[k]
-			u1, u2 = np.einsum("ij,ij->i", qp, e1[k]), np.einsum("ij,ij->i", qp, e2[k])
-			ins = ok & (np.sqrt((u1 / r1[k]) ** 2 + (u2 / r2[k]) ** 2) < 1.0)
-			if not ins.any():
-				continue
-			nq = np.linalg.norm(qp, axis=1)
-			dirv = np.where((nq > 1e-6)[:, None], qp / np.maximum(nq, 1e-9)[:, None], e1[k])
-			c1, c2 = np.einsum("ij,ij->i", dirv, e1[k]), np.einsum("ij,ij->i", dirv, e2[k])
-			rb = 1.0 / np.sqrt((c1 / r1[k]) ** 2 + (c2 / r2[k]) ** 2)          # その向きの、A の外形の縁までの距離
-			dv = (((rb - nq)[:, None] * dirv) * ins[:, None]).reshape(len(kbs), M, 3)
-			jm = np.argmax(np.linalg.norm(dv, axis=2), axis=1)                 # 断面ごとに、いちばん深い縁の点
-			moves[b][kbs] += gain * dv[np.arange(len(kbs)), jm]
-			cnt += int(ins.sum())
+			mv = (0.5 * gain * pen * hit)[:, None] * dirv          # B は離れる向き、A は逆向き（半分ずつ）
+			moves[b][kbs] += mv
+			np.add.at(moves[a], ia0, -mv * (1 - u)[:, None])
+			np.add.at(moves[a], ia1, -mv * u[:, None])
+			cnt += int(hit.sum())
 	for X, m in zip(Xs, moves):
-		X[:, 1:-1] += m[None, 1:-1]
+		ms = m.copy()
+		ms[1:-1] = 0.25 * m[:-2] + 0.5 * m[1:-1] + 0.25 * m[2:]         # 長さの向きに少しならす（折れを作らない）
+		X[:, 1:-1] += ms[None, 1:-1]
 	return cnt
 
 

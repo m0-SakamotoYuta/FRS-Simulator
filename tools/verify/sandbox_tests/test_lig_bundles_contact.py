@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """靭帯の束（段階2）（2026-10-20）: 束どうしの当たり（外形どうし）と自然長の基準のコマ。
 画面の欄・既定で当たり ON・基準のコマで自然長＝その時の長さ・戻す・切り替えると計算の結果が外れる・当たりで外形の重なりが減る。
-接触の計算はダミー。4〜6分。"""
+当たりで外形が跳ばない（10/21）。接触の計算はダミー。4〜6分。"""
 import importlib.util, os, sys, time, json, glob, shutil, gc
 HERE = os.path.dirname(os.path.abspath(__file__)); os.chdir(HERE)
 spec = importlib.util.spec_from_file_location("frs", os.path.join(HERE, "FRS-SIMULATOR.py"))
@@ -48,21 +48,22 @@ def ring(si, center, ra, rb_, n=7):
 	t1 = np.cross(nrm, [1, 0, 0]); t1 /= np.linalg.norm(t1); t2 = np.cross(nrm, t1)
 	th = np.linspace(0, 2 * np.pi, n, endpoint=False) + 0.3
 	return bones.closest(idx, cpp[0] + np.outer(np.cos(th) * ra, t1) + np.outer(np.sin(th) * rb_, t2) + 2 * nrm)[0]
-def make(name, lig, si_a, si_b):
+def make(name, lig, si_a, si_b, off=(0.0, 0.0, 0.0)):
 	ctx._add_bundle(); pump(app, 0.2)
 	b = ctx.data["bundles"][-1]; b["name"] = name; b["n_fibers"] = 8
 	G = [x for x in app.ankle_ligaments if x["name"] == lig][0]
 	for end, si, key in (("a", si_a, "a"), ("b", si_b, "b")):
 		ctx._ol_start(b, end)
-		for q in ring(si, G[key]["point"], 3.0, 1.8):
+		for q in ring(si, np.asarray(G[key]["point"], float) + np.asarray(off, float), 3.0, 1.8):
 			ctx.add_point(si, q)
 		ctx._ol_commit(); pump(app, 0.2)
 	return b
 si_f, si_t = ctx.names.index("大腿骨"), ctx.names.index("脛骨")
 b1 = make("ACL(当たり)", "ACL", si_f, si_t)
 b2 = make("PCL(当たり)", "PCL", si_f, si_t)
-check(ctx._ready(b1) and ctx._ready(b2), "束 2 本の面ができた")
-ctx.data["params"]["stride"] = 30
+b3 = make("ACL(隣)", "ACL", si_f, si_t, off=(2.5, 0.0, 0.0))     # ACL の隣（跳びが出やすい、隣り合う束）
+check(ctx._ready(b1) and ctx._ready(b2) and ctx._ready(b3), "束 3 本の面ができた")
+ctx.data["params"]["stride"] = 10
 lbl = ctx.w["ref_lbl"]
 check(lbl.cget("text").startswith(("表示の始まりのコマ", "初期状態（自動）")), f"自然長の基準の欄（{lbl.cget('text')}）")
 # 自動: 試験の段階から初期状態の終わりの 1 秒前（人工の段階で確かめる）
@@ -89,10 +90,10 @@ check("いまのコマを基準にする" in btns and "自動（初期状態）�
 cv = [w for w in walk(ctx.win) if w.winfo_class() == "TCheckbutton" and "束どうしの当たり" in str(w.cget("text"))]
 check(len(cv) == 1 and bool(ctx.w["contact_var"].get()), "「束どうしの当たり」のチェック（既定で ON）")
 import ankle_lig_bundles as _alb
-key_on = ctx._key([b1, b2])
+key_on = ctx._key([b1, b2, b3])
 # 当たりあり（既定）で計算
 t0 = time.time(); ctx.compute(parent=ctx.win); pump(app, 0.3); dt_on = time.time() - t0
-check(all(ctx.results.get(b["id"]) is not None for b in (b1, b2)), f"当たりありで計算した（{dt_on:.0f} 秒）")
+check(all(ctx.results.get(b["id"]) is not None for b in (b1, b2, b3)), f"当たりありで計算した（{dt_on:.0f} 秒）")
 def env_overlap():
 	"""計算したコマごとに、束 B の線維の点が束 A の外形（楕円の断面＋太さ）の中にある数（両端 8% を除く）。"""
 	from scipy.spatial import cKDTree
@@ -115,11 +116,30 @@ def env_overlap():
 			n += int(((s < 0.9) & ok).sum())
 	return n
 ov_on = env_overlap()
+def jumps():
+	"""外形の中心線（21 点に取り直し）の 2 階差分が、骨そのものの動き（2点目の付着部の線維の端の重心）の 3 倍 + 0.5mm を超えるコマの数と最大。"""
+	n_bad, worst = 0, 0.0
+	for b in (b1, b2, b3):
+		r = ctx.results[b["id"]]
+		Cs, En = [], []
+		for j in range(len(r["frames"])):
+			X = r["local"][j].astype(float)
+			C = _alb._envelopes(X, ctx._rf(b))[0]
+			sl = np.r_[0, np.cumsum(np.linalg.norm(np.diff(C, axis=0), axis=1))]
+			u = np.linspace(0, sl[-1], 21)
+			Cs.append(np.stack([np.interp(u, sl, C[:, i]) for i in range(3)], axis=1)); En.append(X[:, -1].mean(axis=0))
+		Cs, En = np.asarray(Cs), np.asarray(En)
+		acc = np.linalg.norm(Cs[2:] - 2 * Cs[1:-1] + Cs[:-2], axis=2).max(axis=1)
+		base = np.linalg.norm(En[2:] - 2 * En[1:-1] + En[:-2], axis=1)
+		n_bad += int((acc > 3 * base + 0.5).sum()); worst = max(worst, float((acc - 3 * base).max()))
+	return n_bad, worst
+jb, jw = jumps()
+check(jb == 0, f"当たりありでも外形が跳ばない（骨の動きの 3 倍 + 0.5mm を超えるコマ {jb}・最大の超え {jw:.2f} mm）")
 # 当たりを切る → 結果が外れる・鍵が変わる・保存
 cv[0].invoke(); pump(app, 0.3)
 check(not bool(ctx.data["params"]["bundle_contact"]) and all(ctx.results.get(b["id"]) is None for b in (b1, b2))
       and json.load(open(ctx.store, encoding="utf-8"))["params"]["bundle_contact"] is False, "当たりを切ると計算の結果が外れる（保存）")
-check(ctx._key([b1, b2]) != key_on, "当たりの有無は計算の鍵に入る")
+check(ctx._key([b1, b2, b3]) != key_on, "当たりの有無は計算の鍵に入る")
 ctx.compute(parent=ctx.win); pump(app, 0.3)
 ov_off = env_overlap()
 check(ov_on < 0.5 * ov_off or (ov_off == 0 and ov_on == 0), f"当たりで外形の重なりが減る（当たりなし {ov_off} 点 → あり {ov_on} 点）")
