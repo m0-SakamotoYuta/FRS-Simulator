@@ -983,12 +983,14 @@ class Stage2:
 			r = self.results.get(b.get("id"))
 			if r is not None:
 				Fn, K = r["local"].shape[1], r["local"].shape[2]
-				# 線維: F 本の折れ線をチューブに
+				dense = self._fib_dense_weights(Fn)                # 見た目の本数（×1 なら None）
+				Fd = Fn if dense is None else len(dense[0])
+				# 線維: Fd 本の折れ線をチューブに
 				pd = vtk.vtkPolyData()
 				pts = vtk.vtkPoints()
-				pts.SetNumberOfPoints(Fn * K)
+				pts.SetNumberOfPoints(Fd * K)
 				ca = vtk.vtkCellArray()
-				for f_ in range(Fn):
+				for f_ in range(Fd):
 					ca.InsertNextCell(K)
 					for k in range(K):
 						ca.InsertCellPoint(f_ * K + k)
@@ -996,7 +998,7 @@ class Stage2:
 				pd.SetLines(ca)
 				tube = vtk.vtkTubeFilter()
 				tube.SetInputData(pd)
-				tube.SetRadius(max(0.05, self._rf(b)))
+				tube.SetRadius(max(0.05, self._rf(b) / np.sqrt(max(1.0, Fd / max(Fn, 1)))))   # 本数を増やした分だけ細く
 				tube.SetNumberOfSides(8)
 				mp = vtk.vtkPolyDataMapper()
 				mp.SetInputConnection(tube.GetOutputPort())
@@ -1052,7 +1054,7 @@ class Stage2:
 				sact.SetVisibility(vis and view in ("skin", "both"))
 				self.plotter.renderer.AddActor(sact)
 				a.update(fib_act=fact, fib_pd=pd, fib_pts=pts, skin_act=sact, skin_pd=spd, skin_pts=spts,
-				         F=Fn, K=K, Ks=Ks, M=M, r=r, rf=self._rf(b))
+				         F=Fn, K=K, Ks=Ks, M=M, r=r, rf=self._rf(b), dense=dense, Fd=Fd)
 				try:
 					a["foot"] = (self._foot_ring(b["a"], M), self._foot_ring(b["b"], M))
 				except Exception as e:
@@ -1088,18 +1090,24 @@ class Stage2:
 	SKIN_M = 24            # 皮の輪のまわりの点の数
 	# 入力した断面の皮（2026-10-21 午後。_skin_shape）
 	SKIN_N_SIG = 0.10      # 輪の面の向き = 中心の線の接線を、輪の数のこの割合でならしたもの（輪どうしが交差しない）
-	SKIN_C_SMOOTH = 0.06   # 中心の線（線維の重心）の細かいうねりを取る強さ（輪の数の割合。両端は動かさない）
+	SKIN_C_SMOOTH = 0.25   # 中心の線（線維の重心）のうねりを取る強さ（輪の数の割合。両端は動かさない。10/22 に 0.06 から: 0.06 では波が残った）
 	SKIN_LIFT = (0.5, 2.0)  # 輪の中心を骨から離す: その向きの輪の半径のこの割合（mm の上限）＋ 許す距離
 	SKIN_LIFT_IT = 3
 	SKIN_LIFT_END = 2.0    # mm。両端からこの長さは中心の線を動かさない（付着部につながったまま）
-	SKIN_MOVE_SIG = 0.04   # 中心の線を動かす量を、輪の数のこの割合でならす
+	SKIN_MOVE_SIG = 0.15   # 中心の線を動かす量を、輪の数のこの割合でならす（10/22 に 0.04 から: 短い幅だと S 字の波になった）
 	SKIN_CLIP_EXTRA = 0.15  # mm。骨に当たる側を縮めるとき、許す距離にさらに足す
 	SKIN_CLIP_MIN = 0.3    # mm。縮めても、輪の中心からこれより内へは入れない
 	SKIN_CLIP_SIG = (1.5, 0.04)  # 縮める量のならし（輪のまわり: 点の数、長さ: 輪の数の割合）
 	SKIN_CLIP_END_POW = 2.0  # 付着部の近くは縮めるのを (1 − 端の輪へ寄せる重み)^これ で弱める（付着部の広がりを残す）
-	SKIN_SEP_IT = 2
+	SKIN_SEP_IT = 0        # 皮どうしを中心線ごと離す回数（10/22 に 2 → 0: AM束と PL束の間にすき間と S 字の波ができた。重なりは平らにするだけ）
 	SKIN_SEP_GAIN = 0.5
 	SKIN_MUT_FRAC = 0.5    # 皮どうしの重なりは、それぞれ重なりのこの割合だけ縮める（押し合って平らに）
+	SKIN_CONTAIN = False   # 入力した断面の皮を、線維の広がりまで広げるか（10/22 に False: PCL の厚みが 5 → 7.5mm になった）
+	SKIN_ORIENT_SIG = 0.12  # 骨に挟まれる所で短径をすき間の向きへそろえるとき、向きを長さ方向にならす幅（輪の数の割合）
+	SKIN_KEEP_CHOICES = ((0.0, "いまのまま（骨に入らない・狭い所で細くなる）"), (0.8, "8割は残す（骨に少し入る）"),
+	                     (1.0, "縮めない（入力の太さ・骨に入る）"))
+	SKIN_KEEP_DEFAULT = 0.8  # 骨とぶつかる所で、皮の輪の大きさを残す割合（2026-10-22）
+	FIB_MULT_MAX = 20      # 線維の見た目の本数（計算した本数の何倍か）の上限（2026-10-22）
 
 	def _shown(self, si):
 		"""骨 si でいま見えているモデル: "alt"（表示変更用モデル）か "calc"（計算に使ったモデル・関節面）。"""
@@ -1372,20 +1380,23 @@ class Stage2:
 		from vtk.util.numpy_support import vtk_to_numpy
 		push = self._skin_push_on()
 		Ws = [W for (_b, _a, W) in jobs]
+		Wd = [self._fib_dense(a, W) for (_b, a, W) in jobs]                # 見た目の線維（×1 なら計算した線維そのもの）
 		fj = [j for j, (_b, a, _W) in enumerate(jobs) if a["fib_act"].GetVisibility()]   # 線維が見えている束だけ
 		if push and fj:
 			try:
-				Wp = self._push_many([Ws[j] for j in fj], [self._fib_spec(jobs[j][2], jobs[j][1], jobs[j][0]) for j in fj], fi)
+				Wp = self._push_many([Wd[j] for j in fj], [self._fib_spec(Wd[j], jobs[j][1], jobs[j][0]) for j in fj], fi)
 				for j, W in zip(fj, Wp):
-					Ws[j] = W
+					Wd[j] = W
+					if jobs[j][1].get("dense") is None:
+						Ws[j] = W                                         # ×1 のときは前と同じ（皮も押し出した線維から）
 			except Exception as e:
 				traceback.print_exc()
 				print(f"[靭帯の束] 線維を骨の外へ出せません: {e}")
 				push = False
 		skins, rxi = [], []
-		for (b, a, _W), W in zip(jobs, Ws):
+		for (b, a, _W), W, W_d in zip(jobs, Ws, Wd):
 			if a["fib_act"].GetVisibility():
-				vtk_to_numpy(a["fib_pts"].GetData())[:] = W.reshape(-1, 3)
+				vtk_to_numpy(a["fib_pts"].GetData())[:] = W_d.reshape(-1, 3)
 				a["fib_pts"].Modified()
 				a["fib_pd"].Modified()
 			if a["skin_act"].GetVisibility():
@@ -1441,6 +1452,37 @@ class Stage2:
 			vtk_to_numpy(a["skin_pts"].GetData())[:] = S
 			a["skin_pts"].Modified()
 			a["skin_pd"].Modified()
+
+	def _fib_mult(self):
+		"""線維の見た目の本数（計算した本数の何倍か。params "fib_mult"）。"""
+		try:
+			m = int(self.params().get("fib_mult", 1))
+		except (TypeError, ValueError):
+			m = 1
+		return int(min(self.FIB_MULT_MAX, max(1, m)))
+
+	def _fib_dense_weights(self, Fn):
+		"""見た目の線維ごとの、計算した線維 3 本の番号と重み（付着部の中の並び＝sunflower の uv で近い 3 本・距離の逆数の 2 乗）。
+		×1 なら None。返り値: (番号 (Fd,3), 重み (Fd,3))。"""
+		mult = self._fib_mult()
+		if mult <= 1 or Fn < 3:
+			return None
+		from scipy.spatial import cKDTree
+		uv0 = sunflower(Fn)
+		uvd = sunflower(Fn * mult)
+		d, i = cKDTree(uv0).query(uvd, k=3)
+		w = 1.0 / np.maximum(d, 1e-6) ** 2
+		w /= w.sum(axis=1, keepdims=True)
+		return i.astype(np.int64), w
+
+	@staticmethod
+	def _fib_dense(a, W):
+		"""計算した線維 W (F,K,3) → 見た目の線維（a["dense"] が無ければ W のまま）。"""
+		dn = a.get("dense")
+		if dn is None:
+			return W
+		i, w = dn
+		return np.einsum("dj,djki->dki", w, W[i])
 
 	def _fib_spec(self, W, a, b):
 		"""線維の押し出しの条件: {"c": 骨 → (n,) 許す距離（nan は動かさない）, "g": 組（線維の同じ番号の点）}。両端の点は動かさない。"""
@@ -1759,7 +1801,7 @@ class Stage2:
 			return None
 
 	@staticmethod
-	def _rx_rings(C, t, Q, rf, rx, Qc=None):
+	def _rx_rings(C, t, Q, rf, rx, Qc=None, contain=True):
 		"""入力した断面の皮の輪: 向き e1 (K,3) と半径 r1・r2 (K,)。
 		向き: 1点目の付着部の長径の向きから 2点目の長径の向きへ、いちばん小さいねじれでなめらかに回す（中心の線に沿って平行に運んだ
 		枠で測る）。中ほどでは線維の広がりの向きを倍角で少し取り入れる（重み 0.9 未満 × 広がりの偏り。足しても 0 にならず向きが飛ばない）。
@@ -1810,8 +1852,8 @@ class Stage2:
 		w_ = np.sin(np.pi * s_)
 		R = (1.0 - w_)[:, None] * fr + w_[:, None] * (0.5 * np.asarray(rx["AB"], float))[None]
 		Qc = Q if Qc is None else Qc                     # 線維を包むかは皮の中心から（向きは線維の重心から）
-		r1 = np.maximum(R[:, 0], np.abs(np.einsum("fki,ki->fk", Qc, e1)).max(axis=0) + rf) if Fn else R[:, 0]
-		r2 = np.maximum(R[:, 1], np.abs(np.einsum("fki,ki->fk", Qc, e2)).max(axis=0) + rf) if Fn else R[:, 1]
+		r1 = np.maximum(R[:, 0], np.abs(np.einsum("fki,ki->fk", Qc, e1)).max(axis=0) + rf) if (Fn and contain) else R[:, 0]
+		r2 = np.maximum(R[:, 1], np.abs(np.einsum("fki,ki->fk", Qc, e2)).max(axis=0) + rf) if (Fn and contain) else R[:, 1]
 		return e1, r1, r2
 
 	def _skin_points(self, W, rf, M, foot=None, rx=None):
@@ -1915,12 +1957,12 @@ class Stage2:
 		C0 = W.mean(axis=0)
 		C = self._smooth_center(C0, self.SKIN_C_SMOOTH)
 		n = self._ring_normals(C)
-		Qc = W - C[None]                                 # 皮の中心から（線維を包むかの判定）
-		Qc = Qc - np.einsum("fki,ki->fk", Qc, n)[:, :, None] * n[None]
-		Qp = W - C0[None]                                # 線維の重心から（線維の広がりの向き）
+		Qp = W - C0[None]                                # 線維の重心から（線維の広がりの向き・大きさ）
 		Qp = Qp - np.einsum("fki,ki->fk", Qp, n)[:, :, None] * n[None]
-		e1, r1, r2 = self._rx_rings(C, n, Qp, rf, rx, Qc=Qc)
-		return {"C": C, "e1": e1, "r1": r1, "r2": r2}
+		# 輪を線維の広がりまで広げる量も、線維の重心から測る（皮の中心からだと、中心の線をならしたずれの分まで輪が大きくなり、
+		# 入力した断面より太くなった。10/22: 8×5 が 8.8×5.6）
+		e1, r1, r2 = self._rx_rings(C, n, Qp, rf, rx, contain=bool(self.SKIN_CONTAIN))
+		return {"C": C, "C0": C0, "e1": e1, "r1": r1, "r2": r2}
 
 	def _skin_rings(self, fr, X, M):
 		"""中心の線 X (K,3) のまわりの輪 (K,M,3)（大きさ・向きは fr）。返り値: 輪・輪の面の向き n・長径の向き e1・短径の向き e2。"""
@@ -1996,6 +2038,9 @@ class Stage2:
 			self._skin_separate(items)
 		if push:
 			self._skin_lift(items, fi)
+			if self._skin_center_guard(items, fi):
+				self._skin_lift(items, fi)                           # 戻した所を、もう一度骨から離す
+			self._skin_orient(items, fi)                             # 骨に挟まれる所は、厚みをすき間の向きへ
 		for it in items:
 			it["R"], it["n"], it["e1"], it["e2"] = self._skin_rings(it["fr"], it["X"], M)
 			it["S"] = self._skin_build(it["R"], M, it["foot"])
@@ -2009,6 +2054,90 @@ class Stage2:
 		for it, (_b, _a, S) in zip(items, skins):
 			it["S"] = S
 		self._skin_last = {it["b"].get("id"): {"X": it["X"], "pre": p_} for it, p_ in zip(items, pre)}   # 確かめ用
+
+	def _skin_center_guard(self, items, fi):
+		"""中心の線が骨の中（許す距離より内）に入った所は、なめらかに線維の重心の線へ戻す（線維は骨の外。2026-10-22）。
+		強くならした中心の線が骨の出っ張りを近道し、骨に挟まれて中心を離しきれない所があった（中心が骨の中の輪は縮められない）。"""
+		from scipy.ndimage import gaussian_filter1d, maximum_filter1d
+		moved = False
+		items = [it for it in items if "C0" in it["fr"]]
+		if not items:
+			return moved
+		Ps = [it["X"] for it in items] + [np.asarray(it["fr"]["C0"], float) for it in items]
+		off = np.r_[0, np.cumsum([len(p) for p in Ps])]
+		Pall = np.concatenate(Ps)
+		n_ = len(items)
+		mg = [np.full(len(p), np.inf) for p in Ps]                    # 骨からの距離 − 許す距離（いちばん近い骨）
+		for si in range(len(self.poses)):
+			o = self._disp_ob(si)
+			if o is None:
+				continue
+			T = self.poses[si][fi]
+			sd = self._ob_closest(o, (Pall - T[:3, 3]) @ T[:3, :3])[2]
+			for j in range(2 * n_):
+				it = items[j % n_]
+				mg[j] = np.minimum(mg[j], sd[off[j]:off[j + 1]] - self._skin_clear(it["a"], it["b"], it["X"], si))
+		for j, it in enumerate(items):
+			# 骨に入った所のうち、線維の重心の線のほうが骨から遠い所だけ（線維が骨の出っ張りを巻くと、重心が骨の中に来ることがある）
+			bd = (mg[j] < 0.05) & (mg[n_ + j] > mg[j] + 0.1) & (it["wb"] < 0.5)     # 付着部（骨の中から出る所）は除く
+			if not bd.any():
+				continue
+			w = gaussian_filter1d(maximum_filter1d(bd.astype(float), size=5, mode="nearest"), 1.5, mode="nearest")
+			w = np.clip(1.5 * w, 0.0, 1.0)[:, None]
+			it["X"] = (1.0 - w) * it["X"] + w * np.asarray(it["fr"]["C0"], float)
+			it["X0"], it["U"] = it["X"].copy(), np.zeros_like(it["X"])     # ここから離し直す
+			it["R0"], it["n"], it["e1"], it["e2"] = self._skin_rings(it["fr"], it["X"], int(it["a"]["M"]))
+			it["R"] = it["R0"].copy()
+			moved = True
+		return moved
+
+	def _skin_orient(self, items, fi):
+		"""反対向きの 2 つの骨に挟まれて、長径の向きでは入らない所だけ、楕円の短径（厚み）をすき間の向きへそろえる（2026-10-22）。
+		it["fr"]["e1"] を差し替える（大きさは入力のまま）。大腿骨と脛骨の間を通る所で長径が骨の方を向くと、両側から縮められて
+		細いくびれになった（PCL）。骨が 1 つ近いだけの所は変えない（向きの段ができた）。"""
+		from scipy.ndimage import gaussian_filter1d
+		M = int(items[0]["a"]["M"])
+		Ps = [it["X"] for it in items]
+		off = np.r_[0, np.cumsum([len(p) for p in Ps])]
+		Pall = np.concatenate(Ps)
+		hits = []                                                    # 骨ごとの (符号つき距離, 法線)
+		for si in range(len(self.poses)):
+			o = self._disp_ob(si)
+			if o is None:
+				continue
+			T = self.poses[si][fi]
+			_cp, ns, sd = self._ob_closest(o, (Pall - T[:3, 3]) @ T[:3, :3])
+			hits.append((sd, ns @ T[:3, :3].T))
+		if len(hits) < 2:
+			return
+		for j, it in enumerate(items):
+			K = len(it["X"])
+			_R, n, e1, e2 = self._skin_rings(it["fr"], it["X"], M)
+			r1, r2 = it["fr"]["r1"], it["fr"]["r2"]
+			acc = np.zeros((K, 2))
+			qs = np.zeros(K)
+			for a_ in range(len(hits)):
+				for b_ in range(a_ + 1, len(hits)):
+					sa, na = hits[a_][0][off[j]:off[j + 1]], hits[a_][1][off[j]:off[j + 1]]
+					sb, nb = hits[b_][0][off[j]:off[j + 1]], hits[b_][1][off[j]:off[j + 1]]
+					opp = np.einsum("ki,ki->k", na, nb) < -0.3              # 反対向き＝挟まれている
+					gap = sa + sb                                            # 骨と骨のすき間（中心を通る向き）
+					q = np.clip((2.0 * r1 + 1.0 - gap) / np.maximum(2.0 * (r1 - r2) + 1.0, 1e-6), 0.0, 1.0) * opp
+					d = 0.5 * (na - nb)                                      # すき間の向き（厚みをこの向きへ）
+					d = d - np.einsum("ki,ki->k", d, n)[:, None] * n
+					dn = np.linalg.norm(d, axis=1)
+					q = q * np.clip(dn / 0.5, 0.0, 1.0)
+					t1 = np.cross(n, d / np.maximum(dn, 1e-9)[:, None])     # 長径の向き（すき間に沿う）
+					ph = np.arctan2(np.einsum("ki,ki->k", t1, e2), np.einsum("ki,ki->k", t1, e1))
+					acc += q[:, None] * np.c_[np.cos(2 * ph), np.sin(2 * ph)]
+					qs += q
+			if not (qs > 1e-3).any():
+				continue
+			w = np.minimum(qs, 1.0) * (1.0 - it["wb"])
+			v = (1.0 - w)[:, None] * np.c_[np.ones(K), np.zeros(K)] + w[:, None] * (acc / np.maximum(np.linalg.norm(acc, axis=1), 1e-9)[:, None])
+			v = gaussian_filter1d(v, max(1.0, self.SKIN_ORIENT_SIG * (K - 1)), axis=0, mode="nearest")
+			dlt = 0.5 * np.arctan2(v[:, 1], v[:, 0])
+			it["fr"] = dict(it["fr"], e1=np.cos(dlt)[:, None] * e1 + np.sin(dlt)[:, None] * e2)
 
 	def _skin_separate(self, items):
 		"""皮どうしを離す（中心の線ごと）: 輪を断面とみなして、中心線どうしの距離で（_bundle_contact。両端の 15% は動かさない）。
@@ -2064,6 +2193,7 @@ class Stage2:
 		"""骨に当たる側だけ、皮の輪の点を輪の中心（origins: 中心の線の点）へ縮める（外へは動かさない＝ひれができない・輪の面の中＝交差しない）。
 		中心から輪の点への光線が骨に当たる所まで（許す距離を残して）。中心が骨の中の輪（付着部）は縮めない。"""
 		import open3d as o3d
+		keep = self._skin_keep()
 		out = []
 		for jj, (b, a, S) in enumerate(skins):
 			K, M = int(a.get("Ks", a["K"])), int(a["M"])
@@ -2090,10 +2220,17 @@ class Stage2:
 				lim[sdc < 0.0] = np.inf
 				lim_all = np.minimum(lim_all, lim)
 			dl = np.clip(rho - np.maximum(lim_all, self.SKIN_CLIP_MIN), 0.0, None)
-			out.append((b, a, self._skin_shrink(S, K, M, O, u, rho, dl)))
+			out.append((b, a, self._skin_shrink(S, K, M, O, u, rho, dl, keep=keep)))
 		return out
 
-	def _skin_shrink(self, S, K, M, O, u, rho, dl):
+	def _skin_keep(self):
+		"""骨とぶつかる所で、皮の輪の大きさを残す割合（0〜1。params "skin_keep"）。"""
+		try:
+			return float(min(1.0, max(0.0, float(self.params().get("skin_keep", self.SKIN_KEEP_DEFAULT)))))
+		except (TypeError, ValueError):
+			return float(self.SKIN_KEEP_DEFAULT)
+
+	def _skin_shrink(self, S, K, M, O, u, rho, dl, keep=0.0):
 		"""輪の点を中心 O へ dl (K,M) だけ縮める。dl はならす（前後・まわりの最大をとってから＝ならしても足りなくならない）。
 		付着部の近くは弱める（(1 − 端の輪へ寄せる重み)^SKIN_CLIP_END_POW。付着部の広がりを残す）。"""
 		from scipy.ndimage import gaussian_filter1d, maximum_filter
@@ -2106,6 +2243,8 @@ class Stage2:
 			dlx = gaussian_filter1d(dlx, sk, axis=0, mode="nearest")
 			dl = np.maximum(dl, dlx)
 		dl = dl * ((1.0 - self._blend_w(K)) ** float(self.SKIN_CLIP_END_POW))[:, None]
+		if keep > 0.0:
+			dl = np.minimum(dl, (1.0 - float(keep)) * rho)            # 輪の大きさを keep の割合は残す（残りは骨に入ってよい）
 		rfin = np.maximum(rho - dl, np.minimum(rho, self.SKIN_CLIP_MIN))
 		S = np.array(S, float)
 		S[:K * M] = (O[:, None] + u * rfin[:, :, None]).reshape(-1, 3)
@@ -2523,6 +2662,49 @@ class Stage2:
 			self.update(self.fi, render=True)
 		ttk.Checkbutton(bot4, text="皮どうしを重ねない（押し合って平らに）", variable=self.w["sep_var"],
 		                command=_sep_toggle).pack(side="left", padx=(10, 0))
+		# 骨とぶつかる所で皮をどこまで縮めるか（2026-10-22）
+		bot5 = ttk.Frame(body)
+		bot5.pack(fill="x", padx=8, pady=(0, 4))
+		ttk.Label(bot5, text="骨とぶつかる所の皮:").pack(side="left")
+		self.w["keep_var"] = tk.StringVar(win, value=f"{self._skin_keep():g}")
+
+		def _keep_set():
+			try:
+				self.data.setdefault("params", {})["skin_keep"] = float(self.w["keep_var"].get())
+			except ValueError:
+				return
+			self._save()
+			self.update(self.fi, render=True)
+		for v_, lab_ in self.SKIN_KEEP_CHOICES:
+			ttk.Radiobutton(bot5, text=lab_, value=f"{v_:g}", variable=self.w["keep_var"], command=_keep_set).pack(side="left", padx=(6, 0))
+		ttk.Label(bot5, text="（表示だけ。骨を出していれば、骨に入った所は骨に隠れます）", foreground="gray").pack(side="left", padx=6)
+		# 線維の見た目の本数（計算は同じ本数のまま。2026-10-22）
+		bot6 = ttk.Frame(body)
+		bot6.pack(fill="x", padx=8, pady=(0, 4))
+		ttk.Label(bot6, text="線維の見た目の本数: ×").pack(side="left")
+		self.w["mult_var"] = tk.StringVar(win, value=str(self._fib_mult()))
+
+		def _mult_set(*_a):
+			try:
+				m_ = int(min(self.FIB_MULT_MAX, max(1, int(float(self.w["mult_var"].get())))))
+			except ValueError:
+				self.w["mult_var"].set(str(self._fib_mult()))
+				return
+			self.w["mult_var"].set(str(m_))
+			if m_ == self._fib_mult():
+				return
+			self.data.setdefault("params", {})["fib_mult"] = m_
+			self._save()
+			self._rebuild_actors()
+			self._say(f"線維の見た目の本数を ×{m_} にしました（計算は同じ本数のまま）。"
+			          + ("倍率が大きいと、再生が遅くなります（×10 で 1 コマ 0.1〜0.2 秒ほど）。" if m_ >= 6 else ""))
+		sb_m = ttk.Spinbox(bot6, from_=1, to=self.FIB_MULT_MAX, increment=1, width=4, textvariable=self.w["mult_var"], command=_mult_set)
+		sb_m.pack(side="left")
+		sb_m.bind("<Return>", _mult_set)
+		sb_m.bind("<FocusOut>", _mult_set)
+		self.w["mult_spin"] = sb_m
+		ttk.Label(bot6, text=f"（1〜{self.FIB_MULT_MAX}。1 は計算した線維そのもの。計算は同じ本数のまま、増やした線維は近い計算線維 3 本の間を補間して描きます。1 本は細く）",
+		          foreground="gray").pack(side="left", padx=6)
 		ttk.Label(bot4, text="　切り残しを消す付着部:").pack(side="left")
 		self.w["stump_lbl"] = ttk.Label(bot4, text="", foreground="#0b5394")
 		self.w["stump_lbl"].pack(side="left", padx=2)

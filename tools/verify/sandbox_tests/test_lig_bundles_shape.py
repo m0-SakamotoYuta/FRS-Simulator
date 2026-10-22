@@ -97,9 +97,11 @@ W = ctx._local_at(rr, fi) @ T[:3, :3].T + T[:3, 3]
 Wu = ctx._upsample(W, Ks)
 R = pre[Ks // 2]; c = R.mean(0); Q = R - c
 w_, V = np.linalg.eigh(Q.T @ Q); e1, e2 = V[:, -1], V[:, -2]
-fpts = Wu[:, Ks // 2] - c
+fpts = Wu[:, Ks // 2] - Wu[:, Ks // 2].mean(0)       # 線維の広がり（線維の重心から。皮の中心はならした線にある。10/22）
 inside = (np.abs(fpts @ e1) / (np.abs(Q @ e1).max() + 1e-9)) ** 2 + (np.abs(fpts @ e2) / (np.abs(Q @ e2).max() + 1e-9)) ** 2
-check(inside.max() <= 1.05, f"中ほどの線維は皮の中（縮める前・いちばん外の線維 {np.sqrt(inside.max()):.2f}・1 以下）")
+# 10/22: 入力した断面を優先（線維の広がりまで輪を広げない。SKIN_CONTAIN = False）。広げる設定のときだけ確かめる
+check((not ctx.SKIN_CONTAIN) or inside.max() <= 1.05,
+      f"線維の広がりまで輪を広げるのは SKIN_CONTAIN のときだけ（いま {ctx.SKIN_CONTAIN}・いちばん外の線維 {np.sqrt(inside.max()):.2f}）")
 # 縮めるだけ（輪の点を外へは動かさない＝ひれができない）
 gr = np.linalg.norm(S - Xc[:, None], axis=2) - np.linalg.norm(pre - Xc[:, None], axis=2)
 check(gr.max() < 1e-3, f"骨・となりの皮の側は輪の中心へ縮めるだけ（外へ動いた最大 {gr.max():+.4f} mm・画面の点は 32 ビット）")
@@ -113,13 +115,25 @@ def sd_min(P_, fi_):
 		mn = np.minimum(mn, ctx._ob_closest(o_, (P_ - T_[:3, 3]) @ T_[:3, :3])[2])
 	return mn
 wbl = ctx._blend_w(Ks)
+# 骨とぶつかる所の皮（10/22）: 既定は「8割は残す」。「いまのまま」(0) なら骨に入らない
+kv = ctx.w.get("keep_var")
+check(abs(ctx._skin_keep() - 0.8) < 1e-9 and kv is not None and kv.get() == "0.8", f"「骨とぶつかる所の皮」の既定は 8割は残す（{ctx._skin_keep()}）")
+ctx.data["params"]["skin_keep"] = 0.0
 bad_in = []
 for fi_ in np.linspace(0, ctx.n_view - 1, 8).astype(int):
 	ctx.update(int(fi_)); S_ = rings()
 	mn_ = sd_min(S_[wbl < 1e-6].reshape(-1, 3), int(fi_))
 	bad_in.append(float(mn_.min()))
+check(min(bad_in) > 0.0, f"「いまのまま」なら筒の部分は骨の外（8 コマの最小 {min(bad_in):+.2f} mm）")
+ctx.data["params"]["skin_keep"] = 0.8
+low = []
+for fi_ in np.linspace(0, ctx.n_view - 1, 8).astype(int):
+	ctx.update(int(fi_)); S_ = rings(); pre_ = ctx._skin_last[b["id"]]["pre"][:Ks * Mm].reshape(Ks, Mm, 3); X_ = ctx._skin_last[b["id"]]["X"]
+	r0 = np.linalg.norm(pre_ - X_[:, None], axis=2); r1 = np.linalg.norm(S_ - X_[:, None], axis=2)
+	low.append(float((r1 / np.maximum(r0, 1e-9))[wbl < 1e-6].min()))
+check(min(low) >= 0.8 - 1e-3, f"「8割は残す」なら輪の大きさは 8 割以上（8 コマの最小 {min(low):.3f}）")
+del ctx.data["params"]["skin_keep"]
 ctx.update(fi); S = rings()
-check(min(bad_in) > 0.0, f"筒の部分は骨の外（8 コマの最小 {min(bad_in):+.2f} mm）")
 # 折れ目が無い: 中ほどで、となりの輪が前の輪の面の後ろへ回り込まない（交差しない）
 Cr = S.mean(axis=1)
 tr = np.zeros((Ks, 3))

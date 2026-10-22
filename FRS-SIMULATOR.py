@@ -729,6 +729,15 @@ class MainMenuGUI(_BaseWindow):
 		self.ankle_clip_kind = tk.StringVar(value="anterior") # "anterior"（0→+200 N）/ "posterior"（0→−200 N）
 		self.ankle_clip_dir = tk.StringVar(value="")
 		self.ankle_clip_chart = tk.BooleanVar(value=True)     # 靭帯の長さのグラフも別の mp4 に
+		# 靭帯の長さのグラフの文字の大きさ「凡例,軸の数字,軸の名前」（2026-10-22）
+		self.ankle_clip_chart_fs = tk.StringVar(value="0,0,0")    # 書き出すグラフ（pt。0＝一辺から自動）
+		# 終わったあと止める秒数・右上の文字を 3D の動画に入れるか・右上の数字だけの動画（2026-10-22）
+		self.ankle_clip_hold = tk.DoubleVar(value=0.0)
+		self.ankle_clip_text_on = tk.BooleanVar(value=True)
+		self.ankle_clip_nums = tk.BooleanVar(value=False)              # ②で数字の動画も一緒に書き出す
+		self.ankle_clip_nums_fs = tk.StringVar(value="60,48")          # 数字の動画の文字 px（段階と力, 接触圧）
+		self.ankle_clip_lig_on = tk.BooleanVar(value=True)             # 正方形（動画）にも靭帯を映す
+		self.ankle_lig_chart_fs = tk.StringVar(value="12,12,12")  # 画面右のグラフ（px。12＝VTK の既定）
 		# 方眼紙と移動量（2026-10-09）
 		self.ankle_grid_show = tk.BooleanVar(value=True)
 		self.ankle_grid_minor_mm = tk.DoubleVar(value=1.0)
@@ -4639,6 +4648,13 @@ class MainMenuGUI(_BaseWindow):
 			"ankle_clip_kind": (self.ankle_clip_kind, str),
 			"ankle_clip_dir": (self.ankle_clip_dir, str),
 			"ankle_clip_chart": (self.ankle_clip_chart, bool),
+			"ankle_clip_chart_fs": (self.ankle_clip_chart_fs, str),
+			"ankle_lig_chart_fs": (self.ankle_lig_chart_fs, str),
+			"ankle_clip_hold": (self.ankle_clip_hold, float),
+			"ankle_clip_text_on": (self.ankle_clip_text_on, bool),
+			"ankle_clip_nums": (self.ankle_clip_nums, bool),
+			"ankle_clip_nums_fs": (self.ankle_clip_nums_fs, str),
+			"ankle_clip_lig_on": (self.ankle_clip_lig_on, bool),
 			"ankle_lig_wrap": (self.ankle_lig_wrap, bool),
 			"ankle_lig_mode": (self.ankle_lig_mode, str),
 			"ankle_joint_only": (self.ankle_joint_only, bool),
@@ -11784,6 +11800,8 @@ class MainMenuGUI(_BaseWindow):
 							_tp.SetFontFile(jfont)
 					except Exception as e:
 						print(f"[右のグラフ] 日本語のフォントを使えません: {e}")
+				if k == "lig":
+					self._ankle_lig_chart_apply_fs(ch)          # 靭帯の長さのグラフの文字の大きさ（2026-10-22）
 				p.add_chart(ch)
 				st["charts"].append((ch, cur, lo, hi))
 			try:
@@ -11866,12 +11884,44 @@ class MainMenuGUI(_BaseWindow):
 			self._ankle_view_write(tab_ref, {"ankle_chart_order": ",".join(cur + rest)})
 			_build()
 
-		scene["chart_select"] = {"items": _avail, "get": _is_on, "set": _set, "ordered": _ordered, "move": _move}
+		def _fs_set(vals):
+			"""靭帯の長さのグラフの文字の大きさ（凡例, 軸の数字, 軸の名前。px）を変えて描き直す。"""
+			try:
+				self.ankle_lig_chart_fs.set(",".join(f"{max(4.0, float(v)):g}" for v in list(vals)[:3]))
+				self._schedule_state_autosave("ankle")
+			except Exception:
+				return
+			_build()
+
+		scene["chart_select"] = {"items": _avail, "get": _is_on, "set": _set, "ordered": _ordered, "move": _move,
+		                         "fs_get": lambda: self._ankle_fs3(self.ankle_lig_chart_fs, (12, 12, 12)), "fs_set": _fs_set}
 		if scene.get("_lig_wrap") is not None:
 			scene["_lig_wrap"]["listeners"].append(_build)      # 沿わせる を切り替えた・計算した → 描き直す
 		if scene.get("_lig_bundles") is not None:
 			scene["_lig_bundles"].listeners.append(_build)      # 段階2: 束を計算した・変えた → 描き直す
 		return _make
+
+	@staticmethod
+	def _ankle_fs3(var, dflt):
+		"""「凡例,軸の数字,軸の名前」の文字列 → 3 つの数（読めない所は dflt）。"""
+		try:
+			v = [float(x) for x in str(var.get()).split(",")]
+		except Exception:
+			v = []
+		v = (v + list(dflt))[:3]
+		return [float(x) if x >= 0 else float(d) for x, d in zip(v, dflt)]
+
+	def _ankle_lig_chart_apply_fs(self, ch):
+		"""画面右の靭帯の長さのグラフの文字の大きさ（凡例・軸の数字・軸の名前。px。2026-10-22）。"""
+		lg, tk_, ti = self._ankle_fs3(self.ankle_lig_chart_fs, (12, 12, 12))
+		try:
+			ch.GetLegend().GetLabelProperties().SetFontSize(max(4, int(round(lg))))
+			for a_ in (0, 1):
+				ax_ = ch.GetAxis(a_)
+				ax_.GetLabelProperties().SetFontSize(max(4, int(round(tk_))))
+				ax_.GetTitleProperties().SetFontSize(max(4, int(round(ti))))
+		except Exception as e:
+			print(f"[右のグラフ] 文字の大きさを変えられません: {e}")
 
 	# ---- 靭帯の長さのグラフ（2026-10-15） ----
 	# 右側のグラフの いちばん上に、模擬靭帯（ACL・PCL・MCL・LCL など）の長さを1枚にまとめて描く。
@@ -13007,13 +13057,29 @@ class MainMenuGUI(_BaseWindow):
 					self.ankle_clip_dir.set(str(d["dir"]))
 				if "chart" in d:
 					self.ankle_clip_chart.set(bool(d["chart"]))
+				if "chart_fs" in d:
+					self.ankle_clip_chart_fs.set(",".join(f"{max(0.0, float(v)):g}" for v in list(d["chart_fs"])[:3]))
+				if "hold" in d:
+					self.ankle_clip_hold.set(max(0.0, float(d["hold"])))
+				if "text_on" in d:
+					self.ankle_clip_text_on.set(bool(d["text_on"]))
+				if "nums" in d:
+					self.ankle_clip_nums.set(bool(d["nums"]))
+				if "nums_fs" in d:
+					self.ankle_clip_nums_fs.set(",".join(f"{max(6.0, float(v)):g}" for v in list(d["nums_fs"])[:2]))
+				if "lig_on" in d:
+					self.ankle_clip_lig_on.set(bool(d["lig_on"]))
 				self._schedule_state_autosave("ankle")
 			except Exception:
 				pass
 		try:
 			clip0 = {"size": int(self.ankle_clip_size.get()), "sec": float(self.ankle_clip_sec.get()),
 			         "kind": ("posterior" if str(self.ankle_clip_kind.get()) == "posterior" else "anterior"),
-			         "dir": str(self.ankle_clip_dir.get() or ""), "chart": bool(self.ankle_clip_chart.get())}
+			         "dir": str(self.ankle_clip_dir.get() or ""), "chart": bool(self.ankle_clip_chart.get()),
+			         "chart_fs": self._ankle_fs3(self.ankle_clip_chart_fs, (0, 0, 0)),
+			         "hold": max(0.0, float(self.ankle_clip_hold.get())), "text_on": bool(self.ankle_clip_text_on.get()),
+			         "nums": bool(self.ankle_clip_nums.get()), "nums_fs": self._ankle_fs3(self.ankle_clip_nums_fs, (60, 48, 0))[:2],
+			         "lig_on": bool(self.ankle_clip_lig_on.get())}
 		except Exception:
 			clip0 = {"size": 900, "sec": 10.0, "kind": "anterior", "dir": "", "chart": True}
 		_tname = ""
@@ -16222,7 +16288,9 @@ class MainMenuGUI(_BaseWindow):
 				po_act[_k] = ta
 			_po_bi = po_cfg.get("bone")
 			_po_area = [None]
-			clip_st = {"busy": False, "cancel": False, "orig_size": None, "clean": False, "heat": False, "saved": {}, "ovr": {}}
+			clip_st = {"busy": False, "cancel": False, "orig_size": None, "clean": False, "heat": False, "saved": {}, "ovr": {},
+			           "text_on": bool((po_cfg.get("clip") or {}).get("text_on", True)),
+			           "lig_on": bool((po_cfg.get("clip") or {}).get("lig_on", True)), "playing": False}
 
 			def _po_point_area():
 				"""脛骨（計算に使ったモデル）の各点が受け持つ面積 mm²（周りの三角形の 1/3 ずつ）。"""
@@ -16242,23 +16310,12 @@ class MainMenuGUI(_BaseWindow):
 						_po_area[0] = np.zeros(0)
 				return _po_area[0]
 
-			def _po_update(fi):
-				if clip_st.get("clean"):
-					_clean_apply()                  # 正方形（動画）の間は、骨と右上の文字だけ
-				# 文字の大きさと位置（右上。引張の行の下に接触の行）
-				try:
-					H_ = float(anim_plotter.renderer.GetSize()[1]) or 900.0
-				except Exception:
-					H_ = 900.0
-				po_act["force"].GetTextProperty().SetFontSize(int(po["force_fs"]))
-				po_act["contact"].GetTextProperty().SetFontSize(int(po["contact_fs"]))
-				y0 = 0.975
-				po_act["force"].SetPosition(0.985, y0)
-				po_act["contact"].SetPosition(0.985, y0 - (1.45 * po["force_fs"] + 8.0) / H_)
+			def _po_texts(fi, lab=None):
+				"""右上の文字: (段階と力の文字, その色 (r,g,b), 接触の文字)。lab は動画用の (段階, Fap) の上書き（2026-10-22 に _po_update から分けた）。"""
 				# 試験の段階（初期状態=緑・前方引張=赤・後方引張=青）と Fap（＋＝前方向の力）
-				txt_f = ""
+				txt_f, col = "", (0.85, 0.0, 0.0)
 				if po["force_on"]:
-					r_ = clip_st["ovr"].get(int(fi)) if clip_st.get("ovr") else None     # 動画用の上書き（始めは初期状態・最後は ±200 N）
+					r_ = lab if lab is not None else (clip_st["ovr"].get(int(fi)) if clip_st.get("ovr") else None)   # 動画用の上書き（始めは初期状態・最後は ±200 N）
 					if r_ is None:
 						r_ = po_cfg["phase_at"](fi) if callable(po_cfg.get("phase_at")) else None
 					if r_ is not None:
@@ -16271,9 +16328,6 @@ class MainMenuGUI(_BaseWindow):
 							txt_f, col = f"後方引張中：{num}", (0.0, 0.25, 0.9)
 						else:
 							txt_f, col = "初期状態", (0.0, 0.55, 0.15)
-						po_act["force"].GetTextProperty().SetColor(*col)
-				po_act["force"].SetInput(txt_f)
-				po_act["force"].SetVisibility(1 if txt_f else 0)
 				# 接触面積・接触圧（脛骨）
 				txt_c = ""
 				if po["contact_on"] and heatmap_enabled and _po_bi is not None:
@@ -16300,8 +16354,30 @@ class MainMenuGUI(_BaseWindow):
 							if po["area_on"] or not (HA_ > 0 and h_ > 0):
 								lines.append(f"接触面積：{area:.0f} mm²")
 							txt_c = "\n".join(lines)
+				return txt_f, col, txt_c
+
+			def _po_update(fi):
+				if clip_st.get("clean"):
+					_clean_apply()                  # 正方形（動画）の間は、骨と右上の文字だけ
+				# 文字の大きさと位置（右上。引張の行の下に接触の行）
+				try:
+					H_ = float(anim_plotter.renderer.GetSize()[1]) or 900.0
+				except Exception:
+					H_ = 900.0
+				po_act["force"].GetTextProperty().SetFontSize(int(po["force_fs"]))
+				po_act["contact"].GetTextProperty().SetFontSize(int(po["contact_fs"]))
+				y0 = 0.975
+				po_act["force"].SetPosition(0.985, y0)
+				po_act["contact"].SetPosition(0.985, y0 - (1.45 * po["force_fs"] + 8.0) / H_)
+				txt_f, col, txt_c = _po_texts(fi)
+				po_act["force"].GetTextProperty().SetColor(*col)
+				po_act["force"].SetInput(txt_f)
+				po_act["force"].SetVisibility(1 if txt_f else 0)
 				po_act["contact"].SetInput(txt_c)
 				po_act["contact"].SetVisibility(1 if txt_c else 0)
+				if clip_st.get("clean") and not clip_st.get("text_on", True):
+					po_act["force"].SetVisibility(0)              # 3D の動画に右上の文字を入れない（数字は別の動画に。2026-10-22）
+					po_act["contact"].SetVisibility(0)
 
 			po_hook[0] = _po_update
 
@@ -16341,11 +16417,38 @@ class MainMenuGUI(_BaseWindow):
 			def _bone_actor_list():
 				return [a_ for a_ in list(actors) + list(actors_j) + list(actors_a) if a_ is not None]
 
+			def _lig_actor_ids():
+				"""靭帯の部品（段階1の靭帯の管と端の球・段階2の線維と皮）。名前の文字・付着部の楕円は含めない。"""
+				out = set()
+				try:
+					for lg in ((lig_ctx[0] or {}).get("_ligs") or []):
+						for k_ in ("actor",):
+							if lg.get(k_) is not None:
+								out.add(id(lg[k_]))
+						for k_ in ("sa", "sb"):
+							v_ = lg.get(k_)
+							if isinstance(v_, (tuple, list)) and len(v_) == 2:
+								out.add(id(v_[1]))
+				except Exception:
+					pass
+				try:
+					s2 = scene.get("_lig_bundles")
+					for a2 in (getattr(s2, "actors", None) or {}).values():
+						for k_ in ("fib_act", "skin_act"):
+							if a2.get(k_) is not None:
+								out.add(id(a2[k_]))
+				except Exception:
+					pass
+				return out
+
 			def _clean_apply():
-				"""骨と右上の文字（と heat のときは色の帯・接触圧の目盛り）以外を隠す。元の見え方は覚えておく。"""
+				"""骨と右上の文字（と heat のときは色の帯・接触圧の目盛り）以外を隠す。元の見え方は覚えておく。
+				「靭帯も映す」のときは靭帯も残す（2026-10-22）。"""
 				ren = anim_plotter.renderer
 				bones_ = {id(a_) for a_ in _bone_actor_list()}
 				keep = {id(a_) for a_ in po_act.values()}
+				if clip_st.get("lig_on", True):
+					keep |= _lig_actor_ids()
 				if clip_st["heat"]:
 					try:
 						keep |= {id(x) for x in anim_plotter.scalar_bars.values()}
@@ -16400,7 +16503,7 @@ class MainMenuGUI(_BaseWindow):
 				fn = po_cfg.get("clips")
 				return fn() if callable(fn) else {}
 
-			def _clip_plan(kind, sec, fps=30.0):
+			def _clip_plan(kind, sec, fps=30.0, hold=0.0):
 				"""区間の計画: {"idx": 書き出すコマの列, "labels": 各コマの (段階, Fap 表示), "T": 映像の秒数, "rate": 倍率,
 				"a": 始めのコマ, "b": 終わりのコマ}。始めは初期状態（前方は前方引張の 2 秒前から、後方は 0 N 付近から）、
 				Fap が ±6 N を超えたら引張中、最後のコマは ±200 N。無ければ None。"""
@@ -16424,10 +16527,14 @@ class MainMenuGUI(_BaseWindow):
 						gone = True
 					labels.append((sgn, fap_) if gone else (0, None))
 				labels[-1] = (sgn, 200.0 * sgn)                         # 最後は ±200 N と出す
-				return {"idx": idx, "labels": labels, "T": T_, "rate": T_ / max(float(sec), 1e-6), "a": a_, "b": b_}
+				n_hold = int(round(max(0.0, float(hold or 0.0)) * fps))   # 終わったあと最後のコマを止める（2026-10-22）
+				if n_hold > 0:
+					idx = np.concatenate([idx, np.full(n_hold, idx[-1], dtype=idx.dtype)])
+					labels = labels + [labels[-1]] * n_hold
+				return {"idx": idx, "labels": labels, "T": T_, "rate": T_ / max(float(sec), 1e-6), "a": a_, "b": b_, "n_hold": n_hold}
 
-			def _clip_info(kind, sec, fps=30.0):
-				pl_ = _clip_plan(kind, sec, fps)
+			def _clip_info(kind, sec, fps=30.0, hold=0.0):
+				pl_ = _clip_plan(kind, sec, fps, hold)
 				if pl_ is None:
 					return None
 				return pl_["a"], pl_["b"], pl_["T"], pl_["idx"], pl_["rate"]
@@ -16522,20 +16629,25 @@ class MainMenuGUI(_BaseWindow):
 				_clean(True)                                  # 正方形（骨と右上の文字だけ）に戻す
 				return out
 
-			def _clip_chart_export(pl_, path, size, fps=30.0):
-				"""靭帯の長さのグラフを、動画と同じコマ・同じ長さで別の mp4 に（縦の線が今の時刻）。返り値: (ok, 説明)。"""
+			def _clip_chart_fs(size, fs=None):
+				"""書き出すグラフの文字の大きさ pt（凡例, 軸の数字, 軸の名前）。0 は自動（一辺から。これまでと同じ）。"""
+				W_ = int(size) - int(size) % 2
+				auto = max(9.0, W_ / 90.0)
+				fs = (list(fs or []) + [0, 0, 0])[:3]
+				return tuple(float(v) if float(v) > 0 else float(d) for v, d in zip(fs, (auto * 0.9, auto * 0.9, auto)))
+
+			def _clip_chart_bg(pl_, size, fs=None):
+				"""靭帯の長さのグラフの絵（縦の線なし・BGR）。返り値: ({"bg", "xpix"(時刻→x), "y_top", "y_bot"} か None, 説明)。"""
 				import cv2
-				import tempfile
-				import shutil
 				fn = scene.get("_chart_series")
 				if not callable(fn):
-					return False, "靭帯の長さのグラフがありません"
+					return None, "靭帯の長さのグラフがありません"
 				try:
 					ser, ylab = fn("lig")
 				except Exception as e:
-					return False, f"靭帯の長さを出せません: {e}"
+					return None, f"靭帯の長さを出せません: {e}"
 				if not ser:
-					return False, "グラフに出す靭帯がありません（右のグラフの「靭帯の長さ」と、靭帯管理の「グラフ」のチェック）"
+					return None, "グラフに出す靭帯がありません（右のグラフの「靭帯の長さ」と、靭帯管理の「グラフ」のチェック）"
 				import matplotlib
 				matplotlib.use("Agg")
 				import matplotlib.pyplot as plt
@@ -16547,7 +16659,7 @@ class MainMenuGUI(_BaseWindow):
 				from matplotlib.font_manager import FontProperties
 				_ff = self._sim_ligament_font_file()                 # 日本語のフォント（メイリオなど）
 				jp = FontProperties(fname=_ff) if _ff else FontProperties()
-				fs_ = max(9.0, W_ / 90.0)
+				fs_lg, fs_tk, fs_ti = _clip_chart_fs(W_, fs)
 				fig = plt.figure(figsize=(W_ / 100.0, H_ / 100.0), dpi=100)
 				FigureCanvasAgg(fig)
 				ax = fig.add_subplot(111)
@@ -16561,16 +16673,16 @@ class MainMenuGUI(_BaseWindow):
 					lo_, hi_ = min(lo_, float(y[m_].min())), max(hi_, float(y[m_].max()))
 				if not np.isfinite(lo_):
 					plt.close(fig)
-					return False, "この区間に靭帯の長さがありません"
+					return None, "この区間に靭帯の長さがありません"
 				pad = max(0.5, 0.08 * (hi_ - lo_))
 				ax.set_ylim(lo_ - pad, hi_ + pad)
 				ax.set_xlim(0.0, t1 - t0)
-				ax.set_xlabel("区間の始めからの時間 [s]（試験の時間）", fontproperties=jp, fontsize=fs_)
-				ax.set_ylabel("靭帯の長さ [mm]", fontproperties=jp, fontsize=fs_)
-				ax.tick_params(labelsize=fs_ * 0.9)
+				ax.set_xlabel("区間の始めからの時間 [s]（試験の時間）", fontproperties=jp, fontsize=fs_ti)
+				ax.set_ylabel("靭帯の長さ [mm]", fontproperties=jp, fontsize=fs_ti)
+				ax.tick_params(labelsize=fs_tk)
 				ax.grid(alpha=0.3)
 				if any(lab for *_x, lab in ser):
-					_lp = FontProperties(fname=_ff, size=fs_ * 0.9) if _ff else None
+					_lp = FontProperties(fname=_ff, size=fs_lg) if _ff else FontProperties(size=fs_lg)
 					ax.legend(loc="best", prop=_lp)
 				fig.tight_layout()
 				fig.canvas.draw()
@@ -16583,6 +16695,19 @@ class MainMenuGUI(_BaseWindow):
 				def _xpix(t):
 					return int(round(ax.transData.transform((t - t0, 0))[0]))
 				plt.close(fig)
+				return {"bg": bg, "xpix": _xpix, "y_top": y_top, "y_bot": y_bot}, ""
+
+			def _clip_chart_export(pl_, path, size, fps=30.0, fs=None):
+				"""靭帯の長さのグラフを、動画と同じコマ・同じ長さで別の mp4 に（縦の線が今の時刻）。返り値: (ok, 説明)。"""
+				import cv2
+				import tempfile
+				import shutil
+				g_, msg_ = _clip_chart_bg(pl_, size, fs)
+				if g_ is None:
+					return False, msg_
+				bg, _xpix, y_top, y_bot = g_["bg"], g_["xpix"], g_["y_top"], g_["y_bot"]
+				Hb, Wb = bg.shape[:2]
+				ft_ = np.asarray(frame_times, float)
 				tmp = os.path.join(tempfile.gettempdir(), f"frs_chart_{os.getpid()}_{int(time.time() * 1000)}.mp4")
 				wr = None
 				try:
@@ -16607,13 +16732,190 @@ class MainMenuGUI(_BaseWindow):
 					return False, f"グラフの mp4 を保存先へ移せませんでした（{tmp}）: {e}"
 				return True, path
 
-			def _clip_export(kind, size, sec, path, progress=None, done=None, fps=30.0, chart=False):
+			def _clip_chart_preview(kind, sec, size, fs=None, hold=0.0):
+				"""プレビュー: 書き出すのと同じグラフの絵（RGB・縦の線なし）と、書き出す各コマの縦の線の x。返り値: (dict か None, 説明)。"""
+				import cv2
+				pl_ = _clip_plan(kind, sec, 30.0, hold)
+				if pl_ is None:
+					return None, "この区間が見つかりません（datalog の Fap を確かめてください）"
+				g_, msg_ = _clip_chart_bg(pl_, size, fs)
+				if g_ is None:
+					return None, msg_
+				bg = g_["bg"]
+				xs = [int(g_["xpix"](float(frame_times[int(fi)]))) for fi in pl_["idx"]]
+				lg, tk_, ti = _clip_chart_fs(size, fs)
+				return ({"bg": cv2.cvtColor(bg, cv2.COLOR_BGR2RGB), "xs": xs, "y_top": g_["y_top"], "y_bot": g_["y_bot"],
+				         "info": (f"書き出す大きさ {bg.shape[1]}×{bg.shape[0]} px・{len(xs)} コマ・"
+				                  f"文字 凡例 {lg:.1f}・軸の数字 {tk_:.1f}・軸の名前 {ti:.1f} pt")}, "")
+
+			def _clip_nums_frames(pl_, fs=None):
+				"""右上の数字だけの絵（RGB・白地・文字に合わせた横長。全部のコマで同じ大きさ）を 1 コマずつ返す関数と、その大きさ。
+				fs = (段階と力の px, 接触圧の px)。文字・色は右上の表示と同じ（_po_texts）。"""
+				from PIL import Image, ImageDraw, ImageFont
+				fs = (list(fs or []) + [60, 48])[:2]
+				fs_f, fs_c = max(6, int(round(float(fs[0]) or 60))), max(6, int(round(float(fs[1]) or 48)))
+				_ff = _po_font
+				try:
+					f_f = ImageFont.truetype(_ff, fs_f) if _ff else ImageFont.load_default()
+					f_c = ImageFont.truetype(_ff, fs_c) if _ff else ImageFont.load_default()
+				except Exception:
+					f_f = f_c = ImageFont.load_default()
+				idx, labels = pl_["idx"], pl_["labels"]
+				texts = [_po_texts(int(fi), labels[k]) for k, fi in enumerate(idx)]
+				tmp_ = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+
+				def _wh(t, f):
+					if not t:
+						return 0, 0
+					x0, y0, x1, y1 = tmp_.multiline_textbbox((0, 0), t, font=f, spacing=int(0.25 * f.size))
+					return x1 - x0, y1 - y0
+				pad = int(round(0.35 * fs_f))
+				Wt = max([_wh(tf, f_f)[0] for tf, _c, _t in texts] + [_wh(tc, f_c)[0] for _f, _c, tc in texts] + [10])
+				hf = max([_wh(tf, f_f)[1] for tf, _c, _t in texts] + [0])
+				hc = max([_wh(tc, f_c)[1] for _f, _c, tc in texts] + [0])
+				gap = int(round(0.35 * fs_f)) if (hf and hc) else 0
+				W_ = Wt + 2 * pad
+				H_ = hf + gap + hc + 2 * pad
+				W_ += W_ % 2
+				H_ += H_ % 2
+
+				def _frame(k):
+					tf, col, tc = texts[k]
+					im = Image.new("RGB", (W_, H_), "white")
+					dr = ImageDraw.Draw(im)
+					c255 = tuple(int(round(255 * v)) for v in col)
+					if tf:
+						w_, _h = _wh(tf, f_f)
+						dr.text((W_ - pad - w_, pad), tf, font=f_f, fill=c255, anchor="la")
+					if tc:
+						w_, _h = _wh(tc, f_c)
+						dr.multiline_text((W_ - pad - w_, pad + hf + gap), tc, font=f_c, fill=(0, 0, 0), spacing=int(0.25 * f_c.size),
+						                  align="right")
+					return np.asarray(im)
+				return _frame, (W_, H_), len(idx)
+
+			def _clip_nums_preview(kind, sec, fs=None, hold=0.0, fps=30.0):
+				"""プレビュー: 数字の動画の各コマを作る関数。返り値: ({"frame": k→RGB, "n", "size", "info"} か None, 説明)。"""
+				pl_ = _clip_plan(kind, sec, fps, hold)
+				if pl_ is None:
+					return None, "この区間が見つかりません（datalog の Fap を確かめてください）"
+				fr_, (W_, H_), n_ = _clip_nums_frames(pl_, fs)
+				if W_ <= 12 or not any(fr_(k).min() < 250 for k in (0, n_ - 1)):
+					return None, "出す数字がありません（再生コントロールの「試験の段階」「接触圧」のチェックを確かめてください）"
+				return {"frame": fr_, "n": n_, "size": (W_, H_),
+				        "info": f"数字の動画 {W_}×{H_} px・{n_} コマ・{n_ / fps:.1f} 秒（止める {pl_.get('n_hold', 0) / fps:g} 秒を含む）"}, ""
+
+			def _clip_nums_export(pl_, path, fps=30.0, fs=None):
+				"""右上の数字だけの mp4（3D の動画と同じコマ・同じ長さ）。返り値: (ok, 説明)。"""
+				import cv2
+				import tempfile
+				import shutil
+				fr_, (W_, H_), n_ = _clip_nums_frames(pl_, fs)
+				tmp = os.path.join(tempfile.gettempdir(), f"frs_nums_{os.getpid()}_{int(time.time() * 1000)}.mp4")
+				wr = None
+				try:
+					wr = cv2.VideoWriter(tmp, cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*"H264"), fps, (W_, H_))
+					if not wr.isOpened():
+						wr = None
+				except Exception:
+					wr = None
+				if wr is None:
+					wr = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W_, H_))
+				if not wr.isOpened():
+					return False, "数字の mp4 を作れませんでした"
+				prev_k, prev_img = None, None
+				for k in range(n_):
+					img = cv2.cvtColor(fr_(k), cv2.COLOR_RGB2BGR)
+					wr.write(img)
+				wr.release()
+				try:
+					shutil.move(tmp, path)
+				except Exception as e:
+					return False, f"数字の mp4 を保存先へ移せませんでした（{tmp}）: {e}"
+				return True, path
+
+			def _clip_nums_only(kind, sec, path, fps=30.0, fs=None, hold=0.0):
+				"""数字の動画だけを書き出す（3D の動画は書かない）。"""
+				pl_ = _clip_plan(kind, sec, fps, hold)
+				if pl_ is None:
+					return False, "この区間が見つかりません（datalog の Fap を確かめてください）"
+				ok_, m_ = _clip_nums_export(pl_, path, fps, fs)
+				return ok_, (f"数字の動画を書き出しました: {path}（{len(pl_['idx'])} コマ・{len(pl_['idx']) / fps:.1f} 秒）" if ok_ else m_)
+
+			def _clip_lig_on(on):
+				"""正方形（動画）にも靭帯を映すか。"""
+				clip_st["lig_on"] = bool(on)
+				if clip_st.get("clean"):
+					# いったん元に戻してから、今の設定で隠し直す（隠していた靭帯を元の見え方に戻すため）
+					heat_ = bool(clip_st.get("heat"))
+					_clean(False)
+					_clean(True, heat=heat_)
+
+			def _clip_play(kind, size, sec, fps=30.0, hold=0.0, progress=None, done=None):
+				"""書き出すのと同じコマ（止める秒数も）を、fps の速さで可視化ウィンドウに流す（保存しない。2026-10-22）。"""
+				pl_ = _clip_plan(kind, sec, fps, hold)
+				if pl_ is None:
+					if done: done(False, "この区間が見つかりません（datalog の Fap を確かめてください）")
+					return
+				if clip_st["busy"]:
+					return
+				idx, labels = pl_["idx"], pl_["labels"]
+				size = _clip_square(size)
+				try:
+					_v_set_paused(True)
+				except Exception:
+					pass
+				clip_st.update(busy=True, cancel=False, playing=True)
+				stt = {"k": 0, "t0": time.perf_counter()}
+
+				def _step():
+					if clip_st["cancel"] or stt["k"] >= len(idx):
+						stopped = bool(clip_st["cancel"])
+						clip_st.update(busy=False, playing=False)
+						k_ = min(stt["k"], len(idx)) - 1
+						if k_ >= 0:
+							clip_st["ovr"] = {int(idx[k_]): labels[k_]}
+							_clip_goto(int(idx[k_]))
+						if done:
+							el = time.perf_counter() - stt["t0"]
+							done(True, ("止めました" if stopped else "再生しました")
+							     + f"（{stt['k']} / {len(idx)} コマ・{el:.1f} 秒。書き出す動画は {len(idx) / fps:.1f} 秒）")
+						return
+					k = stt["k"]
+					fi = int(idx[k])
+					try:
+						clip_st["ovr"] = {fi: labels[k]}
+						current_frame[0] = fi
+						show_frame(fi, force_render=True)
+					except Exception as e:
+						print(f"[発表用の動画] コマ {fi} を出せません: {e}")
+					stt["k"] = k + 1
+					if progress:
+						try:
+							progress(k + 1, len(idx))
+						except Exception:
+							pass
+					due = stt["t0"] + stt["k"] / float(fps)             # 本来この時刻に次のコマ（描くのが遅いと、そのぶん遅れて流れる）
+					self.after(max(1, int(round(1000.0 * (due - time.perf_counter())))), _step)
+				self.after(1, _step)
+
+			def _clip_text_on(on):
+				"""右上の文字を 3D の動画（正方形の間）に入れるか。"""
+				clip_st["text_on"] = bool(on)
+				try:
+					_po_update(current_frame[0])
+					anim_plotter.render()
+				except Exception:
+					pass
+
+			def _clip_export(kind, size, sec, path, progress=None, done=None, fps=30.0, chart=False, chart_fs=None,
+			                 hold=0.0, nums=False, nums_fs=None):
 				"""区間を mp4 に書き出す（Tk の after で 1 コマずつ。progress(i, n)、done(ok, msg)）。
 				chart=True なら、靭帯の長さのグラフも「…_靭帯の長さ.mp4」に（同じコマ・同じ長さ）。"""
 				import tempfile
 				import shutil
 				import cv2
-				pl_ = _clip_plan(kind, sec, fps)
+				pl_ = _clip_plan(kind, sec, fps, hold)
 				if pl_ is None:
 					if done: done(False, "この区間が見つかりません（datalog の Fap を確かめてください）")
 					return
@@ -16664,8 +16966,12 @@ class MainMenuGUI(_BaseWindow):
 							msg, ok = f"保存先へ移せませんでした（一時ファイル {tmp}）: {e}", False
 						if ok and chart:
 							cp_ = os.path.splitext(path)[0] + "_靭帯の長さ.mp4"
-							ok2, m2 = _clip_chart_export(pl_, cp_, size, fps)
+							ok2, m2 = _clip_chart_export(pl_, cp_, size, fps, fs=chart_fs)
 							msg += (f"／グラフ: {cp_}（同じ {len(idx)} コマ）" if ok2 else f"／グラフは書けませんでした: {m2}")
+						if ok and nums:
+							np_ = os.path.splitext(path)[0] + "_数字.mp4"
+							ok3, m3 = _clip_nums_export(pl_, np_, fps, nums_fs)
+							msg += (f"／数字: {np_}（同じ {len(idx)} コマ）" if ok3 else f"／数字の動画は書けませんでした: {m3}")
 						clip_st["busy"] = False
 						print(f"[発表用の動画] {msg}")
 						if done: done(ok, msg)
@@ -16693,6 +16999,9 @@ class MainMenuGUI(_BaseWindow):
 			po_cb.update({"clip_info": _clip_info, "clip_square": _clip_square, "clip_restore": _clip_restore,
 			              "clip_seek": _clip_seek, "clip_export": _clip_export, "clip_cancel": _clip_cancel,
 			              "clip_heat_images": _clip_heat_images, "clip_plan": _clip_plan,
+			              "clip_chart_preview": _clip_chart_preview, "clip_chart_fs": _clip_chart_fs,
+			              "clip_nums_preview": _clip_nums_preview, "clip_nums_only": _clip_nums_only, "clip_text_on": _clip_text_on,
+			              "clip_play": _clip_play, "clip_lig_on": _clip_lig_on,
 			              "clip_busy": lambda: bool(clip_st["busy"]),
 			              "clip_cfg": dict(po_cfg.get("clip") or {}), "clip_on_change": po_cfg.get("on_clip_change"),
 			              "tab_name": str(po_cfg.get("tab_name", "") or "")})
@@ -19777,8 +20086,38 @@ class MainMenuGUI(_BaseWindow):
 					          foreground="gray", font=(self.ui_font_family, 8)).pack(side=tk.LEFT, anchor="n", padx=(6, 0))
 					_ord_refresh()
 					chart_vars["_order_lb"] = _ord_lb
+				if callable(_cs.get('fs_set')) and callable(_cs.get('fs_get')):
+					ff_ = ttk.Frame(cs_frame)
+					ff_.grid(row=_n_rows + 1, column=0, columnspan=8, sticky="w", padx=6, pady=(2, 4))
+					ttk.Label(ff_, text="靭帯の長さのグラフの文字（px）: 凡例").pack(side=tk.LEFT)
+					_fs_vars = []
+					try:
+						_fs0 = list(_cs['fs_get']())
+					except Exception:
+						_fs0 = [12, 12, 12]
+
+					def _fs_apply(*_a):
+						vals = []
+						for v_ in _fs_vars:
+							try:
+								vals.append(float(v_.get()))
+							except ValueError:
+								return
+						_cs['fs_set'](vals)
+					for j_, (lab_, v0_) in enumerate(zip(("", "軸の数字", "軸の名前"), _fs0)):
+						if lab_:
+							ttk.Label(ff_, text=lab_).pack(side=tk.LEFT, padx=(8, 0))
+						v_ = tk.StringVar(control_window, value=f"{float(v0_):g}")
+						sb_ = ttk.Spinbox(ff_, from_=4, to=48, increment=1, width=4, textvariable=v_, command=_fs_apply)
+						sb_.pack(side=tk.LEFT, padx=(2, 0))
+						sb_.bind("<Return>", _fs_apply)
+						sb_.bind("<FocusOut>", _fs_apply)
+						_fs_vars.append(v_)
+					ttk.Label(ff_, text="（12 がこれまでの大きさ）", foreground="gray",
+					          font=(self.ui_font_family, 8)).pack(side=tk.LEFT, padx=(8, 0))
+					chart_vars["_fs_vars"] = _fs_vars
 				try:
-					_panel_h += 30 + 26 * _n_rows + (100 if _ord_lb is not None else 0)
+					_panel_h += 30 + 26 * _n_rows + (100 if _ord_lb is not None else 0) + 30
 					control_window.geometry(f"850x{_panel_h}")
 				except Exception:
 					pass
@@ -20098,6 +20437,13 @@ class MainMenuGUI(_BaseWindow):
 				cv_sec = tk.StringVar(control_window, value=f"{float(_cc.get('sec', 10.0)):g}")
 				cv_dir = [str(_cc.get("dir", "") or "")]
 				cv_chart = tk.BooleanVar(control_window, value=bool(_cc.get("chart", True)))
+				cv_fs = [tk.StringVar(control_window, value=f"{float(v_):g}")
+				         for v_ in (list(_cc.get("chart_fs") or []) + [0, 0, 0])[:3]]     # グラフの文字 pt（0＝自動。2026-10-22）
+				cv_hold = tk.StringVar(control_window, value=f"{float(_cc.get('hold', 0.0)):g}")      # 終わったあと止める秒数
+				cv_text = tk.BooleanVar(control_window, value=bool(_cc.get("text_on", True)))       # 右上の文字を 3D の動画に
+				cv_nums = tk.BooleanVar(control_window, value=bool(_cc.get("nums", False)))         # 数字の動画も一緒に
+				cv_nfs = [tk.StringVar(control_window, value=f"{float(v_):g}") for v_ in (list(_cc.get("nums_fs") or []) + [60, 48])[:2]]
+				cv_lig = tk.BooleanVar(control_window, value=bool(_cc.get("lig_on", True)))         # 正方形にも靭帯を映す
 				po_vars.update(clip_kind=cv_kind, clip_size=cv_size, clip_sec=cv_sec)
 				c1 = ttk.Frame(cf)
 				c1.pack(fill=tk.X, padx=6, pady=(2, 0))
@@ -20114,7 +20460,30 @@ class MainMenuGUI(_BaseWindow):
 				sp_sec.pack(side=tk.LEFT, padx=(2, 2))
 				sp_sec.bind("<Return>", lambda e: _clip_refresh())
 				sp_sec.bind("<FocusOut>", lambda e: _clip_refresh())
-				ttk.Label(c2, text="秒（30 fps）").pack(side=tk.LEFT)
+				ttk.Label(c2, text="秒（30 fps）　終わったあと").pack(side=tk.LEFT)
+				sp_hold = ttk.Spinbox(c2, from_=0, to=60, increment=0.5, width=5, textvariable=cv_hold, command=lambda: _clip_refresh())
+				sp_hold.pack(side=tk.LEFT, padx=(2, 2))
+				sp_hold.bind("<Return>", lambda e: _clip_refresh())
+				sp_hold.bind("<FocusOut>", lambda e: _clip_refresh())
+				ttk.Label(c2, text="秒 止める").pack(side=tk.LEFT)
+				c2b = ttk.Frame(cf)
+				c2b.pack(fill=tk.X, padx=6, pady=(2, 0))
+				ttk.Label(c2b, text="（止める間は最後のコマ（±200 N）のまま。グラフ・数字の動画も同じだけ止めて、長さをそろえます）",
+				          foreground="gray").pack(side=tk.LEFT)
+
+				def _text_toggle():
+					_poc["clip_text_on"](bool(cv_text.get()))
+					_save_clip_cfg()
+				if callable(_poc.get("clip_text_on")):
+					ttk.Checkbutton(c2b, text="右上の文字を3Dの動画に入れる", variable=cv_text, command=_text_toggle).pack(side=tk.LEFT, padx=(12, 0))
+					_poc["clip_text_on"](bool(cv_text.get()))
+
+				def _lig_toggle():
+					_poc["clip_lig_on"](bool(cv_lig.get()))
+					_save_clip_cfg()
+				if callable(_poc.get("clip_lig_on")):
+					ttk.Checkbutton(c2b, text="靭帯も映す", variable=cv_lig, command=_lig_toggle).pack(side=tk.LEFT, padx=(12, 0))
+					_poc["clip_lig_on"](bool(cv_lig.get()))
 				c3 = ttk.Frame(cf)
 				c3.pack(fill=tk.X, padx=6, pady=(4, 0))
 
@@ -20128,24 +20497,57 @@ class MainMenuGUI(_BaseWindow):
 					fn = _poc.get("clip_on_change")
 					if callable(fn):
 						fn({"size": _num(cv_size, int, 900), "sec": _num(cv_sec, float, 10.0), "kind": cv_kind.get(), "dir": cv_dir[0],
-						    "chart": bool(cv_chart.get())})
+						    "chart": bool(cv_chart.get()), "chart_fs": [_num(v_, float, 0.0) for v_ in cv_fs],
+						    "hold": max(0.0, _num(cv_hold, float, 0.0)), "text_on": bool(cv_text.get()), "nums": bool(cv_nums.get()),
+						    "nums_fs": [_num(v_, float, 60.0) for v_ in cv_nfs], "lig_on": bool(cv_lig.get())})
 
 				def _do_square():
 					sz = _poc["clip_square"](_num(cv_size, int, 900))
 					cv_size.set(str(sz))
 					_save_clip_cfg()
-					clip_msg.config(text=(f"可視化ウィンドウを {sz}×{sz} にし、骨と右上の文字だけにしました（ヒートマップ・グラフ・靭帯などは隠しています）。"
-					                      "この見た目のまま書き出します。骨の位置はマウスで、視点はプリセットでも合わせられます。"), foreground="#0b5394")
+					clip_msg.config(text=(f"可視化ウィンドウを {sz}×{sz} にし、骨と右上の文字"
+					                      + ("・靭帯" if bool(cv_lig.get()) else "") + "だけにしました（ヒートマップ・グラフなどは隠しています）。"
+					                      "この見た目のまま書き出します。骨の位置はマウスで、視点はプリセットでも合わせられます。"
+					                      "「② その場で再生して確かめる」で、書き出す動きをその場で流せます。"), foreground="#0b5394")
 
 				def _do_seek(where):
 					ok = _poc["clip_seek"](cv_kind.get(), where)
 					if not ok:
 						clip_msg.config(text="この区間が見つかりません（datalog の Fap を確かめてください）", foreground="#a06000")
 
-				ttk.Button(c3, text="① 正方形にする（プレビュー）", command=_do_square).pack(side=tk.LEFT)
+				ttk.Button(c3, text="① 正方形にする", command=_do_square).pack(side=tk.LEFT)
 				ttk.Button(c3, text="区間の始めへ", command=lambda: _do_seek("start")).pack(side=tk.LEFT, padx=(6, 0))
 				ttk.Button(c3, text="区間の終わりへ", command=lambda: _do_seek("end")).pack(side=tk.LEFT, padx=(4, 0))
 				ttk.Button(c3, text="元の大きさに戻す", command=lambda: _poc["clip_restore"]()).pack(side=tk.LEFT, padx=(6, 0))
+				# ② その場で再生（保存しない。2026-10-22）
+				c3b = ttk.Frame(cf)
+				c3b.pack(fill=tk.X, padx=6, pady=(4, 0))
+				play_prog = ttk.Progressbar(c3b, length=260, mode="determinate")
+
+				def _play_done(ok, msg):
+					play_prog.pack_forget()
+					btn_stop.pack_forget()
+					btn_play.state(["!disabled"])
+					clip_msg.config(text=msg, foreground=("#1b5e20" if ok else "#a06000"))
+
+				def _play_prog(i, n):
+					play_prog.configure(maximum=n, value=i)
+
+				def _do_play():
+					if not callable(_poc.get("clip_play")):
+						return
+					sz = _num(cv_size, int, 900)
+					btn_play.state(["disabled"])
+					play_prog.configure(value=0)
+					play_prog.pack(side=tk.LEFT, padx=(8, 0))
+					btn_stop.pack(side=tk.LEFT, padx=(4, 0))
+					clip_msg.config(text="その場で再生しています（保存はしません）…", foreground="#0b5394")
+					_poc["clip_play"](cv_kind.get(), sz, _num(cv_sec, float, 10.0), 30.0, max(0.0, _num(cv_hold, float, 0.0)),
+					                  progress=_play_prog, done=_play_done)
+				btn_play = ttk.Button(c3b, text="② その場で再生して確かめる", command=_do_play)
+				btn_play.pack(side=tk.LEFT)
+				btn_stop = ttk.Button(c3b, text="止める", command=lambda: _poc["clip_cancel"]())
+				ttk.Label(c3b, text="（書き出すのと同じ速さ・同じコマで流します。保存はしません）", foreground="gray").pack(side=tk.LEFT, padx=(8, 0))
 				c4 = ttk.Frame(cf)
 				c4.pack(fill=tk.X, padx=6, pady=(4, 0))
 				clip_prog = ttk.Progressbar(c4, length=260, mode="determinate")
@@ -20162,7 +20564,7 @@ class MainMenuGUI(_BaseWindow):
 				def _do_export():
 					from tkinter import filedialog
 					kind = cv_kind.get()
-					info = _poc["clip_info"](kind, _num(cv_sec, float, 10.0))
+					info = _poc["clip_info"](kind, _num(cv_sec, float, 10.0), 30.0, max(0.0, _num(cv_hold, float, 0.0)))
 					if info is None:
 						clip_msg.config(text="この区間が見つかりません（datalog の Fap を確かめてください）", foreground="#a06000")
 						return
@@ -20180,13 +20582,99 @@ class MainMenuGUI(_BaseWindow):
 					btn_cancel.pack(side=tk.LEFT, padx=(4, 0))
 					clip_msg.config(text="書き出しています…（可視化ウィンドウは動かさないでください）", foreground="#0b5394")
 					_poc["clip_export"](kind, _num(cv_size, int, 900), _num(cv_sec, float, 10.0), fp, progress=_prog, done=_done,
-					                    chart=bool(cv_chart.get()))
+					                    chart=bool(cv_chart.get()), chart_fs=[_num(v_, float, 0.0) for v_ in cv_fs],
+					                    hold=max(0.0, _num(cv_hold, float, 0.0)), nums=bool(cv_nums.get()),
+					                    nums_fs=[_num(v_, float, 60.0) for v_ in cv_nfs])
 
-				btn_exp = ttk.Button(c4, text="② mp4 に書き出す…", command=_do_export)
+				btn_exp = ttk.Button(c4, text="③ mp4 に書き出す…", command=_do_export)
 				btn_exp.pack(side=tk.LEFT)
 				btn_cancel = ttk.Button(c4, text="やめる", command=lambda: _poc["clip_cancel"]())
 				ttk.Checkbutton(c4, text="靭帯の長さのグラフも別の mp4 に（同じ長さ・同じコマ。「…_靭帯の長さ.mp4」）",
 				                variable=cv_chart, command=lambda: _save_clip_cfg()).pack(side=tk.LEFT, padx=(10, 0))
+				# グラフの文字の大きさ・プレビュー（2026-10-22）
+				if callable(_poc.get("clip_chart_preview")):
+					c4b = ttk.Frame(cf)
+					c4b.pack(fill=tk.X, padx=6, pady=(4, 0))
+					ttk.Label(c4b, text="グラフの文字（pt。0＝自動）: 凡例").pack(side=tk.LEFT)
+					prev_win = {"w": None}
+
+					def _fs_list():
+						return [_num(v_, float, 0.0) for v_ in cv_fs]
+
+					def _fs_auto_text():
+						try:
+							lg_, tk_, ti_ = _poc["clip_chart_fs"](_num(cv_size, int, 900), [0, 0, 0])
+							return f"（自動では 凡例 {lg_:.1f}・軸の数字 {tk_:.1f}・軸の名前 {ti_:.1f} pt。一辺 {_num(cv_size, int, 900)} px のとき）"
+						except Exception:
+							return ""
+
+					def _do_chart_preview(only_if_open=False):
+						from PIL import Image, ImageTk
+						w_ = prev_win["w"]
+						if only_if_open and (w_ is None or not w_.winfo_exists()):
+							return
+						g_, msg_ = _poc["clip_chart_preview"](cv_kind.get(), _num(cv_sec, float, 10.0), _num(cv_size, int, 900), _fs_list(),
+						                                      max(0.0, _num(cv_hold, float, 0.0)))
+						if g_ is None:
+							clip_msg.config(text=f"グラフのプレビューを出せません: {msg_}", foreground="#a06000")
+							return
+						if w_ is None or not w_.winfo_exists():
+							w_ = tk.Toplevel(control_window)
+							w_.title("書き出す靭帯の長さのグラフ（プレビュー）")
+							w_.lbl = ttk.Label(w_)
+							w_.lbl.pack(padx=6, pady=(6, 2))
+							w_.pos = tk.DoubleVar(w_, value=0.0)
+							pf_ = ttk.Frame(w_)
+							pf_.pack(fill=tk.X, padx=6)
+							ttk.Label(pf_, text="縦の線（今の時刻）: 区間の始め").pack(side=tk.LEFT)
+							ttk.Scale(pf_, from_=0.0, to=1.0, variable=w_.pos, orient="horizontal", length=420,
+							          command=lambda v, ww=w_: ww._draw()).pack(side=tk.LEFT, padx=4)
+							ttk.Label(pf_, text="終わり").pack(side=tk.LEFT)
+							w_.info = ttk.Label(w_, foreground="gray", wraplength=880, justify="left")
+							w_.info.pack(anchor="w", padx=6, pady=(2, 6))
+							prev_win["w"] = w_
+
+							def _draw(ww=w_):
+								import cv2
+								gg = ww.g
+								img = gg["bg"].copy()
+								xs = gg["xs"]
+								x_ = xs[min(len(xs) - 1, max(0, int(round(float(ww.pos.get()) * (len(xs) - 1)))))]
+								cv2.line(img, (x_, gg["y_top"]), (x_, gg["y_bot"]), (220, 0, 0), 2, cv2.LINE_AA)
+								im = Image.fromarray(img)
+								sc = min(1.0, 900.0 / im.width, 640.0 / im.height)
+								if sc < 1.0:
+									im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
+								ww.photo = ImageTk.PhotoImage(im, master=ww)
+								ww.lbl.configure(image=ww.photo)
+								ww.info.configure(text=(f"{gg['info']}（ここでは {sc * 100:.0f}% で表示）。"
+								                        "つまみで縦の線を動かせます。文字の大きさ・区間・一辺を変えると描き直します。"))
+							w_._draw = _draw
+						w_.g = g_
+						w_._draw()
+						try:
+							w_.lift()
+						except Exception:
+							pass
+
+					def _fs_changed(*_a):
+						_save_clip_cfg()
+						fs_auto_lbl.config(text=_fs_auto_text())
+						_do_chart_preview(only_if_open=True)
+					for j_, lab_ in enumerate(("", "軸の数字", "軸の名前")):
+						if lab_:
+							ttk.Label(c4b, text=lab_).pack(side=tk.LEFT, padx=(8, 0))
+						sb_ = ttk.Spinbox(c4b, from_=0, to=60, increment=1, width=4, textvariable=cv_fs[j_], command=_fs_changed)
+						sb_.pack(side=tk.LEFT, padx=(2, 0))
+						sb_.bind("<Return>", _fs_changed)
+						sb_.bind("<FocusOut>", _fs_changed)
+					ttk.Button(c4b, text="グラフのプレビュー…", command=_do_chart_preview).pack(side=tk.LEFT, padx=(10, 0))
+					fs_auto_lbl = ttk.Label(cf, text=_fs_auto_text(), foreground="gray", font=(self.ui_font_family, 8))
+					fs_auto_lbl.pack(anchor="w", padx=12)
+					sp_sz.configure(command=_fs_changed)                 # 一辺を変えても（自動の大きさ・プレビュー）
+					sp_sz.bind("<Return>", _fs_changed)
+					sp_sz.bind("<FocusOut>", _fs_changed)
+					po_vars.update(clip_chart_fs=cv_fs, clip_chart_preview=_do_chart_preview, clip_chart_prev_win=prev_win)
 
 				def _do_heat():
 					from tkinter import filedialog
@@ -20206,22 +20694,118 @@ class MainMenuGUI(_BaseWindow):
 				c5 = ttk.Frame(cf)
 				c5.pack(fill=tk.X, padx=6, pady=(4, 0))
 				ttk.Button(c5, text="ヒートマップの画像を保存（区間の始め・終わり。色の帯つき）…", command=_do_heat).pack(side=tk.LEFT)
+				# 右上の数字だけの動画（2026-10-22）
+				if callable(_poc.get("clip_nums_preview")):
+					c6 = ttk.Frame(cf)
+					c6.pack(fill=tk.X, padx=6, pady=(4, 0))
+					ttk.Label(c6, text="右上の数字だけの動画（白地・同じコマ数）　文字（px）: 段階と力").pack(side=tk.LEFT)
+					nprev = {"w": None}
+
+					def _nfs():
+						return [_num(v_, float, 60.0) for v_ in cv_nfs]
+
+					def _do_nums_preview(only_if_open=False):
+						from PIL import Image, ImageTk
+						w_ = nprev["w"]
+						if only_if_open and (w_ is None or not w_.winfo_exists()):
+							return
+						g_, msg_ = _poc["clip_nums_preview"](cv_kind.get(), _num(cv_sec, float, 10.0), _nfs(), max(0.0, _num(cv_hold, float, 0.0)))
+						if g_ is None:
+							clip_msg.config(text=f"数字の動画のプレビューを出せません: {msg_}", foreground="#a06000")
+							return
+						if w_ is None or not w_.winfo_exists():
+							w_ = tk.Toplevel(control_window)
+							w_.title("右上の数字だけの動画（プレビュー）")
+							w_.configure(background="#d8d8d8")
+							w_.lbl = tk.Label(w_, background="#d8d8d8")
+							w_.lbl.pack(padx=10, pady=(10, 2))
+							w_.pos = tk.DoubleVar(w_, value=1.0)
+							pf_ = ttk.Frame(w_)
+							pf_.pack(fill=tk.X, padx=6)
+							ttk.Label(pf_, text="コマ: 始め").pack(side=tk.LEFT)
+							ttk.Scale(pf_, from_=0.0, to=1.0, variable=w_.pos, orient="horizontal", length=420,
+							          command=lambda v, ww=w_: ww._draw()).pack(side=tk.LEFT, padx=4)
+							ttk.Label(pf_, text="終わり").pack(side=tk.LEFT)
+							w_.info = ttk.Label(w_, foreground="gray", wraplength=880, justify="left")
+							w_.info.pack(anchor="w", padx=6, pady=(2, 6))
+							nprev["w"] = w_
+
+							def _draw(ww=w_):
+								gg = ww.g
+								k_ = min(gg["n"] - 1, max(0, int(round(float(ww.pos.get()) * (gg["n"] - 1)))))
+								im = Image.fromarray(gg["frame"](k_))
+								sc = min(1.0, 900.0 / im.width, 500.0 / im.height)
+								if sc < 1.0:
+									im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
+								ww.photo = ImageTk.PhotoImage(im, master=ww)
+								ww.lbl.configure(image=ww.photo)
+								ww.info.configure(text=(f"{gg['info']}・いま {k_ + 1} コマ目（ここでは {sc * 100:.0f}% で表示。灰色は窓の地）。"
+								                        "つまみでコマを動かせます。文字の大きさ・区間・秒数を変えると描き直します。"))
+							w_._draw = _draw
+						w_.g = g_
+						w_._draw()
+						try:
+							w_.lift()
+						except Exception:
+							pass
+
+					def _nfs_changed(*_a):
+						_save_clip_cfg()
+						_do_nums_preview(only_if_open=True)
+					for j_, lab_ in enumerate(("", "接触圧")):
+						if lab_:
+							ttk.Label(c6, text=lab_).pack(side=tk.LEFT, padx=(8, 0))
+						sb_ = ttk.Spinbox(c6, from_=8, to=200, increment=2, width=5, textvariable=cv_nfs[j_], command=_nfs_changed)
+						sb_.pack(side=tk.LEFT, padx=(2, 0))
+						sb_.bind("<Return>", _nfs_changed)
+						sb_.bind("<FocusOut>", _nfs_changed)
+					ttk.Button(c6, text="数字のプレビュー…", command=_do_nums_preview).pack(side=tk.LEFT, padx=(10, 0))
+
+					def _do_nums_only():
+						from tkinter import filedialog
+						kind = cv_kind.get()
+						nm = f"{_poc.get('tab_name') or 'clip'}_{'前方引張' if kind == 'anterior' else '後方引張'}_数字.mp4"
+						fp = filedialog.asksaveasfilename(parent=control_window, title="右上の数字だけの動画を保存", defaultextension=".mp4",
+						                                  initialdir=(cv_dir[0] or None), initialfile=nm, filetypes=[("mp4", "*.mp4")])
+						if not fp:
+							return
+						cv_dir[0] = os.path.dirname(fp)
+						_save_clip_cfg()
+						ok_, m_ = _poc["clip_nums_only"](kind, _num(cv_sec, float, 10.0), fp, 30.0, _nfs(), max(0.0, _num(cv_hold, float, 0.0)))
+						clip_msg.config(text=m_, foreground=("#1b5e20" if ok_ else "#a06000"))
+					c6b = ttk.Frame(cf)
+					c6b.pack(fill=tk.X, padx=6, pady=(2, 0))
+					ttk.Button(c6b, text="数字の動画だけ書き出す…", command=_do_nums_only).pack(side=tk.LEFT)
+					ttk.Checkbutton(c6b, text="③ で 3D の動画と一緒に書き出す（「…_数字.mp4」）", variable=cv_nums,
+					                command=lambda: _save_clip_cfg()).pack(side=tk.LEFT, padx=(10, 0))
+					po_vars.update(clip_hold=cv_hold, clip_text=cv_text, clip_nums=cv_nums, clip_nums_fs=cv_nfs,
+					               clip_nums_preview=_do_nums_preview, clip_nums_prev_win=nprev, clip_nums_only=_do_nums_only)
 				clip_msg = ttk.Label(cf, text="", font=(self.ui_font_family, 9), wraplength=800, justify="left")
 				clip_msg.pack(anchor="w", padx=6, pady=(2, 2))
 
 				def _clip_refresh():
-					info = _poc["clip_info"](cv_kind.get(), _num(cv_sec, float, 10.0))
+					hold_ = max(0.0, _num(cv_hold, float, 0.0))
+					info = _poc["clip_info"](cv_kind.get(), _num(cv_sec, float, 10.0), 30.0, hold_)
 					if info is None:
 						clip_msg.config(text="この区間が見つかりません（datalog の Fap を確かめてください）", foreground="#a06000")
 						return
 					a_, b_, T_, idx_, rate = info
 					clip_msg.config(text=(f"区間: 映像の {frame_times[a_]:.1f}〜{frame_times[b_]:.1f} 秒（{T_:.1f} 秒）→ "
-					                      f"{_num(cv_sec, float, 10.0):g} 秒の動画（×{rate:.2f} 倍速・{len(idx_)} コマ）"),
+					                      f"{_num(cv_sec, float, 10.0):g} 秒の動画（×{rate:.2f} 倍速）"
+					                      + (f" ＋ 止める {hold_:g} 秒" if hold_ > 0 else "")
+					                      + f"＝ {len(idx_) / 30.0:.1f} 秒・{len(idx_)} コマ"),
 					                 foreground="black")
 					_save_clip_cfg()
+					try:
+						if callable(po_vars.get("clip_chart_preview")):
+							po_vars["clip_chart_preview"](only_if_open=True)
+						if callable(po_vars.get("clip_nums_preview")):
+							po_vars["clip_nums_preview"](only_if_open=True)
+					except Exception:
+						pass
 				_clip_refresh()
 				try:
-					_panel_h += 150
+					_panel_h += 270
 				except Exception:
 					pass
 			ttk.Label(po_frame, text=("段階は試験の手順（初期状態→前方引張→後方引張→前方引張→初期状態）で、datalog の Fap から分けます"

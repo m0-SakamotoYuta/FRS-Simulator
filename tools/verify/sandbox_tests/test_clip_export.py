@@ -39,6 +39,7 @@ app.on_ankle_tab_select(next(i for i, t in enumerate(app._ankle_tabs) if t["name
 app.ankle_dilate_mm.set(0.15); app.ankle_cp_ha.set(2.8); app.ankle_cp_h.set(1.6); app.ankle_lig_mode.set("stage1")
 app.ankle_po_force_on.set(True); app.ankle_po_contact_on.set(True); app.ankle_start_at_load.set(False)
 app.ankle_clip_size.set(900); app.ankle_clip_sec.set(10.0); app.ankle_clip_kind.set("anterior")
+app.ankle_clip_hold.set(0.0); app.ankle_clip_text_on.set(True); app.ankle_clip_nums.set(False); app.ankle_clip_lig_on.set(True)   # 10/22 の設定は既定に
 app.on_ankle_animate(); pump(app, 2.0)
 v = app._sim_viewers_alive()[-1]; p = v["plotter"]; ctrl = v["ctrl"]
 scn = [o for o in gc.get_objects() if isinstance(o, dict) and "bones" in o and "heatmap" in o and "_t_shift" in o][-1]
@@ -70,7 +71,10 @@ check(info_l and "120 コマ" in info_l[0] and f"×{T_a / 4:.2f}" in info_l[0], 
 # 正方形
 orig = tuple(p.window_size)
 pv_["clip_size"].set("401")
-btn["① 正方形にする（プレビュー）"].invoke(); pump(app, 0.5)
+cbl = [w for w in walk(cf[0]) if w.winfo_class() == "TCheckbutton" and str(w.cget("text")) == "靭帯も映す"]
+check(len(cbl) == 1 and app.ankle_clip_lig_on.get() is True, "「靭帯も映す」（既定はオン）")
+cbl[0].invoke(); pump(app, 0.2)       # この試しでは骨と右上の文字だけを確かめる
+btn["① 正方形にする"].invoke(); pump(app, 0.5)
 check(tuple(p.window_size) == (400, 400) and pv_["clip_size"].get() == "400", f"可視化ウィンドウを正方形に（奇数は偶数へ: {tuple(p.window_size)}）")
 def vis_props():
 	out = []
@@ -119,7 +123,7 @@ for kind, lab in (("anterior", "前方引張"), ("posterior", "後方引張")):
 	fd.asksaveasfilename = lambda *a, _p=path, **k: _p
 	pv_["clip_kind"].set(kind)
 	t0 = time.time()
-	btn["② mp4 に書き出す…"].invoke()
+	btn["③ mp4 に書き出す…"].invoke()
 	while time.time() - t0 < 300:
 		pump(app, 0.2)
 		if os.path.exists(path):
@@ -163,6 +167,6 @@ check(tuple(p.window_size) == orig, f"元の大きさに戻せる（{tuple(p.win
 check(any(a_.GetMapper().GetScalarVisibility() for a_ in bone_acts if a_.GetVisibility()) and len(p.scalar_bars) >= 1
       and any(a_.GetVisibility() for a_ in vis_props() if type(a_).__name__ == "vtkScalarBarActor"), "元に戻すとヒートマップと色の帯も戻る")
 w_ = ctrl["window"]; w_.tk.call(w_.protocol("WM_DELETE_WINDOW")); pump(app, 0.4)
-app.ankle_clip_size.set(900); app.ankle_clip_sec.set(10.0); app.ankle_clip_kind.set("anterior"); app.ankle_clip_dir.set("")
+app.ankle_clip_size.set(900); app.ankle_clip_sec.set(10.0); app.ankle_clip_kind.set("anterior"); app.ankle_clip_dir.set(""); app.ankle_clip_lig_on.set(True)
 print(f"合計: NG {len(fails)} 件", flush=True)
 sys.stdout.flush(); os._exit(0)
