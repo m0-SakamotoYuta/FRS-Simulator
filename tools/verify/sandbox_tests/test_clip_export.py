@@ -84,21 +84,27 @@ def vis_props():
 		if a_.GetVisibility():
 			out.append(a_)
 	return out
+import re as _re
+NUM_RE = _re.compile(r"^[+−]?\d+ N$")
 bone_acts = [a_ for k_, a_ in p.renderer.actors.items() if str(k_).startswith("bone_")]
 vp = vis_props()
-others = [a_ for a_ in vp if a_ not in bone_acts and not (isinstance(a_, vtk.vtkTextActor) and ("引張中" in str(a_.GetInput()) or "初期状態" in str(a_.GetInput()) or "接触圧" in str(a_.GetInput())))]
+others = [a_ for a_ in vp if a_ not in bone_acts and not (isinstance(a_, vtk.vtkTextActor) and ("引張中" in str(a_.GetInput()) or NUM_RE.match(str(a_.GetInput())) or "接触圧" in str(a_.GetInput())))]
 check(not others, f"正方形の間は骨と右上の文字だけ（ほかに見えている物 {len(others)}: {[type(o).__name__ for o in others][:5]}）")
 check(all(not a_.GetMapper().GetScalarVisibility() for a_ in bone_acts if a_.GetVisibility()), "骨にヒートマップの色を出さない（骨の色）")
 btn["区間の始めへ"].invoke(); pump(app, 0.3)
 def stage_text():
-	props = p.renderer.GetViewProps(); props.InitTraversal()
+	"""段階の文字＋数字（2026-10-22 から別の文字）。"""
+	props = p.renderer.GetViewProps(); props.InitTraversal(); la_, na_ = "", ""
 	for _ in range(props.GetNumberOfItems()):
 		a_ = props.GetNextProp()
-		if isinstance(a_, vtk.vtkTextActor) and a_.GetVisibility() and ("引張中" in str(a_.GetInput()) or "初期状態" in str(a_.GetInput())):
-			return str(a_.GetInput())
-	return ""
+		if isinstance(a_, vtk.vtkTextActor) and a_.GetVisibility():
+			if "引張中" in str(a_.GetInput()):
+				la_ = str(a_.GetInput())
+			elif NUM_RE.match(str(a_.GetInput())):
+				na_ = str(a_.GetInput())
+	return la_ + na_
 fi_now = int(np.searchsorted(ft, float(v["time"]()) + 1e-9, side="right") - 1)
-check(abs(fi_now - a0s) <= 1 and stage_text() == "初期状態", f"「区間の始めへ」で前方引張の 2 秒前（初期状態）へ（{stage_text()}・{ft[a0] - ft[fi_now]:.2f} 秒前）")
+check(abs(fi_now - a0s) <= 1 and stage_text() == "前方引張中：0 N", f"「区間の始めへ」で前方引張の 2 秒前（前方引張中：0 N）へ（{stage_text()}・{ft[a0] - ft[fi_now]:.2f} 秒前）")
 btn["区間の終わりへ"].invoke(); pump(app, 0.3)
 check(stage_text() == "前方引張中：+200 N", f"「区間の終わりへ」は「前方引張中：+200 N」（実際 {fap[a1]:+.1f} N・{stage_text()}）")
 # ヒートマップの画像
@@ -114,7 +120,7 @@ imgs = [cv2.imdecode(np.fromfile(q, np.uint8), cv2.IMREAD_COLOR) if os.path.exis
 colorful = [im is not None and im.shape[:2] == (400, 400) and float(np.mean(np.abs(im[:, :, 2].astype(int) - im[:, :, 0].astype(int)) > 60)) > 0.002 for im in imgs]
 check(all(colorful), f"ヒートマップの画像を 2 枚（始め・終わり、400×400、色つき）: {[os.path.basename(q) for q in pngs]} {colorful}")
 vp = vis_props()
-others = [a_ for a_ in vp if a_ not in bone_acts and not (isinstance(a_, vtk.vtkTextActor) and ("引張中" in str(a_.GetInput()) or "初期状態" in str(a_.GetInput()) or "接触圧" in str(a_.GetInput())))]
+others = [a_ for a_ in vp if a_ not in bone_acts and not (isinstance(a_, vtk.vtkTextActor) and ("引張中" in str(a_.GetInput()) or NUM_RE.match(str(a_.GetInput())) or "接触圧" in str(a_.GetInput())))]
 check(not others and all(not a_.GetMapper().GetScalarVisibility() for a_ in bone_acts if a_.GetVisibility()), "画像を保存したあとは、また骨と右上の文字だけに戻る")
 # 書き出し（前方・後方）
 outdir = outdir0
@@ -142,7 +148,8 @@ for kind, lab in (("anterior", "前方引張"), ("posterior", "後方引張")):
 		g = ((top[:, :, 1].astype(int) > 100) & (top[:, :, 2].astype(int) < 80) & (top[:, :, 0].astype(int) < 100)).sum()
 		r = ((top[:, :, 2].astype(int) > 150) & (top[:, :, 1].astype(int) < 80)).sum()
 		b = ((top[:, :, 0].astype(int) > 150) & (top[:, :, 2].astype(int) < 80)).sum()
-		check(g > 20 and g > r and g > b, f"{lab}の動画の最初のコマは緑の文字（初期状態）: 緑 {g}・赤 {r}・青 {b} 画素")
+		ok_c = (r > 20 and r > b) if kind == "anterior" else (b > 20 and b > r)
+		check(ok_c and g == 0, f"{lab}の動画の最初のコマは{'赤' if kind == 'anterior' else '青'}の文字（{lab}中：0 N。緑の初期状態はやめた）: 緑 {g}・赤 {r}・青 {b} 画素")
 	check(ok and 115 <= n <= 125 and (w_, h_) == (400, 400) and abs(fps - 30) < 0.5 and okf and fr.std() > 5,
 	      f"{lab}の mp4（日本語のパス）: {n} コマ・{w_}×{h_}・{fps:.1f} fps・{time.time() - t0:.1f} 秒で書けた")
 	st = stage_text()

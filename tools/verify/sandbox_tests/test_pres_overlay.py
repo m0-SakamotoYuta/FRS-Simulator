@@ -111,32 +111,69 @@ fP, fN = int(np.nanargmax(fap)), int(np.nanargmin(fap))
 RED, BLUE, GREEN = (0.85, 0.0, 0.0), (0.0, 0.25, 0.9), (0.0, 0.55, 0.15)
 def num(x):
 	return "0 N" if round(x) == 0 else f"{x:+.0f} N".replace("-", "−")
-def stage_check(f, lab, col, why):
+import re as _re
+NUM_RE = _re.compile(r"^[+−]?\d+ N$")
+def stage_acts():
+	"""段階の文字（「前方引張中：」）と数字（「+200 N」）の 2 つ（2026-10-22 から別の文字）。"""
+	la = [x for x in tacts() if x.GetVisibility() and "引張中" in str(x.GetInput())]
+	na = [x for x in tacts() if x.GetVisibility() and NUM_RE.match(str(x.GetInput()))]
+	return la, na
+def stage_check(f, lab, col, why, zero=False):
 	fi = go(f)
-	a = [x for x in tacts() if x.GetVisibility() and ("引張中" in str(x.GetInput()) or "初期状態" in str(x.GetInput()))]
-	exp = lab if lab == "初期状態" else f"{lab}：{num(fap[fi])}"
-	check(len(a) == 1 and str(a[0].GetInput()) == exp and np.allclose(a[0].GetTextProperty().GetColor(), col, atol=0.01),
-	      f"{why}: 「{exp}」（表示「{a[0].GetInput() if a else '-'}」・Fap {fap[fi]:+.1f} N）")
+	la, na = stage_acts()
+	exp = f"{lab}：{'0 N' if zero else num(fap[fi])}"
+	got = (str(la[0].GetInput()) + str(na[0].GetInput())) if (len(la) == 1 and len(na) == 1) else "-"
+	check(got == exp and all(np.allclose(x.GetTextProperty().GetColor(), col, atol=0.01) for x in la + na),
+	      f"{why}: 「{exp}」（表示「{got}」・Fap {fap[fi]:+.1f} N）")
 fin = np.where(np.isfinite(fap))[0]
 stage_check(fP, "前方引張中", RED, "前方に引っぱるコマで赤")
 stage_check(fN, "後方引張中", BLUE, "後方に引っぱるコマで青")
-stage_check(fin[5], "初期状態", GREEN, "始め（引っぱる前）は緑で初期状態")
+stage_check(fin[5], "前方引張中", RED, "始め（引っぱる前。以前の初期状態）は「前方引張中：0 N」（赤）", zero=True)
 mid = np.arange(fP, fN)
 stage_check(int(mid[np.argmin(np.abs(fap[mid] - 25))]), "前方引張中", RED, "最大のあと +25 N まで戻した所はまだ前方引張")
 stage_check(int(mid[np.argmin(np.abs(fap[mid] + 10))]), "後方引張中", BLUE, "0 N を下回った後（−10 N）は後方引張")
 last = np.arange(fN, fin[-1])
 stage_check(int(last[np.argmin(np.abs(fap[last] + 100))]), "前方引張中", RED, "最後の −200→0 N に戻す区間は前方引張（Fap が負でも）")
-stage_check(fin[-3], "初期状態", GREEN, "終わりに 0 N 付近へ戻ると初期状態")
-# 映像は記録より長い（前後）。記録の外でも初期状態のまま（最後のコマまで消えない）
+stage_check(fin[-3], "前方引張中", RED, "終わりに 0 N 付近へ戻った所も「前方引張中：0 N」", zero=True)
+# 映像は記録より長い（前後）。記録の外でも「前方引張中：0 N」のまま（最後のコマまで消えない）
 if fin[-1] < len(ft) - 1:
-	go(len(ft) - 1)
-	a = [x for x in tacts() if x.GetVisibility() and "初期状態" in str(x.GetInput())]
-	check(len(a) == 1 and np.allclose(a[0].GetTextProperty().GetColor(), GREEN, atol=0.01),
-	      f"記録が終わった後（映像の最後のコマ・記録より {ft[-1] - ft[fin[-1]]:.1f} 秒あと）も初期状態のまま")
+	stage_check(len(ft) - 1, "前方引張中", RED, f"記録が終わった後（映像の最後のコマ・記録より {ft[-1] - ft[fin[-1]]:.1f} 秒あと）も", zero=True)
 if fin[0] > 0:
-	go(0)
-	a = [x for x in tacts() if x.GetVisibility() and "初期状態" in str(x.GetInput())]
-	check(len(a) == 1, f"記録が始まる前（映像の最初のコマ・記録より {ft[fin[0]] - ft[0]:.1f} 秒前）も初期状態")
+	stage_check(0, "前方引張中", RED, f"記録が始まる前（映像の最初のコマ・記録より {ft[fin[0]] - ft[0]:.1f} 秒前）も", zero=True)
+check(not any(x.GetVisibility() and "初期状態" in str(x.GetInput()) for x in tacts()), "「初期状態」はもう出さない")
+# ---- 配置（2026-10-22）: 太字なし・2 行を左右の中央でそろえる・桁が変わっても段階の文字と数字の位置が動かない
+def ink():
+	"""文字だけを残して画面を撮り、赤（段階）と黒（接触圧）の文字の左右の端（px）を測る。"""
+	props = p.renderer.GetViewProps(); props.InitTraversal(); hid = []
+	for _ in range(props.GetNumberOfItems()):
+		a_ = props.GetNextProp()
+		if a_.GetVisibility() and not isinstance(a_, vtk.vtkTextActor):
+			a_.SetVisibility(0); hid.append(a_)
+	p.render(); img = np.asarray(p.screenshot(None, return_img=True))
+	for a_ in hid:
+		a_.SetVisibility(1)
+	p.render()
+	top = img[: int(0.2 * img.shape[0])]
+	r_ = (top[:, :, 0] > 150) & (top[:, :, 1] < 80) & (top[:, :, 2] < 80)
+	k_ = top.max(axis=2) < 60
+	xr, xk = np.where(r_.any(axis=0))[0], np.where(k_.any(axis=0))[0]
+	return ((int(xr[0]), int(xr[-1])) if len(xr) else None), ((int(xk[0]), int(xk[-1])) if len(xk) else None), img.shape[1]
+pos = {}
+la = na = ca = []
+for f_, nm_ in ((fP, "3 桁"), (int(mid[np.argmin(np.abs(fap[mid] - 25))]), "2 桁"), (fin[5], "0 N")):
+	go(f_)
+	la, na = stage_acts()
+	ca = [x for x in tacts() if x.GetVisibility() and "接触圧" in str(x.GetInput())]
+	er, ek, Wpx = ink()
+	if er and ek:
+		pos[nm_] = (er[0], er[1], na[0].GetInput() if na else "-")
+		c1, c3 = 0.5 * (er[0] + er[1]), 0.5 * (ek[0] + ek[1])
+		check(abs(c1 - c3) <= 3.0 and abs(max(er[1], ek[1]) - 0.985 * Wpx) <= 6.0,
+		      f"{nm_}（{pos[nm_][2]}）: 段階の行と接触圧の行の中心がそろう（{c1:.1f} / {c3:.1f} px）・右端は右上（{max(er[1], ek[1])} / {0.985 * Wpx:.1f}）")
+check(len(pos) == 3 and max(v_[0] for v_ in pos.values()) - min(v_[0] for v_ in pos.values()) <= 1 and max(v_[1] for v_ in pos.values()) - min(v_[1] for v_ in pos.values()) <= 1,
+      f"桁が変わっても「前方引張中：」の左端と数字の右端が動かない（{pos}）")
+check(len(la) == 1 and len(ca) == 1 and not la[0].GetTextProperty().GetBold() and not na[0].GetTextProperty().GetBold() and not ca[0].GetTextProperty().GetBold(),
+      "太字なし（段階の行も接触圧の行も同じ太さ）")
 # 接触圧（脛骨・独立に計算）
 fP = go(fP)
 names = [b["name"] for b in scn["bones"]]; ti = names.index("脛骨")
@@ -150,11 +187,11 @@ pmax, pmean, area = pp.max(), (pp[c] * ar[c]).sum() / ar[c].sum(), ar[c].sum()
 a = shown("接触圧")
 check(len(a) == 1 and str(a[0].GetInput()) == f"接触圧：{pmean:.2f} MPa" and np.allclose(a[0].GetTextProperty().GetColor(), (0, 0, 0)),
       f"既定は大腿骨-脛骨の平均接触圧を「接触圧」として黒で（「{a[0].GetInput() if a else '-'}」・期待 {pmean:.2f}）")
-_notes = [w for w in walk(ctrl["window"]) if w.winfo_class() == "TLabel" and "＝ 平均接触圧" in str(w.cget("text"))]
-check(len(_notes) == 1 and "接触力 ÷ 接触面積" in str(_notes[0].cget("text")), "再生コントロールに「接触圧 ＝ 平均接触圧（接触力 ÷ 接触面積）」の説明")
+_notes = [w for w in walk(ctrl["window"]) if w.winfo_class() == "TLabel" and "とだけ出ます" in str(w.cget("text"))]
+check(len(_notes) == 1 and all(k_ in str(_notes[0].cget("text")) for k_ in ("接触力 ÷ 接触面積", "最大 ＝")), "再生コントロールに「どちらも『接触圧』と出る・平均＝接触力÷接触面積・最大＝1 点」の説明")
 check(not shown("接触面積"), "接触面積は既定で出さない")
 fa = shown("引張中")[0]
-check(fa.GetPosition()[1] > 0.75 and a[0].GetPosition()[1] > 0.75 and fa.GetPosition()[0] > 0.9,
+check(fa.GetPosition()[1] > 0.75 and a[0].GetPosition()[1] > 0.75 and fa.GetPosition()[0] > 0.66,
       f"右上（右のグラフ y 0.74 より上）に置く（{fa.GetPosition()} / {a[0].GetPosition()}）")
 check(fa.GetPosition()[1] > a[0].GetPosition()[1], "段階の行の下に接触圧の行")
 jf = app._sim_ligament_font_file()
@@ -174,7 +211,9 @@ check(len(fr) == 1, "再生コントロールに「発表用の表示」の欄")
 cbs = {str(w.cget("text")): w for w in walk_po(fr[0]) if w.winfo_class() == "TCheckbutton"}
 rbs = {str(w.cget("text")): w for w in walk_po(fr[0]) if w.winfo_class() == "TRadiobutton"}
 sps = [w for w in walk_po(fr[0]) if w.winfo_class() == "TSpinbox"]
-check(len(cbs) == 3 and set(rbs) == {"最大", "平均"} and len(sps) == 2, "段階・接触圧・接触面積のチェック、最大／平均、文字の大きさ 2 つ")
+check(len(cbs) == 4 and any("平滑化" in k for k in cbs) and set(rbs) == {"最大", "平均"} and len(sps) == 3,
+      "段階・接触圧・接触面積・平滑化（10/22）のチェック、最大／平均、文字の大きさ 2 つと平滑化の σ")
+sps = [w for w in sps if "cp_smooth" not in str(w.cget("textvariable")) and str(w.cget("textvariable")) != str(ctrl["po_vars"].get("cp_smooth_s"))]
 cb_stage = [w for k, w in cbs.items() if "段階" in k][0]
 cb_cp = [w for k, w in cbs.items() if k.startswith("接触圧")][0]
 cb_area = [w for k, w in cbs.items() if "接触面積" in k][0]
@@ -184,8 +223,8 @@ check(len(a) == 1 and str(a[0].GetInput()) == f"接触圧：{pmean:.2f} MPa{NL}�
       f"「接触面積も出す」で接触面積の行が増える（{str(a[0].GetInput()).replace(NL, ' / ') if a else '-'}・覚える）")
 rbs["最大"].invoke(); pump(app, 0.2)
 a = shown("接触圧")
-check(len(a) == 1 and str(a[0].GetInput()).startswith(f"最大接触圧：{pmax:.2f} MPa") and app.ankle_po_cp_kind.get() == "max",
-      f"「最大」に切り替えると最大接触圧（{str(a[0].GetInput()).split(NL)[0] if a else '-'}・覚える）")
+check(len(a) == 1 and str(a[0].GetInput()).startswith(f"接触圧：{pmax:.2f} MPa") and app.ankle_po_cp_kind.get() == "max",
+      f"「最大」に切り替えると最大の値（表示は「接触圧」のまま。{str(a[0].GetInput()).split(NL)[0] if a else '-'}・覚える）")
 rbs["平均"].invoke(); pump(app, 0.2)
 cb_area.invoke(); pump(app, 0.2)
 cb_stage.invoke(); pump(app, 0.2)

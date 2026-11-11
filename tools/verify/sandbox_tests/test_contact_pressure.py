@@ -103,7 +103,7 @@ rng0 = acts[k0].GetMapper().GetScalarRange()
 r_ = bar(p)
 check(not r_[3] and p.scalar_bars and list(p.scalar_bars.values())[0].GetDrawTickLabels(), f"外しているときは目盛りなし・帯は元のまま（題名「{r_[0]}」）")
 cpv = ctrl.get("cp_vars")
-check(cpv is not None and set(cpv) == {"on", "HA", "h"}, "再生コントロールに「接触圧（推定）」の欄（H_A・軟骨の厚さ。色の上限は無し）")
+check(cpv is not None and set(cpv) == {"on", "HA", "h", "only"}, "再生コントロールに「接触圧（推定）」の欄（H_A・軟骨の厚さ・接触圧だけ。色の上限は無し）")
 fr_ = [w for w in walk(ctrl["window"]) if w.winfo_class() == "TLabelframe" and "接触圧" in str(w.cget("text"))][0]
 btn = [w for w in walk(fr_) if w.winfo_class() == "TButton" and str(w.cget("text")) == "適用"][0]
 cb = [w for w in walk(fr_) if w.winfo_class() == "TCheckbutton"][0]

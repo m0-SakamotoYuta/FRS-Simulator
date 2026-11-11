@@ -243,7 +243,66 @@ def _ramp(x, w):
 	return t * t * (3.0 - 2.0 * t)
 
 
-def _bundle_contact(Xs, rfs, end_frac=0.08, gain=0.5, margin=1.1, ramp=3.0):
+def _adhere_w(s, span):
+	"""癒着の強さの分布: 束の長さの割合 s（0〜1）で、真ん中 span の範囲の内側半分は 1、外へなめらかに 0（smoothstep）。"""
+	half = 0.5 * float(span)
+	core = 0.5 * half
+	x = (half - np.abs(np.asarray(s, float) - 0.5)) / max(half - core, 1e-6)
+	t = np.clip(x, 0.0, 1.0)
+	return t * t * (3.0 - 2.0 * t)
+
+
+ADHERE_GAP_REF = 0.8   # mm。癒着で縮める距離の基準＝楕円の押し離しで生じていた自然なすき間（実測 約 0.8 mm。2026-10-25）
+
+
+def _bundle_adhere(Xs, rfs, pairs, gain=0.5, span=0.9):
+	"""束どうしの癒着（その場で書き換え。2026-10-24）: 束の組 (a, b) の、実際の線維どうしのすき間（いちばん近い線維の表面どうし）が
+	あれば、そのすき間に gain と強さの分布を掛けて寄せる（目標はすき間 0＝線維どうしが触れる。重なりは線維どうしの当たりが止める）。
+	外形の楕円は線維の広がりより大きめなので、楕円の距離ではなく線維の距離で測る（楕円で測ると、見た目に約 1 mm のすき間が残った）。
+	寄せる向きは中心線どうしを結ぶ向きだけ（長さの向きには拘束しない）。a→b・b→a の両方から（それぞれ 1/4 ずつ）。長さの向きに少しならす。
+	返り値: 寄せた断面の数。"""
+	if not pairs:
+		return 0
+	from scipy.spatial import cKDTree
+	js = sorted({int(j) for pr in pairs for j in pr if 0 <= int(j) < len(Xs)})
+	cen = {j: Xs[j].mean(axis=0) for j in js}
+	moves = {j: np.zeros((Xs[j].shape[1], 3)) for j in js}
+	cnt = 0
+	for a0, b0 in pairs:
+		if a0 not in cen or b0 not in cen or a0 == b0:
+			continue
+		for pa, qb in ((a0, b0), (b0, a0)):
+			CA, CB = cen[pa], cen[qb]
+			KA, KB = len(CA), len(CB)
+			if KA < 3 or KB < 3:
+				continue
+			kbs = np.arange(1, KB - 1)
+			tree = cKDTree(Xs[pa].reshape(-1, 3))
+			Fb = Xs[qb].shape[0]
+			dmin, _ix = tree.query(Xs[qb][:, kbs].reshape(-1, 3), k=1)
+			gapf = dmin.reshape(Fb, len(kbs)).min(axis=0) - (float(rfs[pa]) + float(rfs[qb]))   # 断面ごとの線維どうしのすき間
+			Q, i, u = _closest_on_polyline(CA, CB[kbs])
+			w = _adhere_w(kbs / (KB - 1.0), span) * _adhere_w((i + u) / (KA - 1.0), span)
+			d = CB[kbs] - Q
+			dist = np.linalg.norm(d, axis=1)
+			dirv = d / np.maximum(dist, 1e-9)[:, None]
+			pull = 0.25 * float(gain) * np.maximum(gapf, 0.0) * w
+			hit = (pull > 1e-6) & (dist > 1e-6)
+			if not hit.any():
+				continue
+			mv = (pull * hit)[:, None] * dirv
+			moves[qb][kbs] -= mv                                   # B は A へ
+			np.add.at(moves[pa], i, mv * (1 - u)[:, None])           # A は B へ（近い区間の両端に割合で）
+			np.add.at(moves[pa], i + 1, mv * u[:, None])
+			cnt += int(hit.sum())
+	for j, m in moves.items():
+		ms = m.copy()
+		ms[1:-1] = 0.25 * m[:-2] + 0.5 * m[1:-1] + 0.25 * m[2:]     # 長さの向きに少しならす（折れを作らない）
+		Xs[j][:, 1:-1] += ms[None, 1:-1]
+	return cnt
+
+
+def _bundle_contact(Xs, rfs, end_frac=0.08, gain=0.5, margin=1.1, ramp=3.0, skip=None):
 	"""束どうしの当たり（その場で書き換え）: 中心線どうしの距離で離す（カプセル同士の当たり）。
 	束 B の各断面の中心から束 A の中心線へのいちばん近い点を結ぶ向きで、両方の外形（皮と同じ楕円の断面）のその向きの半径の和 × margin
 	より近ければ、その差の gain/2 ずつ離す（A の側は近い区間の両端に割合で分ける。A・B を入れ替えても行う）。
@@ -263,6 +322,9 @@ def _bundle_contact(Xs, rfs, end_frac=0.08, gain=0.5, margin=1.1, ramp=3.0):
 		for b in range(nb):
 			if b == a:
 				continue
+			# 癒着させる組（skip = {組: (強さ, 範囲)}）: 押し離しの目標の距離を、強さ × 分布 × ADHERE_GAP_REF だけ縮め、
+			# 範囲の中は遠すぎても寄せる（両向き。2026-10-25）。範囲の外・付着部の近くは今までどおり
+			adh_ = skip.get((a, b), skip.get((b, a))) if isinstance(skip, dict) else None
 			CB, tB, e1B, e2B, r1B, r2B = env[b]
 			KB = len(CB)
 			kb0 = max(1, int(round(end_frac * (KB - 1))))
@@ -289,8 +351,16 @@ def _bundle_contact(Xs, rfs, end_frac=0.08, gain=0.5, margin=1.1, ramp=3.0):
 			e2A_ = np.cross(tA_, e1A_)
 			ra = _support(dirv, tA_, e1A_, e2A_, (1 - u) * r1A[ia0] + u * r1A[ia1], (1 - u) * r2A[ia0] + u * r2A[ia1])
 			rb = _support(-dirv, tB[kbs], e1B[kbs], e2B[kbs], r1B[kbs], r2B[kbs])
-			pen = (margin * (ra + rb) - dist) * wa * wb
-			hit = ok & (pen > 0) & (dist > 1e-6)
+			tgt_d = margin * (ra + rb)
+			wad = None
+			if adh_ is not None:
+				wad = _adhere_w(kbs / (KB - 1.0), adh_[1]) * _adhere_w(sa / (KA - 1.0), adh_[1])
+				tgt_d = tgt_d - min(1.0, max(0.0, float(adh_[0]))) * wad * ADHERE_GAP_REF
+			pen = (tgt_d - dist) * wa * wb
+			if wad is None:
+				hit = ok & (pen > 0) & (dist > 1e-6)
+			else:
+				hit = ok & (dist > 1e-6) & ((pen > 0) | (wad > 1e-3))   # 癒着の範囲の中は、遠すぎても寄せる（負の pen＝寄せる）
 			if not hit.any():
 				continue
 			mv = (0.5 * gain * pen * hit)[:, None] * dirv          # B は離れる向き、A は逆向き（半分ずつ）
@@ -471,6 +541,20 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 	frames = list(range(s0, N, stride))
 	if frames[-1] != N - 1:
 		frames.append(N - 1)
+	only = params.get("only_frames")                 # このコマだけ（初期長のスライダーの仮の計算。2026-10-23）
+	if only:
+		frames = [int(max(0, min(int(x), N - 1))) for x in only]
+	repeat = max(1, int(params.get("repeat", 1)))     # 1 コマを何回くり返して整えるか
+	skip_center = bool(params.get("skip_center", False))   # グラフ用の中心の線維の長さを求めない
+	rng_ = params.get("frame_range")                 # この区間だけ（前方引張の区間など。2026-10-23）
+	if rng_ and not only:
+		ga, gb = int(max(0, min(int(rng_[0]), N - 1))), int(max(0, min(int(rng_[1]), N - 1)))
+		frames = list(range(ga, gb + 1, stride))
+		if not frames or frames[-1] != gb:
+			frames.append(gb)
+		fr_ = params.get("rest_frame")
+		if fr_ is not None and 0 <= int(fr_) < N and not (ga <= int(fr_) <= gb):
+			frames = sorted(set(frames) | {int(fr_)})          # 自然長の基準のコマも（基準の長さ・張り具合の基準）
 	scale = float(params.get("rest_scale", 1.0))
 	gstep = float(params.get("gravity", 0.02))
 	gdir = np.asarray(params.get("gravity_dir", (0.0, 1.0, 0.0)), dtype=float)
@@ -479,6 +563,9 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 	inner = int(params.get("inner", 6))
 	bend = float(params.get("bend", 0.05))
 	contact = bool(params.get("bundle_contact", True))
+	adh_pairs = [tuple(int(x) for x in pr) for pr in (params.get("adhere_pairs") or [])]   # 束どうしの癒着（2026-10-24）
+	adh_gain = float(params.get("adhere_gain", 0.5))
+	adh_span = float(params.get("adhere_span", 0.9))
 	nb = len(bundles)
 
 	def world(i, P, f):
@@ -491,6 +578,17 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 	fref = params.get("rest_frame")
 	fref = int(fref) if fref is not None and 0 <= int(fref) < N else f0
 	for b in bundles:
+		if b.get("_X0") is not None and b.get("_Lt") is not None:
+			# はじめの形（前の計算の形）と、基準のコマで張った長さがわかっている → 張り直さずにそこから（2026-10-23）
+			X0_ = np.array(b["_X0"], dtype=float)
+			L0 = np.asarray(b["_Lt"], float) * float(b.get("rest_scale", scale))
+			K = int(X0_.shape[1])
+			Xs.append(X0_)
+			seg0.append((L0 / (K - 1))[:, None])
+			Ks.append(K)
+			rfs.append(float(b["rf"]))
+			b["_L0"] = L0
+			continue
 		A, B = world(b["a"], b["pa"], f0), world(b["b"], b["pb"], f0)
 		F = len(A)
 		Kt = 33
@@ -501,7 +599,7 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 			Lt = np.linalg.norm(np.diff(Xr, axis=1), axis=2).sum(axis=1)
 		else:
 			Lt = np.linalg.norm(np.diff(Xt, axis=1), axis=2).sum(axis=1)
-		L0 = Lt * scale
+		L0 = Lt * float(b.get("rest_scale", scale))          # 束ごとの初期長の係数（2026-10-23。無ければ全体の値）
 		K = int(np.clip(round(float(L0.max()) / max(1.2, 2.5 * float(b["rf"]))) + 1, 15, 33))
 		Xs.append(_resample(Xt, K))
 		seg0.append((L0 / (K - 1))[:, None])
@@ -545,7 +643,8 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 					_sheath(X, bundles[j]["foot_r"], bundles[j]["sheath"], rfs[j])
 			# 束どうし（外形どうし。線維の点どうしだけだと、束の外形が重なった。2026-10-20）
 			if contact:
-				_bundle_contact(Xs, rfs)
+				_bundle_contact(Xs, rfs, skip={tuple(pr): (adh_gain, adh_span) for pr in adh_pairs})
+			# 癒着は束どうしの当たりの中で（目標の距離を縮めて両向きに。2026-10-25。_bundle_adhere は使わない）
 			# 線維どうし
 			P = np.concatenate([X.reshape(-1, 3) for X in Xs], axis=0)
 			pr = cKDTree(P).query_pairs(2.0 * rmax, output_type="ndarray")
@@ -574,7 +673,7 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 		# まっすぐ戻されてよけられなかった）。そのあと骨の外へ
 		if contact:
 			for _k in range(6):
-				if _bundle_contact(Xs, rfs) == 0:
+				if _bundle_contact(Xs, rfs, skip={tuple(pr): (adh_gain, adh_span) for pr in adh_pairs}) == 0:
 					break
 			P = np.concatenate([X.reshape(-1, 3) for X in Xs], axis=0)
 			Q = P[~is_end].copy()
@@ -591,10 +690,13 @@ def simulate(app, bones_full, bundles, s0, params, progress=None, cancelled=None
 	t0 = time.time()
 	last = 0.0
 	for k, f in enumerate(frames):
-		step(f)
+		for _rp in range(repeat):
+			step(f)
 		for j, b in enumerate(bundles):
 			T = Ts[int(b["a"])][f]
 			out_local[j][k] = ((Xs[j] - T[:3, 3]) @ T[:3, :3]).astype(np.float32)
+			if skip_center:
+				continue
 			A = world(b["a"], b["pa"][:1], f)
 			B = world(b["b"], b["pb"][:1], f)
 			Xc[j] = _taut_paths(bones, Ts, f, A, B, 33, np.array([float(b["rf"])]), X=Xc[j],
@@ -735,6 +837,7 @@ class Stage2:
 					best = (L, pb)
 		AB = self._xsec(b)
 		return {"a": ia, "b": ib, "pa": pa, "pb": best[1], "rf": self._rf(b), "_sia": sia,
+		        "rest_scale": self._rest_pct(b) / 100.0,
 		        "sheath": AB,
 		        "foot_r": ((float(b["a"]["ellipse"]["ra"]), float(b["a"]["ellipse"]["rb"])),
 		                   (float(b["b"]["ellipse"]["ra"]), float(b["b"]["ellipse"]["rb"])))}
@@ -757,7 +860,138 @@ class Stage2:
 			return auto_fiber_radius(int(b.get("n_fibers", 10)), AB[0], AB[1])
 		return float(b.get("fiber_radius", 0.4))
 
-	def _key(self, ready):
+	CALC_MARGIN_S = 2.0   # 区間だけ計算するとき、前後に足す秒数
+
+	def _calc_frames(self):
+		"""計算する範囲（絶対のコマ番号の (始め, 終わり)）。全部なら None（2026-10-23）。区間が見つからなければ None（全部）。"""
+		kind = str(self.params().get("calc_range", "all"))
+		if kind not in ("anterior", "posterior", "extension", "flexion"):
+			return None
+		memo = self.__dict__.get("_cf_memo")
+		if memo is not None and memo[0] == kind:
+			return memo[1]
+		val = None
+		try:
+			fn = (self.scene.get("pres_overlay") or {}).get("clips")
+			rg = fn().get(kind) if callable(fn) else None
+			if rg is not None:
+				times = np.asarray(self.scene.get("frame_times") or [], float)[:self.n_view]
+				a, b = int(rg[0]), int(rg[1])
+				a2 = int(np.searchsorted(times, times[a] - self.CALC_MARGIN_S))
+				b2 = int(min(self.n_view - 1, np.searchsorted(times, times[b] + self.CALC_MARGIN_S)))
+				val = (int(self.s0 + a2), int(self.s0 + b2))
+		except Exception as e:
+			print(f"[靭帯の束] 計算する区間を求められません（全部のコマを計算します）: {e}")
+		self._cf_memo = (kind, val)
+		return val
+
+	def _mask_range(self, g, L):
+		"""計算する範囲の外は NaN（グラフに線を出さない）。"""
+		rng_ = self._calc_frames()
+		if rng_ is not None:
+			L = np.array(L, dtype=float)
+			L[(np.asarray(g) < rng_[0]) | (np.asarray(g) > rng_[1])] = np.nan
+		return L
+
+	# ---------------------------------------------------------------- 初期長のセット（2026-10-24）
+	def _tab_key(self):
+		"""このタブの名前（初期長のセットを覚える鍵）。わからなければ記録の指紋。"""
+		nm = str((self.scene.get("pres_overlay") or {}).get("tab_name") or "")
+		return f"tab:{nm}" if nm else f"rec:{self._rec_id()}"
+
+	def _tab_name(self):
+		k = self._tab_key()
+		return k[4:] if k.startswith("tab:") else "（このタブ）"
+
+	def _len_sets(self):
+		"""初期長のセット {id: {"name", "memo", "pct": {束の id: %}, "time"}}。無ければ、それまでの束ごとの初期長（全タブ共通）から
+		「前後方用」を作って既定にする（同じ値なので計算結果の鍵は変わらない）。"""
+		p = self.data.setdefault("params", {})
+		sets = p.get("len_sets")
+		if not isinstance(sets, dict) or not sets:
+			pct = {}
+			for b in self.data.get("bundles", []):
+				try:
+					if b.get("rest_pct") is not None:
+						pct[b.get("id")] = float(b["rest_pct"])
+				except (TypeError, ValueError):
+					pass
+			sets = {"s1": {"name": "前後方用", "pct": pct, "time": time.strftime("%Y-%m-%d %H:%M"),
+			               "memo": "それまでの初期長（全タブ共通）から作りました（2026-10-24）。"}}
+			p["len_sets"] = sets
+			p["len_set_default"] = "s1"
+			p.setdefault("len_set_of", {})
+			try:
+				self._save()
+			except Exception:
+				pass
+		return sets
+
+	def _len_set_id(self):
+		"""このタブが使う初期長のセットの id（選んでいなければ既定）。"""
+		sets = self._len_sets()
+		p = self.data.get("params") or {}
+		sid = (p.get("len_set_of") or {}).get(self._tab_key())
+		if sid not in sets:
+			sid = p.get("len_set_default")
+		if sid not in sets:
+			sid = next(iter(sets))
+		return sid
+
+	def _len_set(self):
+		return self._len_sets()[self._len_set_id()]
+
+	ADHERE_DEFAULT = {"on": False, "gain": 0.5, "span": 0.9}
+
+	def _adhere(self):
+		"""癒着の設定（params "adhere"）。束を選んでいなければ、名前に AM・PL を含む束。"""
+		d = dict(self.ADHERE_DEFAULT)
+		d.update(self.data.get("params", {}).get("adhere") or {})
+		bs = self.data.get("bundles", [])
+		if not d.get("a"):
+			d["a"] = next((b.get("id") for b in bs if "AM" in str(b.get("name", ""))), None)
+		if not d.get("b"):
+			d["b"] = next((b.get("id") for b in bs if "PL" in str(b.get("name", ""))), None)
+		return d
+
+	def _adhere_cfg(self, blist):
+		"""simulate に渡す癒着の設定（オフ・束が無いときは空）。blist は計算に渡す束の並び。"""
+		d = self._adhere()
+		ids = [b.get("id") for b in blist]
+		if not d.get("on") or d.get("a") not in ids or d.get("b") not in ids or d.get("a") == d.get("b"):
+			return {}
+		return {"adhere_pairs": [(ids.index(d["a"]), ids.index(d["b"]))], "adhere_gain": float(d["gain"]), "adhere_span": float(d["span"])}
+
+	def _pct_explicit(self, b):
+		"""このタブのセットに入っている束 b の初期長 %（入っていなければ None＝全体の「自然長 ×」）。"""
+		v = (self._len_set().get("pct") or {}).get(b.get("id"))
+		try:
+			return None if v is None else float(v)
+		except (TypeError, ValueError):
+			return None
+
+	def _len_set_put(self, b, pct):
+		self._len_set().setdefault("pct", {})[b.get("id")] = float(pct)
+
+	def _len_set_users(self, sid):
+		"""セット sid を使っているタブの名前（選んだタブ）と、既定かどうか。"""
+		p = self.data.get("params") or {}
+		tabs = [k[4:] for k, v in (p.get("len_set_of") or {}).items() if v == sid and str(k).startswith("tab:")]
+		return tabs, (p.get("len_set_default") == sid)
+
+	def _rest_pct(self, b):
+		"""束の初期長 %（基準のコマで骨を避けて張った長さに対して）。このタブの初期長のセットから。入っていなければ
+		全体の「自然長 ×」（2026-10-23。2026-10-24 からセット）。"""
+		try:
+			v = self._pct_explicit(b)
+			if v is not None:
+				return float(max(self.REST_PCT_LIMIT[0], min(self.REST_PCT_LIMIT[1], v)))
+		except Exception:
+			pass
+		return 100.0 * float(self.params().get("rest_scale", 1.0))
+
+	def _key(self, ready, with_pct=True):
+		"""計算結果の鍵。with_pct=False: 束ごとの初期長 % を入れない鍵（初期長だけ違う結果を探すとき。2026-10-23）。"""
 		h = hashlib.sha1()
 		for (idx, name, mesh, Ts) in sorted(self.bones_full, key=lambda x: int(x[0])):
 			h.update(f"bone{int(idx)}|".encode())
@@ -769,20 +1003,84 @@ class Stage2:
 		                    sort_keys=True).encode())
 		h.update(json.dumps({"rest_frame": self._rest_frame(), "contact": bool(pp.get("bundle_contact", True))},
 		                    sort_keys=True).encode())
+		rng_ = self._calc_frames()
+		if rng_ is not None:                                  # 区間だけの結果は別に（全部の結果の鍵は変えない。2026-10-23）
+			h.update(f"|rng{rng_[0]}-{rng_[1]}".encode())
 		for b in ready:
 			h.update(json.dumps({"a": b["a"], "b": b["b"], "n": int(b.get("n_fibers", 10)),
 			                     "r": round(self._rf(b), 6), "xs": self._xsec(b)}, sort_keys=True).encode())
+			if with_pct and self._pct_explicit(b) is not None:       # 束ごとの初期長（入れたときだけ。前の結果の鍵は変えない）
+				h.update(f"|rp{round(self._rest_pct(b), 3)}".encode())
+		ad = self._adhere_cfg(ready)
+		if with_pct and ad:                                      # 癒着（オンのときだけ。2026-10-24）
+			h.update(f"|adh{ad['adhere_pairs']}-{round(ad['adhere_gain'], 3)}-{round(ad['adhere_span'], 3)}".encode())
 		return h.hexdigest()[:24]
+
+	def _pct_index(self):
+		"""初期長の一覧: {初期長を除いた鍵: [{"key": 結果の鍵, "pct": {束の id: %}, "time": …}, …]}（2026-10-23）。"""
+		try:
+			d = json.loads((self.res_dir / "pct_index.json").read_text(encoding="utf-8"))
+			return d if isinstance(d, dict) else {}
+		except Exception:
+			return {}
+
+	def _pct_index_add(self, ready):
+		"""いま計算した結果を初期長の一覧に入れる（同じ結果の鍵は入れ直す・1 つの鍵につき新しい 20 件まで）。"""
+		try:
+			d = self._pct_index()
+			base, full = self._key(ready, with_pct=False), self._key(ready)
+			lst = [e for e in (d.get(base) or []) if e.get("key") != full]
+			ad_ = self._adhere_cfg(ready)
+			lst.append({"key": full, "pct": {b.get("id"): self._rest_pct(b) for b in ready},
+			            "adh": ({"gain": ad_["adhere_gain"], "span": ad_["adhere_span"]} if ad_ else None),
+			            "range": str(self.params().get("calc_range", "all")),
+			            "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
+			d[base] = lst[-20:]
+			self.res_dir.mkdir(parents=True, exist_ok=True)
+			tmp = self.res_dir / "pct_index.tmp.json"
+			tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+			os.replace(str(tmp), str(self.res_dir / "pct_index.json"))
+		except Exception as e:
+			print(f"[靭帯の束] 初期長の一覧を書けません: {e}")
 
 	def _load_cached_results(self):
 		ready = [b for b in self.data["bundles"] if self._ready(b)]
 		self.results = {}
+		self.rest_stale = False
+		self._preview = {}
 		if not ready:
 			return
 		try:
 			fp = self.res_dir / f"lb_{self._key(ready)}.npz"
+			self.rest_pct_done = {b.get("id"): self._rest_pct(b) for b in ready}   # 3D のたるみを計算した初期長
+			self.res_desc = None                                  # 前の計算を使っているとき、その計算の設定（窓に出す。2026-10-25）
 			if not fp.exists():
-				return
+				# 初期長 % だけ違う結果を使う（たるみはその計算のまま。2026-10-23）:
+				# ① 初期長の一覧（pct_index.json）のいちばん新しい結果 ② 初期長を入れる前の結果（全体の「自然長 ×」）
+				base = self._key(ready, with_pct=False)
+				hit = None
+				for ent in reversed(self._pct_index().get(base) or []):
+					fp2 = self.res_dir / f"lb_{ent.get('key', '')}.npz"
+					if ent.get("key") and fp2.exists():
+						hit = (fp2, ent)
+						break
+				if hit is not None:
+					fp = hit[0]
+					gl = 100.0 * float(self.params().get("rest_scale", 1.0))
+					self.rest_pct_done = {b.get("id"): float((hit[1].get("pct") or {}).get(b.get("id")) or gl) for b in ready}
+					ent = hit[1]
+					pc_ = "・".join(f"{b.get('name', '')} {self.rest_pct_done[b.get('id')]:g}" for b in ready)
+					ad_ = ent.get("adh")
+					self.res_desc = (f"初期長 {pc_} %、" + (f"癒着あり（強さ {ad_['gain']:g}・範囲 {100 * ad_['span']:.0f} %）" if ad_
+					                                        else ("癒着なし" if "adh" in ent else "癒着なし（癒着を作る前の計算）"))
+					                 + f"、{ent.get('time', '')[:16].replace('T', ' ')} の計算")
+				else:
+					self.rest_pct_done = {b.get("id"): 100.0 * float(self.params().get("rest_scale", 1.0)) for b in ready}
+					fp = self.res_dir / f"lb_{base}.npz"
+					if not fp.exists() or not (any(self._pct_explicit(b) is not None for b in ready) or self._adhere_cfg(ready)):
+						return
+					self.res_desc = "初期長・癒着を入れる前の計算"
+				self.rest_stale = True
 			with np.load(str(fp), allow_pickle=False) as z:
 				for j, b in enumerate(ready):
 					self.results[b["id"]] = {"frames": np.asarray(z[f"frames{j}"]), "local": np.asarray(z[f"local{j}"]),
@@ -801,7 +1099,8 @@ class Stage2:
 		try:
 			upd(0.0, "骨の形と線維の端を準備しています…")
 			rts = [self._runtime(b) for b in ready]
-			res = simulate(self.app, self.bones_full, rts, self.s0, dict(self.params(), rest_frame=self._rest_frame()),
+			res = simulate(self.app, self.bones_full, rts, self.s0,
+			               dict(self.params(), rest_frame=self._rest_frame(), frame_range=self._calc_frames(), **self._adhere_cfg(ready)),
 			               progress=upd, cancelled=cancelled,
 			               bones=self._ensure_bones())
 		finally:
@@ -820,12 +1119,19 @@ class Stage2:
 			tmp = self.res_dir / "lb_tmp.npz"
 			np.savez_compressed(str(tmp), **arrs)
 			os.replace(str(tmp), str(self.res_dir / f"lb_{self._key(ready)}.npz"))
+			self._pct_index_add(ready)                         # どの初期長で計算した結果か（2026-10-23）
 		except Exception as e:
 			print(f"[靭帯の束] 結果を保存できませんでした: {e}")
 		self.results = {b["id"]: dict(r, sia=rt["_sia"]) for b, r, rt in zip(ready, res, rts)}
+		self.rest_stale = False
+		self.res_desc = None
+		self.rest_pct_done = {b.get("id"): self._rest_pct(b) for b in ready}   # 3D のたるみを計算した初期長
+		self._preview = {}
+		self._rt_cache = {}
 		self._rebuild_actors()
 		self._notify()
 		self._say(f"{len(ready)} 束を計算しました。", "#1b5e20")
+		self._adhere_state_label()
 		return True
 
 	# ---------------------------------------------------------------- 表示の時刻
@@ -848,8 +1154,45 @@ class Stage2:
 			if r is None or not b.get("chart", True):
 				continue
 			g = self.s0 + np.arange(len(times))
-			L = np.interp(g, r["frames"].astype(float), r["center_len"].astype(float))
+			L = self._mask_range(g, np.interp(g, r["frames"].astype(float), r["center_len"].astype(float)))
 			out.append((times, L, str(b.get("color", "#FF8800")), str(b.get("name", ""))))
+		return out
+
+	def strain_at(self, b, g_abs):
+		"""束 b の、絶対のコマ g_abs の張り具合 [%]（中心の線維・骨を避けて張った長さ）。求められなければ None。"""
+		r = self.results.get(b.get("id"))
+		if r is None:
+			return None
+		rng_ = self._calc_frames()
+		if rng_ is not None and not (rng_[0] <= float(g_abs) <= rng_[1]):
+			return None                                       # 計算する範囲の外（2026-10-23）
+		fr = r["frames"].astype(float)
+		cl = r["center_len"].astype(float)
+		gr = self._rest_frame()
+		gr = float(gr) if gr is not None else float(fr[0])
+		L0 = float(np.interp(gr, fr, cl)) * self._rest_pct(b) / 100.0
+		if not L0 > 0:
+			return None
+		return (float(np.interp(float(g_abs), fr, cl)) / L0 - 1.0) * 100.0
+
+	def series_strain(self):
+		"""右のグラフ: 張り具合 [%] = (いまの長さ − 初期長) ÷ 初期長 × 100。初期長 = 基準のコマ（自然長の基準）の、
+		中心の線維を骨を避けて張った長さ × 束の初期長 %（2026-10-23）。[(時刻, 張り具合, 色, 名前)]"""
+		times = np.asarray(self.scene.get("frame_times") or [], dtype=float)
+		out = []
+		gr = self._rest_frame()
+		for b in self.data["bundles"]:
+			r = self.results.get(b.get("id"))
+			if r is None or not b.get("chart", True):
+				continue
+			fr = r["frames"].astype(float)
+			cl = r["center_len"].astype(float)
+			g = self.s0 + np.arange(len(times))
+			L = self._mask_range(g, np.interp(g, fr, cl))
+			L0 = float(np.interp(float(gr) if gr is not None else fr[0], fr, cl)) * self._rest_pct(b) / 100.0
+			if not L0 > 0:
+				continue
+			out.append((times, (L / L0 - 1.0) * 100.0, str(b.get("color", "#FF8800")), str(b.get("name", ""))))
 		return out
 
 	def _notify(self):
@@ -969,7 +1312,7 @@ class Stage2:
 						print(f"[靭帯の束] 付着部の輪郭を骨の面に落とせません（平らな楕円で描きます）: {ex}")
 					pd_e = self._ring_poly(ring["out_calc"]) if ring is not None else self._ellipse_poly(e["ellipse"])
 					act = self._line_actor(pd_e, col, 3.0)
-					act.SetVisibility(vis and self._outline_on() and not self._drawing(b, end))
+					act.SetVisibility(vis and self._outline_on() and not self._drawing(b, end) and self._end_side_ok(e))
 					a[f"e{end}_act"] = act
 					a[f"e{end}_si"] = si
 					a[f"e{end}_ring"] = ring
@@ -978,7 +1321,7 @@ class Stage2:
 			if self._xsec(b) is not None and self._ready(b):
 				xpd = self._ring_poly(np.zeros((48, 3)))
 				xact = self._line_actor(xpd, col, 2.0)
-				xact.SetVisibility(vis and bool(self.params().get("show_xsec", True)) and view != "foot")
+				xact.SetVisibility(vis and bool(self.params().get("show_xsec", True)) and not str(view).startswith("foot"))
 				a.update(xs_act=xact, xs_pd=xpd)
 			r = self.results.get(b.get("id"))
 			if r is not None:
@@ -2378,7 +2721,8 @@ class Stage2:
 				W = None
 				if r is not None:
 					T = self.poses[r["sia"]][fi]
-					W = self._local_at(r, fi) @ T[:3, :3].T + T[:3, 3]
+					loc_ = self._preview_local(b, fi)            # 初期長を変えて、このコマだけ計算した形（2026-10-23）
+					W = (loc_ if loc_ is not None else self._local_at(r, fi)) @ T[:3, :3].T + T[:3, 3]
 				if a.get("xs_act") is not None and a["xs_act"].GetVisibility():
 					P_ = self._xsec_ring(b, W, fi)
 					if P_ is not None:
@@ -2387,6 +2731,22 @@ class Stage2:
 						a["xs_pd"].GetPoints().Modified()
 						a["xs_pd"].Modified()
 				if r is None:
+					continue
+				# 計算する範囲の外のコマ（区間だけ計算したとき）は、線維・皮を隠す（2026-10-23）
+				rng_ = self._calc_frames()
+				g_ = int(self.s0 + fi)
+				out_ = rng_ is not None and (g_ < rng_[0] or g_ > rng_[1])
+				ov_ = a.setdefault("_out_vis", {})
+				for k_ in ("fib_act", "skin_act"):
+					act_ = a.get(k_)
+					if act_ is None:
+						continue
+					if out_ and act_.GetVisibility():
+						ov_[k_] = True
+						act_.VisibilityOff()
+					elif not out_ and ov_.pop(k_, None):
+						act_.VisibilityOn()
+				if out_:
 					continue
 				# 表示変更用モデルが見えている骨では、線維の端をその面の上へ
 				if a.get("fend"):
@@ -2609,6 +2969,19 @@ class Stage2:
 		ttk.Checkbutton(mvr, text="この付着部の切り残しを消す（表示だけ・開き直すと反映）", variable=self.w["stump_var"],
 		                command=self._stump_toggle).pack(side="left", padx=(12, 0))
 		self.w["mv_combo"].bind("<<ComboboxSelected>>", lambda e: self._stump_sync())
+		# 楕円の向きを回す（中心はそのまま。2026-10-24）
+		mvr2 = ttk.Frame(mv)
+		mvr2.pack(fill="x", padx=6, pady=(0, 2))
+		self.w["rot_btn"] = ttk.Button(mvr2, text="マウスで回す（中心はそのまま）", command=self._rot_toggle)
+		self.w["rot_btn"].pack(side="left")
+		ttk.Label(mvr2, text="　1 回").pack(side="left")
+		self.w["rot_step"] = tk.StringVar(win, value="5")
+		ttk.Spinbox(mvr2, from_=0.5, to=90.0, increment=0.5, width=5, textvariable=self.w["rot_step"]).pack(side="left", padx=2)
+		ttk.Label(mvr2, text="°").pack(side="left")
+		ttk.Button(mvr2, text="⟲", width=3, command=lambda: self._rot_click(+1)).pack(side="left", padx=(6, 1))
+		ttk.Button(mvr2, text="⟳", width=3, command=lambda: self._rot_click(-1)).pack(side="left", padx=1)
+		self.w["rot_lbl"] = ttk.Label(mvr2, text="（押すと、選んだ楕円の中心に点が出ます。左ドラッグで中心のまわりに回します）", foreground="gray")
+		self.w["rot_lbl"].pack(side="left", padx=8)
 		self.w["mv_lbl"] = ttk.Label(mv, text="（束の面を決めると選べます。動かすと計算の結果は外れるので、もう一度「▶ 計算する」）",
 		                             foreground="gray")
 		self.w["mv_lbl"].pack(anchor="w", padx=6, pady=(0, 4))
@@ -2620,7 +2993,8 @@ class Stage2:
 		pp = self.params()
 		ttk.Label(bot, text="表示:").pack(side="left")
 		self.w["view_var"] = tk.StringVar(win, value=str(pp.get("view", "both")))
-		for v_, t_ in (("fibers", "線維"), ("skin", "楕円の皮"), ("both", "両方"), ("foot", "付着部の楕円だけ")):
+		for v_, t_ in (("fibers", "線維"), ("skin", "楕円の皮"), ("both", "両方"), ("foot", "付着部の楕円だけ"),
+		               ("foot_fem", "付着部の楕円だけ（大腿骨側のみ）"), ("foot_tib", "付着部の楕円だけ（脛骨側のみ）")):
 			ttk.Radiobutton(bot, text=t_, value=v_, variable=self.w["view_var"], command=self._set_view).pack(side="left")
 		ttk.Label(bot, text="　自然長 ×").pack(side="left")
 		self.w["scale_var"] = tk.StringVar(win, value=f"{100.0 * float(pp.get('rest_scale', 1.0)):g}")
@@ -2648,6 +3022,53 @@ class Stage2:
 		ttk.Checkbutton(bot3, text="束どうしの当たり（外形どうしがめり込まない）", variable=self.w["contact_var"],
 		                command=self._contact_toggle).pack(side="left", padx=(14, 4))
 		ttk.Label(bot3, text="（どちらも変えると計算し直しが要ります）", foreground="gray").pack(side="left", padx=4)
+		# 束どうしの癒着（β。2026-10-24）
+		bot3c = ttk.Frame(body)
+		bot3c.pack(fill="x", padx=8, pady=(0, 4))
+		ad0 = self._adhere()
+		self.w["adh_on"] = tk.BooleanVar(win, value=bool(ad0.get("on")))
+		ttk.Checkbutton(bot3c, text="2 つの束を癒着させる（β）:", variable=self.w["adh_on"], command=self._adhere_set).pack(side="left")
+		bnames = [str(b.get("name", "")) for b in self.data.get("bundles", [])]
+		bname_of = {b.get("id"): str(b.get("name", "")) for b in self.data.get("bundles", [])}
+		self.w["adh_a"] = ttk.Combobox(bot3c, values=bnames, state="readonly", width=9)
+		self.w["adh_a"].set(bname_of.get(ad0.get("a"), ""))
+		self.w["adh_a"].pack(side="left", padx=(4, 0))
+		ttk.Label(bot3c, text="と").pack(side="left", padx=2)
+		self.w["adh_b"] = ttk.Combobox(bot3c, values=bnames, state="readonly", width=9)
+		self.w["adh_b"].set(bname_of.get(ad0.get("b"), ""))
+		self.w["adh_b"].pack(side="left")
+		for cb_ in (self.w["adh_a"], self.w["adh_b"]):
+			cb_.bind("<<ComboboxSelected>>", lambda _e: self._adhere_set())
+		ttk.Label(bot3c, text="　強さ").pack(side="left")
+		self.w["adh_gain"] = tk.DoubleVar(win, value=float(ad0.get("gain", 0.5)))
+		self.w["adh_gain_lbl"] = ttk.Label(bot3c, text=f"{float(ad0.get('gain', 0.5)):.2f}", width=5)
+		ttk.Scale(bot3c, from_=0.1, to=1.0, orient="horizontal", length=110, variable=self.w["adh_gain"],
+		          command=lambda _x: self._adhere_slide()).pack(side="left")
+		self.w["adh_gain_lbl"].pack(side="left")
+		ttk.Label(bot3c, text="　範囲（真ん中の）").pack(side="left")
+		self.w["adh_span"] = tk.DoubleVar(win, value=100.0 * float(ad0.get("span", 0.9)))
+		self.w["adh_span_lbl"] = ttk.Label(bot3c, text=f"{100.0 * float(ad0.get('span', 0.9)):.0f} %", width=5)
+		ttk.Scale(bot3c, from_=30.0, to=100.0, orient="horizontal", length=110, variable=self.w["adh_span"],
+		          command=lambda _x: self._adhere_slide()).pack(side="left")
+		self.w["adh_span_lbl"].pack(side="left")
+		ttk.Label(bot3c, text=("（強さ 1＝真ん中の線維どうしが触れる・0.5＝自然なすき間（約 0.8 mm）の半分・範囲の外は今までどおり。"
+		                       "付着部へなめらかに弱める。長さの向きのずれは自由。張っていて寄りきれないときは無理に寄せない。"
+		                       "変えたら、いまのコマだけすぐ計算して見せます）"),
+		          foreground="gray", wraplength=520, justify="left").pack(side="left", padx=6)
+		self.w["adh_state"] = ttk.Label(body, text="", foreground="#a06000", wraplength=980, justify="left")
+		self.w["adh_state"].pack(fill="x", padx=12, pady=(0, 4))
+		self._adhere_state_label()
+		# 計算する範囲（2026-10-23）
+		bot3b = ttk.Frame(body)
+		bot3b.pack(fill="x", padx=8, pady=(0, 4))
+		ttk.Label(bot3b, text="計算する範囲:").pack(side="left")
+		self.w["crange_var"] = tk.StringVar(win, value=str(pp.get("calc_range", "all")))
+		for v_, t_ in (("all", "全部のコマ"), ("anterior", "前方引張の区間だけ"), ("posterior", "後方引張の区間だけ"),
+		               ("extension", "伸展の区間だけ"), ("flexion", "屈曲の区間だけ")):
+			ttk.Radiobutton(bot3b, text=t_, value=v_, variable=self.w["crange_var"], command=self._crange_set).pack(side="left", padx=(4, 0))
+		self.w["crange_lbl"] = ttk.Label(bot3b, text="", foreground="gray")
+		self.w["crange_lbl"].pack(side="left", padx=8)
+		self._crange_label()
 		# 皮を入力した断面で描く・付着部の切り残しを消す（どちらも表示だけ。2026-10-21）
 		bot4 = ttk.Frame(body)
 		bot4.pack(fill="x", padx=8, pady=(0, 4))
@@ -2705,6 +3126,10 @@ class Stage2:
 		self.w["mult_spin"] = sb_m
 		ttk.Label(bot6, text=f"（1〜{self.FIB_MULT_MAX}。1 は計算した線維そのもの。計算は同じ本数のまま、増やした線維は近い計算線維 3 本の間を補間して描きます。1 本は細く）",
 		          foreground="gray").pack(side="left", padx=6)
+		# 束ごとの初期長（どれくらい張るか。2026-10-23）
+		self.w["rest_box"] = ttk.LabelFrame(body, text="張り（初期長）: 基準のコマで骨を避けて張った長さの何 % を初期長にするか")
+		self.w["rest_box"].pack(fill="x", padx=8, pady=(2, 6))
+		self._rest_rows()
 		ttk.Label(bot4, text="　切り残しを消す付着部:").pack(side="left")
 		self.w["stump_lbl"] = ttk.Label(bot4, text="", foreground="#0b5394")
 		self.w["stump_lbl"].pack(side="left", padx=2)
@@ -2751,6 +3176,10 @@ class Stage2:
 		self._ol_cancel(quiet=True)
 		self._stop_poll()
 		try:
+			self._rot_stop()                                   # 楕円を回している途中なら終える（2026-10-24）
+		except Exception:
+			pass
+		try:
 			if self.win is not None and self.win.winfo_exists():
 				self.win.destroy()
 		except Exception:
@@ -2764,6 +3193,9 @@ class Stage2:
 		fr = self.w.get("rows")
 		if fr is None:
 			return
+		if self.w.get("rest_box") is not None:
+			self._rest_rows()                                   # 束が変わったら初期長のスライダーも（2026-10-23）
+		self._adhere_state_label()                            # いまの 3D がどの計算か（2026-10-25）
 		for c in fr.winfo_children():
 			c.destroy()
 		hdr = ("表示", "グラフ", "名前", "色", "線維の本数", "断面の長径 mm", "断面の短径 mm", "線維の太さ(半径) mm",
@@ -2873,6 +3305,8 @@ class Stage2:
 		"""束の形・本数などが変わった → 計算し直しが要る（結果を外す）。
 		rows=False: 一覧は作り直さない（入力中の欄を壊さない）。"""
 		self.results = {}
+		self._preview = {}
+		self._rt_cache = {}
 		self._rebuild_actors()
 		self._notify()
 		if rows:
@@ -2931,7 +3365,8 @@ class Stage2:
 		self._save()
 		self._load_cached_results()
 		ready = [b for b in self.data["bundles"] if self._ready(b)]
-		if ready and all(self.results.get(b["id"]) is not None for b in ready):
+		# 前の計算（初期長・癒着だけ違う）を代わりに見せているとき（rest_stale）は、使わずに計算する（2026-10-25）
+		if ready and all(self.results.get(b["id"]) is not None for b in ready) and not self.__dict__.get("rest_stale"):
 			self._rebuild_actors()
 			self._notify()
 			self._rows()
@@ -3048,6 +3483,378 @@ class Stage2:
 		self._say(f"{self.w['mv_target'].get()} の切り残しを{'消す' if on else '消さない'}ようにしました。"
 		          "可視化を開き直すと反映されます（計算し直しは要りません）。", "blue")
 
+	REST_PCT_RANGE = (50.0, 150.0)   # スライダーの範囲 %（2026-10-23 に 80〜120 から広げた）
+	REST_PCT_LIMIT = (30.0, 200.0)   # 数の欄で入れられる範囲 %
+	PREVIEW_REPEAT = 4               # このコマだけ計算するときに、1 コマを何回くり返して整えるか
+
+	def _rest_rows(self):
+		"""束ごとの初期長のスライダー（張り具合はすぐ・3D のたるみは「▶ 計算する」で）。"""
+		import tkinter as tk
+		from tkinter import ttk
+		box = self.w.get("rest_box")
+		if box is None:
+			return
+		for c in box.winfo_children():
+			c.destroy()
+		self.w["rest_w"] = {}
+		info = ttk.Label(box, foreground="gray", justify="left", wraplength=900,
+		                 text=("基準のコマは上の「自然長の基準」（自動＝前方引張を始める直前）。100 % なら基準のコマでちょうどぴんと張る。"
+		                       "張り具合 [%] ＝（いまの長さ − 初期長）÷ 初期長（0 より上＝張っている・下＝たるんでいる）は、"
+		                       "右のグラフの「靭帯の張り具合」と発表用の動画のグラフにすぐ出ます。3D の線維のたるみは「▶ 計算する」で反映。"
+		                       "付着部は全部のタブで共通、初期長はタブごとに選んだセットのものです。"))
+		info.grid(row=95, column=0, columnspan=7, sticky="w", padx=4)
+		self._len_set_frame(box).grid(row=0, column=0, columnspan=7, sticky="we", padx=2, pady=(0, 4))
+		if self.__dict__.get("rest_stale"):
+			ttk.Label(box, foreground="#a06000", wraplength=900, justify="left",
+			          text=("※ いまの設定（初期長・癒着）で計算した結果がありません。3D は、ほかのコマは前の計算"
+			                + (f"（{self.__dict__.get('res_desc')}）" if self.__dict__.get("res_desc") else "")
+			                + "のまま、このコマだけ新しい設定で見せています。全部のコマは「▶ 計算する」で")).grid(
+				row=99, column=0, columnspan=6, sticky="w", padx=4)
+		lo, hi = self.REST_PCT_RANGE
+		self.w["prev_var"] = tk.BooleanVar(box, value=bool(self.params().get("rest_preview", True)))
+
+		def _prev_toggle():
+			self.data.setdefault("params", {})["rest_preview"] = bool(self.w["prev_var"].get())
+			self._save()
+		ttk.Checkbutton(box, text="変えたら、いまのコマだけすぐ計算して 3D に見せる（ほかのコマは「▶ 計算する」で）",
+		                variable=self.w["prev_var"], command=_prev_toggle).grid(row=98, column=0, columnspan=7, sticky="w", padx=4)
+		ttk.Label(box, text=f"（スライダー {lo:g}〜{hi:g} %・右の数の欄なら {self.REST_PCT_LIMIT[0]:g}〜{self.REST_PCT_LIMIT[1]:g} %）",
+		          foreground="gray").grid(row=97, column=0, columnspan=7, sticky="w", padx=4)
+		for r_, b in enumerate([b for b in self.data["bundles"] if self._ready(b)], start=1):
+			ttk.Label(box, text=str(b.get("name", "")), width=10).grid(row=r_, column=0, sticky="w", padx=4)
+			v = tk.DoubleVar(box, value=self._rest_pct(b))
+			val_lbl = ttk.Label(box, text=f"{self._rest_pct(b):.1f} %", width=8)
+			ent = ttk.Spinbox(box, from_=self.REST_PCT_LIMIT[0], to=self.REST_PCT_LIMIT[1], increment=0.5, width=6, textvariable=v,
+			                  command=lambda b=b, v=v, l=val_lbl: (self._rest_slide(b, v, l), self._rest_release(b)))
+			for ev_ in ("<Return>", "<FocusOut>", "<KP_Enter>"):
+				ent.bind(ev_, lambda _e, b=b, v=v, l=val_lbl: (self._rest_slide(b, v, l), self._rest_release(b)))
+			now_lbl = ttk.Label(box, text="", width=34)
+			sc = ttk.Scale(box, from_=lo, to=hi, orient="horizontal", length=260, variable=v,
+			               command=lambda x, b=b, v=v, l=val_lbl: self._rest_slide(b, v, l))
+			sc.grid(row=r_, column=1, padx=4)
+			val_lbl.grid(row=r_, column=2, sticky="w")
+			ent.grid(row=r_, column=6, padx=(4, 0))
+			sc.bind("<ButtonRelease-1>", lambda _e, b=b: self._rest_release(b))
+			ttk.Button(box, text="−0.5", width=5, command=lambda b=b, v=v, l=val_lbl: self._rest_step(b, v, l, -0.5)).grid(row=r_, column=3)
+			ttk.Button(box, text="+0.5", width=5, command=lambda b=b, v=v, l=val_lbl: self._rest_step(b, v, l, +0.5)).grid(row=r_, column=4)
+			now_lbl.grid(row=r_, column=5, sticky="w", padx=6)
+			self.w["rest_w"][b.get("id")] = (b, v, val_lbl, now_lbl)
+		self._rest_now_update()                            # 作り直した欄にすぐ書く
+		if not self.__dict__.get("_rest_polling"):          # 書き直しの時計は 1 つだけ
+			self._rest_polling = True
+			self._rest_now_poll()
+
+	def _len_set_frame(self, box):
+		"""初期長のセットの欄（このタブのセットを選ぶ・新しく作る・名前を変える・削除・使っているタブ・メモ）。"""
+		import tkinter as tk
+		from tkinter import ttk
+		fr = ttk.Frame(box)
+		sets = self._len_sets()
+		sid = self._len_set_id()
+		cur = sets[sid]
+		try:
+			self.w["rest_box"].config(text=f"張り（初期長）: このタブの初期長のセット「{cur.get('name', '')}」"
+			                               "（基準のコマで骨を避けて張った長さの何 % を初期長にするか）")
+		except Exception:
+			pass
+		r0 = ttk.Frame(fr)
+		r0.pack(fill="x")
+		ttk.Label(r0, text=f"このタブ（{self._tab_name()}）の初期長のセット:", font=("", 9, "bold")).pack(side="left")
+		names = [str(v.get("name", "")) for v in sets.values()]
+		cb = ttk.Combobox(r0, values=names, state="readonly", width=18)
+		cb.set(str(cur.get("name", "")))
+		cb.pack(side="left", padx=4)
+		cb.bind("<<ComboboxSelected>>", lambda _e: self._len_set_choose(cb.get()))
+		ttk.Button(r0, text="新しく作る…", command=self._len_set_new).pack(side="left", padx=2)
+		ttk.Button(r0, text="名前を変える…", command=self._len_set_rename).pack(side="left", padx=2)
+		ttk.Button(r0, text="削除", command=self._len_set_delete).pack(side="left", padx=2)
+		tabs, is_def = self._len_set_users(sid)
+		use = "、".join(tabs) if tabs else ""
+		ttk.Label(r0, foreground="gray",
+		          text=("（このセットを使うタブ: " + (use if use else "") + ("、" if use and is_def else "")
+		                + ("選んでいないタブ（既定）" if is_def else "") + "）")).pack(side="left", padx=6)
+		r1 = ttk.Frame(fr)
+		r1.pack(fill="x", pady=(2, 0))
+		ttk.Label(r1, text="メモ:").pack(side="left", anchor="n")
+		tx = tk.Text(r1, height=2, width=100, wrap="word", font=("", 9))
+		tx.insert("1.0", str(cur.get("memo", "")))
+		tx.pack(side="left", fill="x", expand=True, padx=4)
+
+		def _memo_save(_e=None, sid_=sid):
+			try:
+				self._len_sets()[sid_]["memo"] = tx.get("1.0", "end-1c")
+				self._save()
+			except Exception:
+				pass
+		tx.bind("<FocusOut>", _memo_save)
+		tx.bind("<KeyRelease>", lambda _e: (self.win.after_cancel(self.__dict__["_memo_job"]) if self.__dict__.get("_memo_job") else None,
+		                                    setattr(self, "_memo_job", self.win.after(800, _memo_save))))
+		self.w["len_set_cb"] = cb
+		self.w["len_set_memo"] = tx
+		return fr
+
+	def _len_set_changed(self, msg):
+		"""このタブのセットが変わった → 初期長が変わる → 計算結果を探し直して描き直す。"""
+		self._save()
+		self._preview = {}
+		self._load_cached_results()
+		self._rebuild_actors()
+		self._notify()
+		self._rows()
+		self.update(self.fi, render=True)
+		self._say(msg, "blue")
+
+	def _len_set_choose(self, name):
+		sets = self._len_sets()
+		sid = next((k for k, v in sets.items() if str(v.get("name", "")) == str(name)), None)
+		if sid is None:
+			return
+		self.data.setdefault("params", {}).setdefault("len_set_of", {})[self._tab_key()] = sid
+		self._len_set_changed(f"このタブ（{self._tab_name()}）の初期長のセットを「{name}」にしました。")
+
+	def _len_set_new(self):
+		from tkinter import simpledialog
+		sets = self._len_sets()
+		names = [str(v.get("name", "")) for v in sets.values()]
+		nm = simpledialog.askstring("初期長のセットを新しく作る",
+		                            "名前（いまのセットの値を写して作り、このタブで使います）:", initialvalue="屈曲伸展用", parent=self.win)
+		if nm is None or not str(nm).strip():
+			return
+		nm = str(nm).strip()
+		if nm in names:
+			self._say(f"「{nm}」はもうあります。別の名前にしてください。", "#a06000")
+			return
+		k = 1
+		while f"s{k}" in sets:
+			k += 1
+		cur = self._len_set()
+		sets[f"s{k}"] = {"name": nm, "pct": dict(cur.get("pct") or {}), "time": time.strftime("%Y-%m-%d %H:%M"),
+		                 "memo": f"「{cur.get('name', '')}」の値を写して作りました（{time.strftime('%Y-%m-%d')}）。"}
+		self.data["params"].setdefault("len_set_of", {})[self._tab_key()] = f"s{k}"
+		self._len_set_changed(f"初期長のセット「{nm}」を作り、このタブ（{self._tab_name()}）で使うようにしました。"
+		                      "スライダーを動かしても、ほかのセットは変わりません。")
+
+	def _len_set_rename(self):
+		from tkinter import simpledialog
+		cur = self._len_set()
+		names = [str(v.get("name", "")) for v in self._len_sets().values()]
+		nm = simpledialog.askstring("初期長のセットの名前を変える", "新しい名前:", initialvalue=str(cur.get("name", "")), parent=self.win)
+		if nm is None or not str(nm).strip() or str(nm).strip() == cur.get("name"):
+			return
+		if str(nm).strip() in names:
+			self._say(f"「{str(nm).strip()}」はもうあります。", "#a06000")
+			return
+		cur["name"] = str(nm).strip()
+		self._save()
+		self._rest_rows()
+
+	def _len_set_delete(self):
+		from tkinter import messagebox
+		sets = self._len_sets()
+		if len(sets) <= 1:
+			self._say("初期長のセットが 1 つしか無いので、削除できません。", "#a06000")
+			return
+		sid = self._len_set_id()
+		nm = sets[sid].get("name", "")
+		tabs, is_def = self._len_set_users(sid)
+		if not messagebox.askyesno("初期長のセットの削除",
+		                           f"初期長のセット「{nm}」を削除しますか？\n使っているタブ（{'、'.join(tabs) or 'なし'}）は既定のセットに戻ります。",
+		                           parent=self.win):
+			return
+		del sets[sid]
+		p = self.data["params"]
+		p["len_set_of"] = {k: v for k, v in (p.get("len_set_of") or {}).items() if v != sid}
+		if p.get("len_set_default") == sid or p.get("len_set_default") not in sets:
+			p["len_set_default"] = next(iter(sets))
+		self._len_set_changed(f"初期長のセット「{nm}」を削除しました。このタブは「{self._len_set().get('name', '')}」を使います。")
+
+	def _rest_set(self, b, pct, lbl):
+		pct = round(float(max(self.REST_PCT_LIMIT[0], min(self.REST_PCT_LIMIT[1], float(pct)))) * 2.0) / 2.0   # 0.5 % 刻み
+		self._len_set_put(b, pct)                             # このタブの初期長のセットに（2026-10-24）
+		try:
+			lbl.config(text=f"{pct:.1f} %")
+		except Exception:
+			pass
+		self._rest_now_update()
+		# 右のグラフ・保存は少し待ってから（動かしている間に何度も描き直さない）
+		job = self.__dict__.get("_rest_job")
+		try:
+			if job is not None and self.win is not None:
+				self.win.after_cancel(job)
+		except Exception:
+			pass
+		try:
+			self._rest_job = self.win.after(250, self._rest_commit) if self.win is not None else None
+		except Exception:
+			self._rest_commit()
+
+	def _rest_commit(self):
+		self._rest_job = None
+		self._save()
+		self._notify()
+		if bool(self.params().get("rest_preview", True)):
+			self._preview_now()
+
+	def _preview_local(self, b, fi):
+		"""このコマだけ計算した形（束 b・表示のコマ fi・いまの初期長のとき）。無ければ None。"""
+		pv = (self.__dict__.get("_preview") or {}).get(b.get("id"))
+		if pv is None or int(pv[0]) != int(fi) or abs(float(pv[2]) - self._rest_pct(b)) > 1e-9:
+			return None
+		return pv[1].astype(float)
+
+	def _sag_to(self, X, L0):
+		"""線維 X (F,K,3)（世界座標・その場で書き換え）が初期長 L0 (F,) より短ければ、足りない分だけ「たるみを下へ」の向きに
+		正弦の形でたわませる（1 コマだけの計算では、伸びない制約は縮めるだけで、たるみを作るきっかけが無いため。2026-10-23）。
+		弦の長さ c・山の高さ A の正弦の長さ ≈ c + π²A²/(4c) → A = (2/π)√(c・足りない長さ)。"""
+		gd = np.asarray(self.params().get("gravity_dir", (0.0, 1.0, 0.0)), dtype=float)
+		gd = gd / max(float(np.linalg.norm(gd)), 1e-9)
+		Fn, K = X.shape[0], X.shape[1]
+		prof = np.sin(np.pi * np.linspace(0.0, 1.0, K))[:, None]
+		Lc = np.linalg.norm(np.diff(X, axis=1), axis=2).sum(axis=1)
+		for f in range(Fn):
+			need = float(L0[f] - Lc[f])
+			if need <= 0.05:
+				continue
+			ch = X[f, -1] - X[f, 0]
+			c = float(np.linalg.norm(ch))
+			if c < 1e-6:
+				continue
+			ch = ch / c
+			d = gd - float(gd @ ch) * ch
+			nd = float(np.linalg.norm(d))
+			if nd < 1e-6:
+				continue
+			A = (2.0 / np.pi) * np.sqrt(max(float(Lc[f]), 1e-6) * need)
+			X[f] += A * prof * (d / nd)
+		return X
+
+	def _preview_now(self):
+		"""いまのコマだけを、いまの初期長で計算して 3D に見せる（前の計算の形から始める・ほかのコマは前の計算のまま。2026-10-23）。
+		返り値: かかった秒数（できなければ None）。"""
+		try:
+			fi = max(0, min(int(self.fi), max(self.n_view - 1, 0)))
+			g = int(self.s0 + fi)
+			bs = [b for b in self.data["bundles"] if self._ready(b) and self.results.get(b.get("id")) is not None]
+			if not bs:
+				self._say("まだ計算した結果がありません。「▶ 計算する」を一度押してください。", "#a06000")
+				return None
+			t0 = time.time()
+			Ts = {int(i): np.asarray(T, dtype=float) for (i, nm, m, T) in self.bones_full}
+			gl = 100.0 * float(self.params().get("rest_scale", 1.0))
+			done = self.__dict__.get("rest_pct_done") or {}
+			rc = self.__dict__.setdefault("_rt_cache", {})
+			rts = []
+			for b in bs:
+				r = self.results[b["id"]]
+				rt = rc.get(b["id"])
+				if rt is None:
+					rt = rc[b["id"]] = self._runtime(b)
+				pct_done = float(done.get(b["id"], gl))
+				Lt = np.asarray(r["L0"], float) / (pct_done / 100.0)          # 基準のコマで張った長さ（前の計算の L0 から）
+				loc = self._preview_local(b, fi)
+				if loc is None or loc.shape != r["local"].shape[1:]:
+					loc = self._local_at(r, fi)
+				Tf = Ts[int(rt["a"])][g]
+				X0 = loc @ Tf[:3, :3].T + Tf[:3, 3]
+				self._sag_to(X0, Lt * self._rest_pct(b) / 100.0)
+				rts.append(dict(rt, rest_scale=self._rest_pct(b) / 100.0, _X0=X0, _Lt=Lt))
+			res = simulate(self.app, self.bones_full, rts, self.s0,
+			               dict(self.params(), rest_frame=self._rest_frame(), only_frames=[g], repeat=self.PREVIEW_REPEAT, skip_center=True,
+			                    **self._adhere_cfg(bs)),
+			               bones=self._ensure_bones())
+			if res is None:
+				return None
+			self._preview = {b["id"]: (fi, np.asarray(r_["local"][0], np.float32), self._rest_pct(b)) for b, r_ in zip(bs, res)}
+			dt = time.time() - t0
+			self.update(self.fi, render=True)
+			self._say(f"このコマ（{fi}）だけ、いまの初期長で計算して見せています（{dt:.1f} 秒）。ほかのコマは前の計算のままです。"
+			          "決まったら「▶ 計算する」で全部のコマを計算してください。", "blue")
+			return dt
+		except Exception as e:
+			traceback.print_exc()
+			self._say(f"このコマだけの計算に失敗しました: {e}", "#a06000")
+			return None
+
+	def _rest_slide(self, b, v, lbl):
+		try:
+			self._rest_set(b, float(v.get()), lbl)
+		except Exception as e:
+			print(f"[靭帯の束] 初期長を変えられません: {e}")
+
+	def _rest_step(self, b, v, lbl, d):
+		v.set(self._rest_pct(b) + d)
+		self._rest_set(b, float(v.get()), lbl)
+		self._rest_release(b)
+
+	def _rest_release(self, b):
+		done = (self.__dict__.get("rest_pct_done") or {}).get(b.get("id"))
+		if done is not None and abs(float(done) - self._rest_pct(b)) < 1e-9 and not self.__dict__.get("rest_stale"):
+			self._say(f"{b.get('name', '')} の初期長 {self._rest_pct(b):.1f} %（3D のたるみもこの値で計算済み）。", "#1b5e20")
+		else:
+			self._say(f"{b.get('name', '')} の初期長を {self._rest_pct(b):.1f} % にしました。張り具合のグラフはもう変わっています。"
+			          "3D の線維のたるみは「▶ 計算する」で反映されます。", "blue")
+
+	def _rest_now_update(self):
+		"""いまのコマの張り具合を、束ごとに書く。"""
+		for _id, (b, _v, _l, now_lbl) in (self.w.get("rest_w") or {}).items():
+			try:
+				g = int(self.s0 + max(0, min(int(self.fi), max(self.n_view - 1, 0))))
+				e = self.strain_at(b, g)
+				if e is None:
+					now_lbl.config(text="いまのコマ: （計算すると出ます）", foreground="gray")
+				else:
+					now_lbl.config(text=f"いまのコマの張り具合 {e:+.1f} %（{'張っている' if e > 0 else 'たるんでいる'}）",
+					               foreground=("#b00000" if e > 0 else "#0b5394"))
+			except Exception:
+				pass
+
+	def _rest_now_poll(self):
+		"""いまのコマの張り具合を、Tk の時計で 0.4 秒ごとに書き直す（VTK のコールバックから Tk に触らない）。"""
+		try:
+			if self.win is None or not self.win.winfo_exists() or self.w.get("rest_box") is None:
+				self._rest_polling = False
+				return
+			if self.__dict__.get("_rest_last_fi") != self.fi:
+				self._rest_last_fi = self.fi
+				self._rest_now_update()
+			self.win.after(400, self._rest_now_poll)
+		except Exception:
+			self._rest_polling = False
+
+	def _crange_label(self):
+		lb = self.w.get("crange_lbl")
+		if lb is None:
+			return
+		kind = str(self.params().get("calc_range", "all"))
+		rng_ = self._calc_frames()
+		times = list(self.scene.get("frame_times") or [])
+		if rng_ is None:
+			lb.config(text=("（区間が見つからないので全部のコマを計算します。datalog を確かめてください）" if kind != "all"
+			                else f"（{self.n_view:,} コマ）"), foreground=("#a06000" if kind != "all" else "gray"))
+			return
+		a, b = rng_[0] - self.s0, rng_[1] - self.s0
+		ta = float(times[a]) if 0 <= a < len(times) else 0.0
+		tb = float(times[b]) if 0 <= b < len(times) else 0.0
+		lb.config(text=(f"（コマ {a:,}〜{b:,}・映像の {ta:.1f}〜{tb:.1f} 秒・前後 {self.CALC_MARGIN_S:g} 秒を含む・全体の "
+		                f"{100.0 * (b - a + 1) / max(self.n_view, 1):.0f} %。区間の外では靭帯を出しません）"), foreground="#0b5394")
+
+	def _crange_set(self):
+		"""計算する範囲を変える。計算済みの結果があれば、すぐそれに切り替える（2026-10-23）。"""
+		self.data.setdefault("params", {})["calc_range"] = str(self.w["crange_var"].get())
+		self._cf_memo = None
+		self._save()
+		self._load_cached_results()
+		self._rebuild_actors()
+		self._notify()
+		self._rows()
+		self._crange_label()
+		self.update(self.fi, render=True)
+		ready = [b for b in self.data["bundles"] if self._ready(b)]
+		if ready and all(self.results.get(b["id"]) is not None for b in ready):
+			self._say("この範囲の計算済みの結果に切り替えました。", "#1b5e20")
+		else:
+			self._say("この範囲はまだ計算していません。「▶ 計算する」を押してください。", "#a06000")
+
 	def _rest_label(self):
 		lb = self.w.get("ref_lbl")
 		if lb is None:
@@ -3078,6 +3885,70 @@ class Stage2:
 		self._invalidate(rows=True)
 		self._rest_label()
 		self._say("自然長の基準を自動（初期状態の終わりの 1 秒前）に戻しました。「▶ 計算する」で計算し直してください。", "blue")
+
+	def _adhere_slide(self):
+		"""癒着の強さ・範囲のスライダー: 表示を変えて、少し止まってから反映（動かしている間に何度も計算しない）。"""
+		try:
+			self.w["adh_gain_lbl"].config(text=f"{float(self.w['adh_gain'].get()):.2f}")
+			self.w["adh_span_lbl"].config(text=f"{float(self.w['adh_span'].get()):.0f} %")
+		except Exception:
+			pass
+		job = self.__dict__.get("_adh_job")
+		try:
+			if job is not None:
+				self.win.after_cancel(job)
+			self._adh_job = self.win.after(400, self._adhere_set)
+		except Exception:
+			self._adhere_set()
+
+	def _adhere_state_label(self):
+		"""いまの 3D がどの計算か（この設定の計算済み／前の計算＋このコマだけ新しい設定）を、癒着の欄の下に書く。"""
+		lb = self.w.get("adh_state")
+		if lb is None:
+			return
+		try:
+			ready = [b for b in self.data["bundles"] if self._ready(b)]
+			if not ready or not all(self.results.get(b["id"]) is not None for b in ready):
+				lb.config(text="いまの設定の計算結果はまだありません。「▶ 計算する」を押してください。", foreground="#a06000")
+			elif self.__dict__.get("rest_stale"):
+				lb.config(text=("いまの設定（初期長・癒着）の計算はまだです。3D は、ほかのコマは前の計算"
+				                + (f"（{self.res_desc}）" if self.__dict__.get("res_desc") else "")
+				                + "のまま、いまのコマだけ新しい設定で見せています。全部のコマに出すには「▶ 計算する」"), foreground="#a06000")
+			else:
+				ad = self._adhere_cfg(ready)
+				lb.config(text=("3D は、いまの設定で全部のコマを計算した結果です（" + (f"癒着あり・強さ {ad['adhere_gain']:g}・範囲 {100 * ad['adhere_span']:.0f} %"
+				                                                              if ad else "癒着なし") + "）。"), foreground="#1b5e20")
+		except Exception:
+			pass
+
+	def _adhere_set(self):
+		"""癒着の設定を変えた → 保存・計算結果を探し直す（無ければ前の結果）・いまのコマだけすぐ計算して見せる。"""
+		self._adh_job = None
+		id_of = {str(b.get("name", "")): b.get("id") for b in self.data.get("bundles", [])}
+		g = round(float(self.w["adh_gain"].get()), 2)
+		sp = round(float(self.w["adh_span"].get()) / 100.0, 2)
+		self.data.setdefault("params", {})["adhere"] = {"on": bool(self.w["adh_on"].get()), "a": id_of.get(self.w["adh_a"].get()),
+		                                               "b": id_of.get(self.w["adh_b"].get()), "gain": g, "span": sp}
+		self._save()
+		self._preview = {}
+		self._load_cached_results()
+		self._rebuild_actors()
+		self._notify()
+		self._rows()
+		self.update(self.fi, render=True)
+		ad = self._adhere()
+		if ad.get("on") and (not ad.get("a") or not ad.get("b") or ad.get("a") == ad.get("b")):
+			self._say("癒着させる 2 つの束を選んでください（同じ束どうしは不可）。", "#a06000")
+			return
+		ready = [b for b in self.data["bundles"] if self._ready(b)]
+		exact = bool(ready) and all(self.results.get(b["id"]) is not None for b in ready) and not self.__dict__.get("rest_stale")
+		if exact:
+			self._say("この設定の計算済みの結果に切り替えました。", "#1b5e20")
+		elif bool(self.params().get("rest_preview", True)) and self.results:
+			self._preview_now()
+		else:
+			self._say("癒着の設定を変えました。「▶ 計算する」で全部のコマを計算してください。", "blue")
+		self._adhere_state_label()
 
 	def _contact_toggle(self):
 		self.data.setdefault("params", {})["bundle_contact"] = bool(self.w["contact_var"].get())
@@ -3475,6 +4346,293 @@ class Stage2:
 		self._mv_refresh_targets()
 		return d
 
+	# ---------------------------------------------------------------- 付着部の楕円を回す（中心はそのまま。2026-10-24）
+	@staticmethod
+	def _rodrigues(n, th):
+		n = np.asarray(n, float)
+		n = n / max(float(np.linalg.norm(n)), 1e-12)
+		K = np.array([[0.0, -n[2], n[1]], [n[2], 0.0, -n[0]], [-n[1], n[0], 0.0]])
+		return np.eye(3) + math.sin(th) * K + (1.0 - math.cos(th)) * (K @ K)
+
+	def rotate_ellipse(self, b, end, deg, save=True):
+		"""束 b の端 end の楕円を、中心のまわりに楕円の面の法線（骨の外向き）を軸に deg 度回す（中心・長径・短径はそのまま）。
+		打った外周の点も回して骨の面へ落とす。返り値: 回した角度（度）か None。"""
+		e = b.get(end) or {}
+		ell = e.get("ellipse")
+		si = self._si_of_name(e.get("bone_name"))
+		if not ell or si is None:
+			return None
+		bones = self._ensure_bones()
+		idx = self.idx_of[si]
+		n = ell_normal(bones, idx, ell)
+		R = self._rodrigues(n, math.radians(float(deg)))
+		key = (id(b), end)
+		und = self.__dict__.setdefault("_mv_undo_store", {})
+		if key not in und:
+			und[key] = json.loads(json.dumps(e))               # 回す前（この画面を開いている間の最初）
+		c = np.asarray(ell["center"], float)
+		ell["u"] = (R @ np.asarray(ell["u"], float)).tolist()
+		ell["v"] = (R @ np.asarray(ell["v"], float)).tolist()
+		if e.get("outline"):
+			O = (np.asarray(e["outline"], float) - c) @ R.T + c
+			e["outline"] = bones.onto(idx, O, n)[0].tolist()
+		self.__dict__.setdefault("_rot_acc", {})[key] = float(self.__dict__.get("_rot_acc", {}).get(key, 0.0)) + float(deg)
+		if save:
+			self._save()
+			self._invalidate()
+			self._mv_refresh_targets()
+		return float(deg)
+
+	def _rot_ring_world(self, b, end):
+		"""回している楕円の、骨の面に落とした輪と中心（世界座標）。"""
+		e = b.get(end) or {}
+		ell = e.get("ellipse")
+		si = self._si_of_name(e.get("bone_name"))
+		bones = self._ensure_bones()
+		idx = self.idx_of[si]
+		n = ell_normal(bones, idx, ell)
+		c = np.asarray(ell["center"], float)
+		u, v = np.asarray(ell["u"], float), np.asarray(ell["v"], float)
+		th = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+		P = c + np.outer(np.cos(th) * float(ell["ra"]), u) + np.outer(np.sin(th) * float(ell["rb"]), v)
+		P = bones.onto(idx, P, n)[0]                           # 骨の面に沿って（平らでない骨の上で）
+		fi = max(0, min(int(self.fi), self.n_view - 1)) if self.n_view else 0
+		T = self.poses[si][fi]
+		return P @ T[:3, :3].T + T[:3, 3], T[:3, :3] @ c + T[:3, 3], T[:3, :3] @ n
+
+	def _rot_draw(self):
+		"""輪と中心の点を描き直す（VTK だけ。Tk は呼ばない）。"""
+		rs = self.__dict__.get("_rot")
+		if not rs or self.plotter is None:
+			return
+		vtk = self._vtk()
+		Pw, cw, _nw = self._rot_ring_world(rs["b"], rs["end"])
+		if rs.get("ring") is None:
+			pd = self._ring_poly(Pw)
+			m = vtk.vtkPolyDataMapper()
+			m.SetInputData(pd)
+			a = vtk.vtkActor()
+			a.SetMapper(m)
+			a.GetProperty().SetColor(1.0, 0.85, 0.0)
+			a.GetProperty().SetLineWidth(5.0)
+			a.GetProperty().SetLighting(False)
+			sp = vtk.vtkSphereSource()
+			sp.SetRadius(0.6)
+			sp.SetThetaResolution(16)
+			sp.SetPhiResolution(16)
+			ms = vtk.vtkPolyDataMapper()
+			ms.SetInputConnection(sp.GetOutputPort())
+			ac = vtk.vtkActor()
+			ac.SetMapper(ms)
+			ac.GetProperty().SetColor(1.0, 0.0, 1.0)
+			self.plotter.renderer.AddActor(a)
+			self.plotter.renderer.AddActor(ac)
+			rs.update(ring=a, ring_pd=pd, cen=ac, cen_src=sp)
+		else:
+			from vtk.util.numpy_support import vtk_to_numpy
+			pts = rs["ring_pd"].GetPoints()
+			vtk_to_numpy(pts.GetData())[:] = Pw
+			pts.Modified()
+			rs["ring_pd"].Modified()
+		rs["cen_src"].SetCenter(*[float(x) for x in cw])
+		rs["cen_src"].Modified()
+		try:
+			self.plotter.render()
+		except Exception:
+			pass
+
+	def _rot_screen(self, Pw):
+		"""世界座標の点 → 画面の座標（表示の座標。y は上向き）。"""
+		ren = self.plotter.renderer
+		ren.SetWorldPoint(float(Pw[0]), float(Pw[1]), float(Pw[2]), 1.0)
+		ren.WorldToDisplay()
+		x, y, _z = ren.GetDisplayPoint()
+		return float(x), float(y)
+
+	def _rot_toggle(self):
+		if self.__dict__.get("_rot"):
+			self._rot_stop()
+			return
+		b, end = self._mv_selected()
+		if b is None:
+			self._say("回す楕円を「動かす楕円」で選んでください。", "#a06000")
+			return
+		if self.plotter is None:
+			return
+		if self.st.get("mode"):
+			self._ol_cancel(quiet=True)
+		key = (id(b), end)
+		und = self.__dict__.setdefault("_mv_undo_store", {})
+		if key not in und:
+			und[key] = json.loads(json.dumps(b[end]))
+		self._rot = {"b": b, "end": end, "drag": None, "dirty": False, "oids": [], "ring": None}
+		try:
+			it = self.plotter.iren.interactor
+			for ev, fn in (("LeftButtonPressEvent", self._rot_press), ("MouseMoveEvent", self._rot_move),
+			               ("LeftButtonReleaseEvent", self._rot_release), ("KeyPressEvent", self._rot_key)):
+				oid = it.AddObserver(ev, fn, 50.0)                # 視点の回転（スタイル）より先に
+				self._rot["oids"].append((ev, oid))
+		except Exception as e:
+			print(f"[靭帯の束] 回す操作の登録に失敗: {e}")
+		self._rot_draw()
+		try:
+			self.w["rot_btn"].config(text="回し終える（Esc）")
+		except Exception:
+			pass
+		self._rot_label()
+		self._rot_poll()
+
+	def _rot_stop(self):
+		rs = self.__dict__.get("_rot")
+		if not rs:
+			return
+		try:
+			it = self.plotter.iren.interactor
+			for _ev, oid in rs["oids"]:
+				it.RemoveObserver(oid)
+		except Exception:
+			pass
+		for k_ in ("ring", "cen"):
+			try:
+				if rs.get(k_) is not None:
+					self.plotter.renderer.RemoveActor(rs[k_])
+			except Exception:
+				pass
+		self._rot = None
+		if rs.get("dirty"):
+			self._rot_commit(rs)
+		try:
+			self.w["rot_btn"].config(text="マウスで回す（中心はそのまま）")
+			self.plotter.render()
+		except Exception:
+			pass
+		self._rot_label(done=True)
+
+	def _rot_oid(self, ev):
+		rs = self.__dict__.get("_rot") or {}
+		return next((oid for e_, oid in rs.get("oids", []) if e_ == ev), None)
+
+	def _rot_press(self, obj, ev):
+		rs = self.__dict__.get("_rot")
+		if not rs:
+			return
+		try:
+			x, y = self._pos(obj)
+			_Pw, cw, nw = self._rot_ring_world(rs["b"], rs["end"])
+			cx, cy = self._rot_screen(cw)
+			dop = np.asarray(self.plotter.camera.GetDirectionOfProjection(), float)
+			rs["drag"] = {"c": (cx, cy), "a": math.atan2(y - cy, x - cx), "sgn": (1.0 if float(nw @ dop) < 0 else -1.0)}
+			oid = self._rot_oid("LeftButtonPressEvent")
+			if oid is not None:
+				self.plotter.iren.interactor.GetCommand(oid).SetAbortFlag(1)   # 視点を回さない
+		except Exception as e:
+			print(f"[靭帯の束] 回し始めに失敗: {e}")
+
+	def _rot_move(self, obj, ev):
+		rs = self.__dict__.get("_rot")
+		if not rs or not rs.get("drag"):
+			return
+		try:
+			x, y = self._pos(obj)
+			dg = rs["drag"]
+			a = math.atan2(y - dg["c"][1], x - dg["c"][0])
+			da = (a - dg["a"] + math.pi) % (2.0 * math.pi) - math.pi
+			if abs(da) < 1e-4:
+				return
+			dg["a"] = a
+			self.rotate_ellipse(rs["b"], rs["end"], math.degrees(da) * dg["sgn"], save=False)
+			rs["dirty"] = True
+			self._rot_draw()
+			oid = self._rot_oid("MouseMoveEvent")
+			if oid is not None:
+				self.plotter.iren.interactor.GetCommand(oid).SetAbortFlag(1)
+		except Exception as e:
+			print(f"[靭帯の束] 回すのに失敗: {e}")
+
+	def _rot_release(self, obj, ev):
+		rs = self.__dict__.get("_rot")
+		if not rs or not rs.get("drag"):
+			return
+		rs["drag"] = None
+		rs["commit"] = True                                  # 保存は Tk の after で
+		oid = self._rot_oid("LeftButtonReleaseEvent")
+		if oid is not None:
+			try:
+				self.plotter.iren.interactor.GetCommand(oid).SetAbortFlag(1)
+			except Exception:
+				pass
+
+	def _rot_key(self, obj, ev):
+		rs = self.__dict__.get("_rot")
+		if not rs:
+			return
+		try:
+			if str(self.plotter.iren.interactor.GetKeySym()) == "Escape":
+				rs["stop"] = True
+		except Exception:
+			pass
+
+	def _rot_poll(self):
+		"""回している間の Tk の時計（保存・知らせ・終わり）。"""
+		rs = self.__dict__.get("_rot")
+		if not rs:
+			return
+		try:
+			if rs.get("stop"):
+				self._rot_stop()
+				return
+			if rs.get("commit"):
+				rs["commit"] = False
+				self._rot_commit(rs)
+			self._rot_label()
+			self.app.after(60, self._rot_poll)
+		except Exception:
+			pass
+
+	def _rot_commit(self, rs):
+		"""回した楕円を保存して、計算の結果を外す（動かすのと同じ）。"""
+		rs["dirty"] = False
+		self._save()
+		self._invalidate()
+		self._mv_refresh_targets()
+		if self.__dict__.get("_rot") is rs:
+			self._rot_draw()                                   # 作り直した後も輪を出したまま
+
+	def _rot_label(self, done=False):
+		lb = self.w.get("rot_lbl")
+		if lb is None:
+			return
+		b, end = self._mv_selected()
+		acc = float((self.__dict__.get("_rot_acc") or {}).get((id(b), end), 0.0)) if b is not None else 0.0
+		try:
+			if self.__dict__.get("_rot"):
+				lb.config(text=f"回しています: 左ドラッグで中心のまわりに（視点は回りません。寄る・動かすはホイール・中ボタン）。"
+				               f"この画面で {acc:+.1f}°。終えるには「回し終える」か Esc", foreground="#0b5394")
+			elif done:
+				lb.config(text=f"回し終えました（この画面で {acc:+.1f}°）。計算の結果は外れたので「▶ 計算する」。戻すには「動かす前に戻す」",
+				          foreground="#1b5e20")
+		except Exception:
+			pass
+
+	def _rot_click(self, sgn):
+		b, end = self._mv_selected()
+		if b is None:
+			self._say("回す楕円を「動かす楕円」で選んでください。", "#a06000")
+			return
+		try:
+			step = float(self.w["rot_step"].get())
+		except ValueError:
+			step = 5.0
+		if self.st.get("mode"):
+			self._ol_cancel(quiet=True)
+		self.rotate_ellipse(b, end, float(sgn) * step)
+		if self.__dict__.get("_rot"):
+			self._rot_draw()
+		acc = float((self.__dict__.get("_rot_acc") or {}).get((id(b), end), 0.0))
+		msg = f"{self.w['mv_target'].get()} を {float(sgn) * step:+g}° 回しました（この画面で {acc:+.1f}°・中心はそのまま）。計算の結果は外れました。"
+		self.w["mv_lbl"].config(text=msg, foreground="#0b5394")
+		self._say(msg, "blue")
+
 	def _mv_click(self, dx, dy):
 		b, end = self._mv_selected()
 		if b is None:
@@ -3503,15 +4661,27 @@ class Stage2:
 			self._say("戻す楕円がありません（この画面で動かした楕円だけ戻せます）。", "#a06000")
 			return
 		b[end] = und.pop((id(b), end))
+		(self.__dict__.get("_rot_acc") or {}).pop((id(b), end), None)
+		rs = self.__dict__.get("_rot")
+		if rs and rs.get("b") is b and rs.get("end") == end:
+			rs["dirty"] = False
+			self._rot_stop()                                   # 回している途中なら終える（戻した形を保存する）
 		self._save()
 		self._invalidate()
 		self._mv_refresh_targets()
 		self.w["mv_lbl"].config(text=f"{self.w['mv_target'].get()} を動かす前に戻しました。", foreground="#1b5e20")
 
+	FOOT_SIDE = {"foot_fem": "大腿骨", "foot_tib": "脛骨"}   # 表示「付着部の楕円だけ（○○側のみ）」（2026-10-25）
+
 	def _outline_on(self):
-		"""付着部の楕円を出すか（「付着部の楕円」のチェック、または表示が「付着部の楕円だけ」）。"""
+		"""付着部の楕円を出すか（「付着部の楕円」のチェック、または表示が「付着部の楕円だけ」（○○側のみも））。"""
 		pp = self.params()
-		return bool(pp.get("show_outline", True)) or str(pp.get("view", "both")) == "foot"
+		return bool(pp.get("show_outline", True)) or str(pp.get("view", "both")) in ("foot", "foot_fem", "foot_tib")
+
+	def _end_side_ok(self, e):
+		"""表示が「付着部の楕円だけ（○○側のみ）」のとき、この端（付着部）の楕円を出すか。それ以外の表示では出す。"""
+		side = self.FOOT_SIDE.get(str(self.params().get("view", "both")))
+		return side is None or side in str((e or {}).get("bone_name", ""))
 
 	def _lig_opacity(self):
 		try:
@@ -3542,7 +4712,7 @@ class Stage2:
 			for end in ("a", "b"):
 				act = a.get(f"e{end}_act")
 				if act is not None:
-					act.SetVisibility(bool(b.get("visible", True)) and show_ol and not self._drawing(b, end))
+					act.SetVisibility(bool(b.get("visible", True)) and show_ol and not self._drawing(b, end) and self._end_side_ok(b.get(end)))
 
 	def _preview_ring(self, si, pts):
 		"""打った点に当てはめた楕円を、決めたあとと同じく骨の面へ落とした輪（モデル座標）。できなければ平らな楕円。"""

@@ -8,6 +8,9 @@ __pycache__/
 frs2015_gui_state.json
 frs2015_gui_state_knee.json
 frs2015_gui_state_knee_sim.json
+# 2026-11-11: ankle と精度検証の状態も PC ごと（共同研究者の git pull で各自のタブが置き換わらないように）
+frs2015_gui_state_ankle_sim.json
+frs2015_gui_state_aruco_verify.json
 .DS_Store
 .vscode/
 *.test_cache/

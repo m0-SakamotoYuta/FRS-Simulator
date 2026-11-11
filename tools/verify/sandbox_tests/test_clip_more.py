@@ -38,7 +38,8 @@ app.ankle_dilate_mm.set(0.15); app.ankle_cp_ha.set(2.8); app.ankle_cp_h.set(1.6)
 app.ankle_po_force_on.set(True); app.ankle_po_contact_on.set(True); app.ankle_start_at_load.set(False)
 app.ankle_clip_size.set(400); app.ankle_clip_sec.set(2.0); app.ankle_clip_kind.set("anterior")
 app.ankle_clip_hold.set(0.0); app.ankle_clip_text_on.set(True); app.ankle_clip_nums.set(False); app.ankle_clip_nums_fs.set("60,48")
-app.ankle_clip_chart.set(True); app.ankle_clip_lig_on.set(True)
+app.ankle_po_force_fs.set(60); app.ankle_po_contact_fs.set(48)       # 数字の動画もこの大きさ（2026-10-22 から 1 つ）
+app.ankle_clip_chart.set(True); app.ankle_clip_lig_on.set(True); app.ankle_clip_heat_on.set(False); app.ankle_clip_bar_on.set(False)
 app.on_ankle_animate(); pump(app, 2.0)
 v = app._sim_viewers_alive()[-1]; p = v["plotter"]; ctrl = v["ctrl"]
 cf = [w for w in walk(ctrl["window"]) if w.winfo_class() == "TLabelframe" and "発表用の動画" in str(w.cget("text"))][0]
@@ -76,6 +77,26 @@ cbl.invoke(); pump(app, 0.3)
 check(sum(1 for lg in ligs if lg["actor"].GetVisibility()) == 0 and app.ankle_clip_lig_on.get() is False, "外すと正方形の靭帯が消える・覚える")
 cbl.invoke(); pump(app, 0.3)
 check(sum(1 for lg in ligs if lg["actor"].GetVisibility()) == n_lig0, "また付けると靭帯が戻る")
+# ヒートマップも映す（既定オフ）
+bone_acts = [a_ for k_, a_ in p.renderer.actors.items() if str(k_).startswith("bone_") and a_.GetVisibility()]
+def heat_vis():
+	sv = any(a_.GetMapper().GetScalarVisibility() for a_ in bone_acts)
+	props = p.renderer.GetViewProps(); props.InitTraversal(); bar = False
+	for _ in range(props.GetNumberOfItems()):
+		a_ = props.GetNextProp()
+		if type(a_).__name__ == "vtkScalarBarActor" and a_.GetVisibility(): bar = True
+	return sv, bar
+cbh = [w for w in walk(cf) if w.winfo_class() == "TCheckbutton" and "ヒートマップも映す" in str(w.cget("text"))]
+check(len(cbh) == 1 and heat_vis() == (False, False) and app.ankle_clip_heat_on.get() is False, f"「ヒートマップも映す」（既定オフ＝骨の色・色の帯なし: {heat_vis()}）")
+cbb = [w for w in walk(cf) if w.winfo_class() == "TCheckbutton" and "ヒートマップバー" in str(w.cget("text"))]
+check(len(cbb) == 1 and app.ankle_clip_bar_on.get() is False, "「ヒートマップバー（色の帯）も映す」は別のチェック（既定オフ）")
+cbh[0].invoke(); pump(app, 0.3)
+check(heat_vis() == (True, False) and app.ankle_clip_heat_on.get() is True, f"「ヒートマップも映す」だけ付けると骨の色だけ・色の帯は出ない（{heat_vis()}）・覚える")
+cbb[0].invoke(); pump(app, 0.3)
+check(heat_vis() == (True, True) and app.ankle_clip_bar_on.get() is True, f"「ヒートマップバー」も付けると色の帯も出る（{heat_vis()}）・覚える")
+cbh[0].invoke(); pump(app, 0.3)
+check(heat_vis() == (False, True), f"ヒートマップだけ外すと、骨の色は消えて色の帯は残る（{heat_vis()}）")
+cbh[0].invoke(); pump(app, 0.3)
 # ② その場で再生（保存しない）
 t0p = time.time()
 btn["② その場で再生して確かめる"].invoke()
@@ -86,6 +107,9 @@ while time.time() - t0p < 60:
 elp = time.time() - t0p
 check(bool(m_) and "90 / 90 コマ" in m_[0] and elp >= 2.5, f"② その場で再生: 90 コマを {elp:.1f} 秒で流した（書き出す動画は 3.0 秒）・{m_[0][:50] if m_ else '-'}")
 check(not any(f.endswith(".mp4") for f in os.listdir(HERE)), "② では何も保存しない")
+check(heat_vis() == (True, True), f"② で再生したあともヒートマップのまま（{heat_vis()}）")
+cbh[0].invoke(); pump(app, 0.3); cbb[0].invoke(); pump(app, 0.3)
+check(heat_vis() == (False, False) and app.ankle_clip_bar_on.get() is False, "両方外すとまた骨の色だけに")
 btn["区間の終わりへ"].invoke(); pump(app, 0.3)
 n_on = text_vis()
 cb_text = [w for w in walk(cf) if w.winfo_class() == "TCheckbutton" and "右上の文字を3Dの動画に入れる" in str(w.cget("text"))]
@@ -106,15 +130,56 @@ def colors(img):
 	k = ((img.max(axis=2) < 60)).sum()
 	return int(r), int(gr), int(k)
 r0, g0c, k0 = colors(g0["frame"](0)); r1, g1c, k1 = colors(g0["frame"](g0["n"] - 1))
-check(g0c > 50 and g0c > r0, f"最初のコマは緑の文字（初期状態）: 緑 {g0c}・赤 {r0}")
+check(r0 > 50 and g0c == 0, f"最初のコマも赤の文字（前方引張中：0 N。緑の初期状態はやめた）: 赤 {r0}・緑 {g0c}")
+# 配置（2026-10-22）: 段階の行と接触圧の行を左右の中央でそろえる・桁が変わっても段階の文字の左端と数字の右端が動かない
+def red_black_x(img):
+	r_ = (img[:, :, 0] > 150) & (img[:, :, 1] < 80)
+	k_ = img.max(axis=2) < 60
+	xr, xk = np.where(r_.any(axis=0))[0], np.where(k_.any(axis=0))[0]
+	return ((int(xr[0]), int(xr[-1])) if len(xr) else None), ((int(xk[0]), int(xk[-1])) if len(xk) else None)
+ext = [red_black_x(g0["frame"](k)) for k in range(g0["n"])]
+lefts = {e[0][0] for e in ext if e[0]}; rights = {e[0][1] for e in ext if e[0]}
+check(len(lefts) == 1 and len(rights) == 1, f"全部のコマで「前方引張中：」の左端と数字の右端が同じ（左端 {sorted(lefts)}・右端 {sorted(rights)}）")
+ce = [abs(0.5 * sum(e[0]) - 0.5 * sum(e[1])) for e in ext if e[0] and e[1]]
+check(ce and max(ce) <= 0.02 * W0, f"段階の行と接触圧の行の中心がそろう（ずれ 最大 {max(ce) if ce else -1:.1f} px・幅 {W0}）")
 check(r1 > 50 and r1 > g1c and k1 > 30, f"最後のコマは赤の文字（前方引張中：+200 N）と黒の接触圧: 赤 {r1}・黒 {k1}")
 img_white = g0["frame"](0)
 check(float((img_white.min(axis=2) > 245).mean()) > 0.6, "白地")
-for sb_, val in zip([w for w in walk(cf) if w.winfo_class() == "TSpinbox" and str(w.cget("textvariable")) in [str(x) for x in pv_["clip_nums_fs"]]], ("90", "60")):
-	sb_.set(val)
-	sb_.event_generate("<FocusOut>"); pump(app, 0.4)
+def set_po_fs(vf, vc):
+	"""「発表用の表示」の文字の大きさ（段階・接触圧）を欄から変える（数字の動画も同じ大きさを使う）。"""
+	for key, val in (("force_fs", vf), ("contact_fs", vc)):
+		sb_ = [w for w in walk(ctrl["window"]) if w.winfo_class() == "TSpinbox" and str(w.cget("textvariable")) == str(pv_[key])][0]
+		sb_.set(str(val))
+		sb_.event_generate("<FocusOut>"); pump(app, 0.4)
+nl = [str(w.cget("text")) for w in walk(cf) if w.winfo_class() == "TLabel" and "文字は「発表用の表示」の大きさ" in str(w.cget("text"))]
+check(len(nl) == 1 and "段階と力 60・接触圧 48 px" in nl[0], f"数字の動画の文字は「発表用の表示」の大きさ（別の欄は無い）: {nl[0] if nl else '-'}")
+check(not [w for w in walk(cf) if w.winfo_class() == "TSpinbox" and str(w.cget("textvariable")) in [str(x) for x in pv_["clip_nums_fs"]]], "数字の動画だけの文字の大きさの欄は無くした")
+set_po_fs(50, 50)
+nl = [str(w.cget("text")) for w in walk(cf) if w.winfo_class() == "TLabel" and "文字は「発表用の表示」の大きさ" in str(w.cget("text"))]
+check(nl and "段階と力 50・接触圧 50 px" in nl[0], f"「発表用の表示」を 50・50 にすると、数字の動画の欄の表示も 50・50（{nl[0] if nl else '-'}）")
+gq = nw.g; imq = gq["frame"](gq["n"] - 1)
+def ink_h(m_):
+	ys = np.where(m_.any(axis=1))[0]
+	return int(ys[-1] - ys[0] + 1) if len(ys) else 0
+hr_ = ink_h((imq[:, :, 0] > 150) & (imq[:, :, 1] < 80)); hk_ = ink_h(imq.max(axis=2) < 60)
+check(hr_ > 20 and abs(hr_ - hk_) <= 3, f"数字の動画のプレビュー: 50・50 なら段階の行と接触圧の行の文字の高さが同じ（赤 {hr_} px・黒 {hk_} px）")
+# ユーザーの手順そのもの: 「数字の動画だけ書き出す…」で書いた mp4 も同じ高さ
+_od = os.path.join(HERE, "動画の試し50"); shutil.rmtree(_od, ignore_errors=True); os.makedirs(_od)
+import tkinter.filedialog as _fd50
+_p50 = os.path.join(_od, "数字だけ50.mp4")
+_fd50.asksaveasfilename = lambda *a, **k: _p50
+[w for w in walk(cf) if w.winfo_class() == "TButton" and "数字の動画だけ書き出す" in str(w.cget("text"))][0].invoke(); pump(app, 0.5)
+_cap = cv2.VideoCapture(_p50); _n50 = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)); _cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, _n50 - 1))
+_ok, _fr = _cap.read(); _cap.release()
+if _ok:
+	_fr = cv2.cvtColor(_fr, cv2.COLOR_BGR2RGB)
+	hr2 = ink_h((_fr[:, :, 0] > 150) & (_fr[:, :, 1] < 80)); hk2 = ink_h(_fr.max(axis=2) < 60)
+check(_ok and hr2 > 20 and abs(hr2 - hk2) <= 3 and abs(hr2 - hr_) <= 2,
+      f"「数字の動画だけ書き出す…」の mp4 も 50・50 で 2 行の文字の高さが同じ（赤 {hr2 if _ok else -1} px・黒 {hk2 if _ok else -1} px）")
+shutil.rmtree(_od, ignore_errors=True)
+set_po_fs(72, 60)
 g1 = nw.g
-check(g1["size"][1] > H0 * 1.3 and app.ankle_clip_nums_fs.get() == "90,60", f"文字を大きくすると開いている窓も描き直す（{g0['size']} → {g1['size']}）・覚える（{app.ankle_clip_nums_fs.get()}）")
+check(g1["size"][1] > H0 * 1.2 and int(app.ankle_po_force_fs.get()) == 72, f"「発表用の表示」の文字を大きくすると、開いている数字のプレビューも描き直す（{g0['size']} → {g1['size']}）")
 # ---- 書き出す（3D・グラフ・数字の 3 つ）
 outdir = os.path.join(HERE, "動画の試し2"); shutil.rmtree(outdir, ignore_errors=True); os.makedirs(outdir)
 import tkinter.filedialog as fd
@@ -176,6 +241,6 @@ try: nw.destroy()
 except Exception: pass
 shutil.rmtree(outdir, ignore_errors=True)
 w_ = ctrl["window"]; w_.tk.call(w_.protocol("WM_DELETE_WINDOW")); pump(app, 0.4)
-app.ankle_clip_size.set(900); app.ankle_clip_sec.set(10.0); app.ankle_clip_hold.set(0.0); app.ankle_clip_nums.set(False); app.ankle_clip_nums_fs.set("60,48")
+app.ankle_clip_heat_on.set(False); app.ankle_clip_bar_on.set(False); app.ankle_clip_size.set(900); app.ankle_clip_sec.set(10.0); app.ankle_clip_hold.set(0.0); app.ankle_clip_nums.set(False); app.ankle_clip_nums_fs.set("60,48")
 print(f"合計: NG {len(fails)} 件", flush=True)
 sys.stdout.flush(); os._exit(0)
