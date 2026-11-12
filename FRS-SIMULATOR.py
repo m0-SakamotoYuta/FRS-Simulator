@@ -5684,6 +5684,8 @@ class MainMenuGUI(_BaseWindow):
 				need, low = False, None
 			if (cache.get("read_info") or {}).get("incomplete"):
 				return f"途中まで {n}枚（推定 {(cache.get('read_info') or {}).get('expected')}）", "#c62828"
+			if need and low is None:
+				return f"済み {n}枚・向きの裏返りあり（④やり直し）", "#b35900"
 			if need:
 				return f"済み {n}枚・拾い直し前（最低 {low:.0f}%）", "#b35900"
 			# 拾い直したコマがある結果は、ひと目で分かるように書き足す（2026-11-11。精度がわずかに下がるため）
@@ -5747,7 +5749,8 @@ class MainMenuGUI(_BaseWindow):
 					_src = str(sn.get("ankle_depth", "") or sn.get("ankle_video", "") or "")
 					_c = self._ankle_pose_cache.get(str(tab.get("name", ""))) or {}
 					_e = self._ankle_depth_size_get(str(_c.get("source", "") or _src)) or {}
-					sn["ankle_marker_size_mm"] = (round(float(_e["all"]["median"]), 2) if _e.get("all") else v)
+					_ok = _e.get("all") and self._ankle_depth_size_plausible(_e["all"]["median"], v)
+					sn["ankle_marker_size_mm"] = (round(float(_e["all"]["median"]), 2) if _ok else v)
 				except Exception:
 					sn["ankle_marker_size_mm"] = v
 			if tab is self._ankle_active_tab_dict():
@@ -5876,7 +5879,7 @@ class MainMenuGUI(_BaseWindow):
 			if not any(r["chk"].get() for r in rows):
 				messagebox.showinfo("まとめて解析",
 				                    "表示中のタブに、拾い直しの前の④で検出率が 99% 未満のタブ"
-			                    "（または録画の途中までしか読めていないタブ）はありません。", parent=win)
+			                    "（または録画の途中までしか読めていないタブ・マーカーの向きの裏返りがあるタブ）はありません。", parent=win)
 				return
 			do_detect_var.set(True)
 			do_contact_var.set(True)
@@ -5982,7 +5985,7 @@ class MainMenuGUI(_BaseWindow):
 				n_low = sum(1 for t in done_tabs
 				            if self._ankle_cache_needs_rescue(self._ankle_pose_cache.get(str(t.get("name", ""))))[0])
 				if n_low:
-					_why = (f"そのうち {n_low} タブは「拾い直し前」で検出率が低いか、録画の途中までしか読めていないタブです。"
+					_why = (f"そのうち {n_low} タブは「拾い直し前」で検出率が低いか、録画の途中までしか読めていないか、マーカーの向きの裏返りがあるタブです。"
 					        "④をやり直すと、見つからなかったコマを拾い直せます → 「はい」を選んでください。\n"
 					        + ("接触も、④をやり直したタブは計算し直します。\n" if do_con else
 					           "⚠ 接触の計算にもチェックを入れないと、シミュレーションの表示は古い接触のままです。\n"))
@@ -10183,7 +10186,9 @@ class MainMenuGUI(_BaseWindow):
 
 	# ④の検出の版。2 = 見つからない ID の拾い直しあり（2026-11-06）。
 	# 1（キーなし）は拾い直し前。接触の指紋にも入れて、④をやり直したら接触も「要計算」にする。
-	_ANKLE_DETECT_VERSION = 2
+	# 3 = IPPE の解を「深度の傾きの形」と前のコマの向きで選ぶ（2026-11-12。大きさが合わないと向きが裏返っていた）。
+	_ANKLE_DETECT_VERSION = 3
+	_ANKLE_FLIP_REDO_MIN = 10        # 向きの裏返りがこの回数以上なら④のやり直しを勧める
 
 	def _ankle_rescue_missing(self, gray, corners, ids, target_ids, detector, dictionary, params, use_new_api):
 		"""④の検出器（CORNER_REFINE_APRILTAG）で見つからなかった ID を拾い直す。→ (corners, ids, 拾い直したIDの集合)
@@ -10292,13 +10297,102 @@ class MainMenuGUI(_BaseWindow):
 			return r
 		return None
 
+	def _ankle_pick_ippe_solution(self, mid, rvecs, tvecs, reproj, num_sols, img_pts, obj_pts,
+	                              depth_arr, depth_scale_mm):
+		"""IPPE の 2 つの解（マーカーの傾きが裏返った 2 通り）から 1 つを選ぶ。→ (番号, 深度の形の残差 mm)
+
+		【2026-11-12 の不具合】以前は「4 隅の 1 画素の深度」と「解の深度」の差の RMS で選んでいた。
+		④に入れたマーカーの大きさが実物と違うと（例: 実物 15mm を 20mm で計算）、PnP の距離が全体に
+		ずれて両方の解が同じくらい外れ、選び方がでたらめになって、マーカーの傾きがコマごとに裏返った
+		（2935 PLF loading200N の 600 コマで ID0 72 回・ID4 255 回、50〜70° の跳び → 骨が大きく跳ねる）。
+		【今】角から 30% 内側の点で 5x5 の中央値の深度を読み、4 点の平均を引いた「傾きの形」どうしで比べる
+		（大きさがずれても傾きの向きは変わらない）。差がはっきりしないときは、前のコマの向きに近い方。
+		"""
+		import cv2
+		import numpy as np
+		H, W = depth_arr.shape[:2]
+		c_img = img_pts.mean(axis=0)
+		in_img = c_img + 0.7 * (img_pts - c_img)
+		in_obj = 0.7 * np.asarray(obj_pts, dtype=np.float64)
+		obs = np.full(len(in_img), np.nan)
+		for k, (u, v) in enumerate(in_img):
+			u, v = int(round(u)), int(round(v))
+			if 2 <= u < W - 2 and 2 <= v < H - 2:
+				patch = depth_arr[v - 2:v + 3, u - 2:u + 3].astype(np.float64).ravel()
+				patch = patch[patch > 0]
+				if patch.size >= 5:
+					obs[k] = float(np.median(patch)) * depth_scale_mm
+		ok = ~np.isnan(obs)
+		Rs, shape = [], []
+		for si in range(num_sols):
+			R_mat, _ = cv2.Rodrigues(rvecs[si])
+			Rs.append(R_mat)
+			tv = np.asarray(tvecs[si], dtype=np.float64).flatten()
+			pred = ((R_mat @ in_obj.T).T + tv)[:, 2]
+			if ok.sum() >= 3:
+				dp = pred[ok] - pred[ok].mean()
+				do = obs[ok] - obs[ok].mean()
+				shape.append(float(np.sqrt(np.mean((dp - do) ** 2))))
+			else:
+				shape.append(None)
+
+		def _rep(si):
+			try:
+				return float(reproj[si].item())
+			except Exception:
+				return float(reproj[si])
+		prev = getattr(self, "_ankle_prev_pose", None)
+		if prev is None:
+			prev = self._ankle_prev_pose = {}
+		sc = getattr(self, "_ankle_pick_calls", None)
+		if sc is None:
+			sc = self._ankle_pick_calls = {}
+		sc[int(mid)] = sc.get(int(mid), 0) + 1
+		p = prev.get(int(mid))
+		R_prev = p[1] if (p is not None and sc[int(mid)] - p[0] <= 15) else None
+
+		dis = getattr(self, "_ankle_pick_disagree", None)
+		if dis is None:
+			dis = self._ankle_pick_disagree = {}
+		if num_sols < 2:
+			best = 0
+		else:
+			s = [x for x in shape if x is not None]
+			clear = (len(s) == num_sols and max(s) > 0
+			         and min(s) < 0.6 * max(s) and max(s) - min(s) > 0.15)
+			by_depth = int(np.argmin(shape)) if len(s) == num_sols else None
+			if R_prev is not None:
+				# 前のコマに近い方を基本にする。深度がはっきり逆を指すコマが 3 つ続いたときだけ切り替える
+				# （1 コマだけの深度の乱れで裏返らないように。実例: 2935 の 477 コマ目、1 か所だけ 4mm ずれた深度）
+				by_cont = int(np.argmin([np.linalg.norm(R - R_prev) for R in Rs]))
+				if clear and by_depth != by_cont:
+					dis[int(mid)] = dis.get(int(mid), 0) + 1
+					if dis[int(mid)] >= 3:
+						best = by_depth
+						dis[int(mid)] = 0
+					else:
+						best = by_cont
+				else:
+					best = by_cont
+					dis[int(mid)] = 0
+			elif by_depth is not None:
+				best = by_depth
+			else:
+				best = int(np.argmin([_rep(si) for si in range(num_sols)]))
+		prev[int(mid)] = (sc[int(mid)], Rs[best])
+		return best, (shape[best] if shape[best] is not None else _rep(best))
+
 	def _ankle_cache_needs_rescue(self, cache) -> tuple:
 		"""(④をやり直すとよいか, いちばん低い検出率%)。一度も見つからない ID（録画に無い）は数えない。
-		やり直すとよい = 拾い直し前で検出率が 99% 未満の ID がある、または録画の途中までしか読めていない。"""
+		やり直すとよい = 拾い直し前で検出率が 99% 未満の ID がある、録画の途中までしか読めていない、
+		または向きの選び方を直す前（版 3 未満）で向きの裏返りが 10 回以上ある。"""
 		import numpy as np
 		if not cache:
 			return False, None
 		if (cache.get("read_info") or {}).get("incomplete"):
+			return True, None
+		if (int(cache.get("detect_version", 1) or 1) < 3
+		        and sum(self._ankle_count_pose_flips(cache).values()) >= self._ANKLE_FLIP_REDO_MIN):
 			return True, None
 		rates = []
 		for _aid, b in (cache.get("bones", {}) or {}).items():
@@ -10309,7 +10403,7 @@ class MainMenuGUI(_BaseWindow):
 			if d.any():
 				rates.append(100.0 * float(d.sum()) / len(d))
 		low = min(rates) if rates else None
-		old = int(cache.get("detect_version", 1) or 1) < self._ANKLE_DETECT_VERSION
+		old = int(cache.get("detect_version", 1) or 1) < 2      # 拾い直し（版 2）より前
 		return bool(old and low is not None and low < 99.0), low
 
 	def _ankle_detect_markers_in_frame(self, gray, depth_arr, K, dist,
@@ -10354,33 +10448,8 @@ class MainMenuGUI(_BaseWindow):
 				if not ok:
 					continue
 				rvecs = [rvec]; tvecs = [tvec]; reproj = np.zeros((1, 1), dtype=np.float32); num_sols = 1
-			# 深度で表裏を選ぶ
-			best_idx = 0
-			best_score = float("inf")
-			for si in range(num_sols):
-				R_mat, _ = cv2.Rodrigues(rvecs[si])
-				tv = np.asarray(tvecs[si], dtype=np.float64).flatten()
-				corners_cam = (R_mat @ obj_pts.T).T + tv   # (4,3) mm
-				pred_depth = corners_cam[:, 2]              # mm
-				observed = []
-				H, W = depth_arr.shape[:2]
-				for pt in img_pts:
-					u, v = int(round(pt[0])), int(round(pt[1]))
-					if 0 <= u < W and 0 <= v < H:
-						d_raw = float(depth_arr[v, u])
-						if d_raw > 0:
-							observed.append(d_raw * depth_scale_mm)
-							continue
-					observed.append(np.nan)
-				observed = np.array(observed)
-				mask = ~np.isnan(observed)
-				if mask.sum() >= 2:
-					score = float(np.sqrt(np.mean((pred_depth[mask] - observed[mask]) ** 2)))
-				else:
-					score = float(reproj[si].item()) if hasattr(reproj[si], 'item') else float(reproj[si])
-				if score < best_score:
-					best_score = score
-					best_idx = si
+			best_idx, best_score = self._ankle_pick_ippe_solution(
+				mid, rvecs, tvecs, reproj, num_sols, img_pts, obj_pts, depth_arr, depth_scale_mm)
 			R_mat, _ = cv2.Rodrigues(rvecs[best_idx])
 			tv = np.asarray(tvecs[best_idx], dtype=np.float64).flatten()
 			T = np.eye(4)
@@ -10622,6 +10691,9 @@ class MainMenuGUI(_BaseWindow):
 
 		align = rs.align(rs.stream.color)
 
+		self._ankle_prev_pose = {}       # IPPE の解を前のコマの向きで選ぶための記録（録画ごとに消す）
+		self._ankle_pick_calls = {}
+		self._ankle_pick_disagree = {}
 		poses = {aid: [] for aid in target_ids}
 		detected = {aid: [] for aid in target_ids}
 		reproj = {aid: [] for aid in target_ids}
@@ -10871,6 +10943,9 @@ class MainMenuGUI(_BaseWindow):
 			raise ValueError(f"npzに 'frames' キーがありません: {depth_path}")
 		depth_frames = depth_npz["frames"]
 
+		self._ankle_prev_pose = {}       # IPPE の解を前のコマの向きで選ぶための記録（録画ごとに消す）
+		self._ankle_pick_calls = {}
+		self._ankle_pick_disagree = {}
 		poses = {aid: [] for aid in target_ids}
 		detected = {aid: [] for aid in target_ids}
 		reproj = {aid: [] for aid in target_ids}
@@ -13762,6 +13837,27 @@ class MainMenuGUI(_BaseWindow):
 		except Exception:
 			self._ankle_size_refresh_job = None
 
+	_ANKLE_DEPTH_SIZE_TOL = 0.10     # 深度の推定を「自動」に使うのは、ノギスとの差がこの割合以内のときだけ
+
+	def _ankle_depth_size_plausible(self, est_mm, true_mm) -> bool:
+		"""深度で推定したマーカーの大きさが、ノギスの値に近いか（2026-11-12）。
+
+		「自動」は深度の推定をそのまま使っていたので、推定がおかしいと（深度の倍率の誤り・
+		平面が当たらない など）、④と可視化の大きさがそのままずれた。大きさが k 倍ずれると
+		骨の位置も k 倍になり、IPPE の解の選び方も狂って骨が跳ぶ。
+		実例: ふだんの推定はノギスと 1〜3% の差（15.0 → 14.76）。差が 10% を超えるなら推定の方を疑う。
+		"""
+		import math
+		try:
+			e, t = float(est_mm), float(true_mm)
+		except Exception:
+			return True
+		if not (math.isfinite(e) and math.isfinite(t)):
+			return True            # 値が無い（nan）ときは比べない
+		if not (e > 0 and t > 0):
+			return e > 0
+		return abs(e / t - 1.0) <= self._ANKLE_DEPTH_SIZE_TOL
+
 	def _ankle_size_refresh_auto(self) -> None:
 		"""補正後の値を決め直し、メモを更新する。
 
@@ -13777,8 +13873,13 @@ class MainMenuGUI(_BaseWindow):
 		except Exception:
 			est = None
 		true_mm = self._ankle_marker_true_mm()
-		auto_val = round(float(est["median"]), 2) if est else round(float(true_mm), 3)
-		if est:
+		bad_est = bool(est) and not self._ankle_depth_size_plausible(est["median"], true_mm)
+		auto_val = round(float(est["median"]), 2) if (est and not bad_est) else round(float(true_mm), 3)
+		if bad_est:
+			est_txt = (f"⚠ 深度の推定 {est['median']:.2f} mm がノギス {float(true_mm):g} mm と "
+			           f"{int(self._ANKLE_DEPTH_SIZE_TOL * 100)}% 以上違うので使いません → ノギスと同じ"
+			           "（ノギスの値・印刷の大きさを確かめてください）")
+		elif est:
 			est_txt = f"深度の推定 {est['median']:.2f} mm（25〜75% {est['p25']:.2f}〜{est['p75']:.2f}, {est['n']}回）"
 		else:
 			est_txt = "深度の推定なし（④を実行するか「深度から推定…」で測れます）→ 実寸と同じ"
@@ -13800,10 +13901,19 @@ class MainMenuGUI(_BaseWindow):
 				_basis = str(self.ankle_marker_size_basis.get() or "").strip()
 			except Exception:
 				_basis = ""
+			_warn = ""
+			try:
+				_cur = float(self.ankle_marker_size_mm.get())
+				if not self._ankle_depth_size_plausible(_cur, true_mm):
+					_warn = (f"⚠ 補正後 {_cur:g} mm がノギス {float(true_mm):g} mm と "
+					         f"{int(self._ANKLE_DEPTH_SIZE_TOL * 100)}% 以上違います。入力の誤りでないか確かめてください ／ ")
+			except Exception:
+				_warn = ""
 			if _basis:
-				self.ankle_marker_size_note.set(f"{_basis}（このタブだけの自動なら {auto_val:g} mm）")
+				self.ankle_marker_size_note.set(f"{_warn}{_basis}（このタブだけの自動なら {auto_val:g} mm）")
 			else:
-				self.ankle_marker_size_note.set(f"手動（自動なら {auto_val:g} mm" + ("・深度の推定" if est else "・実寸と同じ") + "）")
+				self.ankle_marker_size_note.set(f"{_warn}手動（自動なら {auto_val:g} mm"
+				                                + ("・深度の推定" if (est and not bad_est) else "・実寸と同じ") + "）")
 			try:
 				self._ankle_size_auto_btn.pack(side=tk.LEFT, padx=(8, 0))
 			except Exception:
@@ -13865,8 +13975,10 @@ class MainMenuGUI(_BaseWindow):
 				true_mm = None
 		if auto:
 			est = self._ankle_tab_depth_estimate(tab)
-			if est:
+			if est and self._ankle_depth_size_plausible(est, true_mm):
 				return round(float(est), 2), "自動", "深度の推定"
+			if est:
+				return (float(true_mm) if true_mm else None), "自動", f"推定 {float(est):.2f} は外れ→ノギス"
 			return (float(true_mm) if true_mm else None), "自動", "推定なし→ノギス"
 		try:
 			val = float(self.ankle_marker_size_mm.get()) if active else float(sn.get("ankle_marker_size_mm"))
@@ -14137,6 +14249,45 @@ class MainMenuGUI(_BaseWindow):
 			return 1.0, old, cur
 		return cur / old, old, cur
 
+	def _ankle_count_pose_flips(self, cache) -> dict:
+		"""保存してある④の結果で、マーカーの向きが隣のコマと 20° を超えて跳んだ回数。→ {ID: 回数}（無ければ {}）
+
+		2026-11-12: 大きさの合わない④では IPPE の逆の解が混じり、骨が跳ねた（2935 PLF loading200N を 20mm で
+		計算: ID0 298 回・ID4 391 回）。保存済みの結果を「なめらかにそろえて」直す方法も試したが、ID2・ID4 は
+		ほとんどのコマが逆の解だったため、多数派の逆の向きにそろってしまった（深度の面の向きと 20〜72° 違う）。
+		録画が無いと正しい側は決められないので、直さずに数えて知らせ、④のやり直しを勧める。
+		ふつうの動きは 1 コマ 1° 未満（30 fps）。3 コマ以内に並んだ検出どうしだけを比べる。
+		"""
+		import numpy as np
+		if not cache:
+			return {}
+		memo = getattr(self, "_ankle_flip_memo", None)
+		if memo is None:
+			memo = self._ankle_flip_memo = {}
+		if len(memo) > 64:
+			memo.clear()
+		key = id(cache)
+		if key in memo and memo[key][0] is cache:
+			return memo[key][1]
+		out = {}
+		for aid, b in (cache.get("bones") or {}).items():
+			try:
+				P = np.asarray(b["poses"], dtype=float)
+				D = np.asarray(b["detected"], dtype=bool)
+				idx = np.where(D & np.isfinite(P[:, 0, 0]))[0]
+				if idx.size < 2:
+					continue
+				Rs = P[idx, :3, :3]
+				tr = np.einsum("nij,nij->n", Rs[:-1], Rs[1:])
+				jump = np.degrees(np.arccos(np.clip((tr - 1.0) / 2.0, -1.0, 1.0)))
+				n = int(np.sum((jump > 20.0) & ((idx[1:] - idx[:-1]) <= 3)))
+				if n:
+					out[int(aid)] = n
+			except Exception:
+				continue
+		memo[key] = (cache, out)
+		return out
+
 	def _ankle_cache_for_current_size(self, cache):
 		"""④の結果を、いまの②の実寸に合わせた写しにして返す（保存してある④の結果は変えない）。
 
@@ -14186,6 +14337,12 @@ class MainMenuGUI(_BaseWindow):
 				_a = _est["all"]
 				lines.append(f"  深度による実寸の推定: {_a['median']:.2f} mm（{_a['p25']:.2f}〜{_a['p75']:.2f}, {_a['n']}回）"
 				             f" → ②の「深度から推定…」で入れられます")
+				# 2026-11-12: ④の大きさが実物と違うと、IPPE の解の選び方が狂って骨が跳び、位置も同じ倍率でずれる
+				_used = float(cache.get("marker_size_mm", 0.0) or 0.0)
+				if _used > 0 and not self._ankle_depth_size_plausible(_a["median"], _used):
+					lines.append(f"  ⚠ ④で使ったマーカーの大きさ {_used:g} mm と、深度で測った大きさ {_a['median']:.2f} mm が "
+					             f"{int(self._ANKLE_DEPTH_SIZE_TOL * 100)}% 以上違います。②のノギスの値と印刷の大きさを確かめて、"
+					             "④をやり直してください（大きさが違うと骨が跳んだり、骨どうしが離れて見えます）")
 		except Exception:
 			pass
 		for aid, b in sorted(bones.items()):
@@ -14204,12 +14361,22 @@ class MainMenuGUI(_BaseWindow):
 			_rs = f"（うち拾い直し {_nr}枚）" if _nr else ""
 			lines.append(f"  ID={aid}: 検出率 {rate:.1f}%{_rs}{re_med}")
 		try:
+			_nf = self._ankle_count_pose_flips(cache)
+			if sum(_nf.values()) >= self._ANKLE_FLIP_REDO_MIN:
+				_v = int(cache.get("detect_version", 1) or 1)
+				lines.append("  ⚠ マーカーの向きが裏返って跳んでいるコマがあります（"
+				             + "、".join(f"ID={k}: {v}回" for k, v in sorted(_nf.items())) + "）。骨が跳ねる原因です。"
+				             + ("④をやり直すと直ります（2026-11-12 の版で向きの選び方を直しました）。" if _v < 3 else "")
+				             + "②のマーカーの大きさがノギスの値と合っているかも確かめてください")
+		except Exception:
+			pass
+		try:
 			_ri = cache.get("read_info") or {}
 			_need, _low = self._ankle_cache_needs_rescue(cache)
 			if _ri.get("incomplete"):
 				lines.append(f"  ⚠ 録画の途中までしか読めていません（{_ri.get('read')} / 推定 {_ri.get('expected')} 枚・"
 				             f"{_ri.get('end_reason', '')}）。④をもう一度実行してください")
-			elif _need:
+			elif _need and _low is not None:
 				lines.append(f"  ※ 拾い直しの機能より前の結果です（いちばん低い検出率 {_low:.1f}%）。"
 				             "④をやり直すと、見つからなかったコマを拾い直せます（まとめて解析の「検出率の低いタブだけ」）")
 		except Exception:
