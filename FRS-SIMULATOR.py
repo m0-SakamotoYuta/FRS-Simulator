@@ -3963,6 +3963,21 @@ class MainMenuGUI(_BaseWindow):
 		ttk.Checkbutton(_pr0, text="可視化に表示する（点・線・左上の数値・右下のグラフ）", variable=self.ankle_pairs_show
 		                ).pack(side="left")
 		ttk.Button(_pr0, text="＋ 2点を追加…", command=self._ankle_pair_add).pack(side="left", padx=(12, 0))
+		# 2026-11-17: datalog（前方変位など）と並べたグラフ。datalog が入っているタブだけで使える
+		self._ankle_log_pair_btn = ttk.Button(_pr0, text="datalog と並べたグラフ…", command=self._ankle_open_log_pair_chart)
+		self._ankle_log_pair_btn.pack(side="left", padx=(8, 0))
+
+		def _log_pair_btn_state(*_):
+			try:
+				p_ = str(self.ankle_robot_log_path.get() or "").strip()
+				self._ankle_log_pair_btn.configure(state=("normal" if (p_ and Path(p_).exists()) else "disabled"))
+			except Exception:
+				pass
+		try:
+			self.ankle_robot_log_path.trace_add("write", _log_pair_btn_state)
+		except Exception:
+			pass
+		_log_pair_btn_state()
 		self._ankle_pairs_frame = ttk.Frame(prs)
 		self._ankle_pairs_frame.pack(fill="x", padx=6)
 		ttk.Label(prs, text='※ 2点はできるだけ近くに置いてください（それぞれ関節面の近くで、割れ目をはさんで向かい合う所）。距離は、2点を結ぶ向きの動きにはそのまま反応しますが、それに垂直な横ずれにはほとんど反応しません（例: 2点が 10 mm 離れていると、0.5 mm の横ずれでも距離は 0.01 mm しか変わりません。2点が近いほど、どの向きのずれも距離の変化に出ます）。', foreground="gray", font=(self.ui_font_family, 8), wraplength=740,
@@ -12511,6 +12526,456 @@ class MainMenuGUI(_BaseWindow):
 			print(f"[靭帯の長さを比べる] datalog を使えません: {e}")
 			log, off = None, None
 		return {"times": ft, "lengths": lengths, "colors": colors, "log": log, "offset": off, "wrapped": bool(wrap_bones is not None)}
+
+	# ---- datalog と 2点の距離を並べたグラフ（2026-11-17） ----
+	def _ankle_log_pair_series(self):
+		"""いま開いているタブの、2点の距離（各コマ）と datalog（コマの時刻に合わせたもの）。
+
+		返り値: {"times": 映像の秒（最初のコマ 0）, "pairs": [{"name", "color", "dist"}],
+		         "log": {項目: 各コマの値}, "log_raw": datalog, "offset": ずれ（秒・ロボット＝映像−ずれ）}
+		姿勢の平滑化・datalog の時刻合わせは、可視化・靭帯の長さを比べる画面と同じ（_ankle_lig_lengths_current_tab）。
+		datalog の値にも、骨の姿勢と同じ平滑化（Butterworth 4 次・filtfilt・同じカットオフ）をかける
+		（かけないと、平滑化で前後に広がった距離の変化と時間の形がそろわない。2026-10-26 の前方変位の横軸と同じ理由）。
+		"""
+		import numpy as np
+		cache = self._ankle_cache_for_current_size(self._ankle_get_current_cache())
+		if not cache:
+			raise RuntimeError("④の結果（姿勢時系列）がありません。先に④を実行してください。")
+		anim, N, _w = self._ankle_build_bone_transforms(cache)
+		if not anim:
+			raise RuntimeError("骨の姿勢が作れません（キャリブ・モデルを確かめてください）")
+		ts = np.asarray(cache.get("timestamps", np.arange(N) / 30.0), dtype=float)[:N]
+		ft = ts - ts[0]
+		bones_data = [(i, str(self.ankle_bones[i].get("name", "")), m, np.asarray(Ts, dtype=float)) for (i, m, Ts) in anim]
+		smooth_on = False
+		fps = None
+		try:
+			if bool(self.ankle_smooth_enable.get()) and N >= 20:
+				fps = self._ankle_fps_of(ft)
+				det = {}
+				cb = cache.get("bones", {}) or {}
+				for (i, nm, m, Ts) in bones_data:
+					aid = int(self.ankle_bones[i].get("aruco_id", -1))
+					if aid in cb:
+						dd = np.asarray(cb[aid].get("detected"), dtype=bool)
+						if len(dd) == len(Ts):
+							det[i] = dd
+				try:
+					rej = bool(self.ankle_reject_outliers.get())
+				except Exception:
+					rej = True
+				bones_data, _st = self._ankle_smooth_pose_series(
+					bones_data, cutoff_hz=float(self.ankle_smooth_cutoff_hz.get()), frame_rate_hz=fps,
+					detected_map=det, reject_outliers=rej)
+				smooth_on = True
+		except Exception as e:
+			print(f"[datalog と 2点の距離] 平滑化に失敗（生の姿勢で計算）: {e}")
+		Ts_of = {i: np.asarray(Ts, dtype=float) for (i, nm, m, Ts) in bones_data}
+		name_of = {i: nm for (i, nm, m, Ts) in bones_data}
+		mesh_of = {i: m for (i, nm, m, Ts) in bones_data}
+		pairs = []
+		for ia, pr in self._ankle_pairs_all():
+			ib = next((i for i in Ts_of if name_of[i] == str(pr.get("bone_b", ""))), None)
+			if ia not in Ts_of or ib is None:
+				print(f"[datalog と 2点の距離] {pr.get('name', '')}: この録画では骨が出ないので使いません")
+				continue
+			_bb = next((x for x in self.ankle_bones if str(x.get("name", "")) == str(pr.get("bone_b", ""))), {})
+			qa = self._ankle_scan_point(self.ankle_bones[ia], pr["point_a"], to_scaled=True)
+			qb = self._ankle_scan_point(_bb, pr["point_b"], to_scaled=True)
+			Ta, Tb = Ts_of[ia], Ts_of[ib]
+			n = min(len(Ta), len(Tb), len(ft))
+			pa = np.einsum("nij,j->ni", Ta[:n, :3, :3], qa) + Ta[:n, :3, 3]
+			pb = np.einsum("nij,j->ni", Tb[:n, :3, :3], qb) + Tb[:n, :3, 3]
+			bname = str(self.ankle_bones[ia].get("name", ""))
+			item = {"name": str(pr.get("name") or (bname + "–" + str(pr.get("bone_b", "")))),
+			        "color": str(pr.get("color", "#d62728")), "dist": np.linalg.norm(pb - pa, axis=1)}
+			# 割れ面の座標系（2026-11-17）: 骨 A に固定した座標で、骨 B の点 B がどう動いたか。
+			# 2点の距離は 2 点を結ぶ向きのずれにしか一次で反応しない（垂直な横ずれ δ は約 δ²/2L）ので、
+			# 点 B の動きをベクトルのまま持ち、割れ面に垂直（開き）・沿った向き（ずれ）に分ける。
+			try:
+				rel = np.einsum("nij,njk->nik", np.linalg.inv(Ta[:n]), Tb[:n])          # 骨 A から見た骨 B
+				pbA = np.einsum("nij,j->ni", rel[:, :3, :3], qb) + rel[:, :3, 3]        # 骨 A の座標での点 B
+				V = np.asarray(getattr(mesh_of.get(ia), "points", np.zeros((0, 3))), dtype=float)
+				nrm, fit = self._ankle_fracture_normal(V, np.asarray(qa, float), pbA[0])
+				item.update({"pbA": pbA, "relR": rel[:, :3, :3], "normal": nrm, "fit": fit})
+			except Exception as e:
+				print(f"[datalog と 2点の距離] {item['name']}: 割れ面の向きを求められません（{e}）")
+			pairs.append(item)
+		# datalog と時刻のずれ（可視化と同じ）
+		path = str(self.ankle_robot_log_path.get() or "").strip()
+		if not path or not Path(path).exists():
+			raise RuntimeError("このタブに datalog が入っていません（②の「ロボットの datalog」で入れてください）。")
+		log = self._ankle_robot_log_load(path)
+		off = float(self.ankle_robot_log_offset_s.get())
+		if bool(self.ankle_robot_log_auto.get()):
+			fx = next((i for i in Ts_of if self.ankle_bones[i].get("fixed")), None)
+			want = str(self.ankle_disp_bone.get() or "")
+			cand = [i for i in Ts_of if i != fx]
+			mi = next((i for i in cand if name_of[i] == want), None)
+			if mi is None and cand:
+				mi = next((i for i in cand if "脛骨" in name_of[i]), cand[0])
+			if fx is not None and mi is not None:
+				rel = np.einsum("nij,njk->nik", np.linalg.inv(Ts_of[fx]), Ts_of[mi])
+				off, _rms = self._ankle_robot_log_sync(log, rel, list(ft))
+		tr = np.asarray(log["t"], dtype=float)
+		tx = ft - off                      # 各コマのロボットの時刻
+		inside = (tx >= tr[0]) & (tx <= tr[-1])
+		vals = {}
+		for key, _lab in self._ANKLE_LOG_ITEMS:
+			y = log["cols"].get(key)
+			if y is None:
+				continue
+			y = np.asarray(y, dtype=float)
+			ok = np.isfinite(y)
+			if ok.sum() < 2:
+				continue
+			v = np.interp(tx, tr[ok], y[ok])
+			if smooth_on and fps and len(v) >= 20:
+				try:
+					from scipy.signal import butter, filtfilt
+					wn = float(np.clip(float(self.ankle_smooth_cutoff_hz.get()) / max(fps / 2.0, 1e-6), 1e-3, 0.99))
+					b_, a_ = butter(N=4, Wn=wn, btype="low")
+					v = filtfilt(b_, a_, v, padtype="odd", padlen=min(len(v) - 1, 3 * max(len(a_), len(b_))))
+				except Exception as e:
+					print(f"[datalog と 2点の距離] {key} の平滑化に失敗（生のまま）: {e}")
+			v = np.where(inside, v, np.nan)
+			vals[key] = v
+		return {"times": ft, "pairs": pairs, "log": vals, "log_raw": log, "offset": float(off)}
+
+	@staticmethod
+	def _ankle_fracture_normal(V, qa, toward):
+		"""点 A のまわりの骨 A の表面に平面を当てはめた法線（割れ面の向き）。→ (単位ベクトル, {"rms", "n", "r", "angle"})
+
+		V: 骨 A のモデルの頂点（骨 A の座標）。半径 3 → 4 → 6 → 8 mm と広げ、30 点以上あれば主成分分析で平面を当てはめる。
+		向きは点 B（toward、骨 A の座標）のある側を ＋（＝開く向き）。点 A と点 B がほぼ重なっているときは、
+		骨 A の中心から点 A へ向かう側（骨の外向き）を ＋ にする。
+		rms = 平面からの点のずれ（平らさ）、angle = 法線と「点 A → 点 B」の向きの角度（°、点が離れているときだけ）。
+		"""
+		import numpy as np
+		V = np.asarray(V, dtype=float)
+		qa = np.asarray(qa, dtype=float)
+		if V.ndim != 2 or len(V) < 30:
+			raise ValueError("骨 A のモデルの点が足りません")
+		d = np.linalg.norm(V - qa, axis=1)
+		P, r_used = None, None
+		for r in (3.0, 4.0, 6.0, 8.0):
+			sel = V[d <= r]
+			if len(sel) >= 30:
+				P, r_used = sel, r
+				break
+		if P is None:
+			P, r_used = V[np.argsort(d)[:30]], float(np.sort(d)[29])
+		c = P.mean(axis=0)
+		_u, s, vt = np.linalg.svd(P - c, full_matrices=False)
+		nrm = vt[2] / np.linalg.norm(vt[2])
+		rms = float(np.sqrt(np.mean(((P - c) @ nrm) ** 2)))
+		v = np.asarray(toward, dtype=float) - qa
+		ang = None
+		if np.linalg.norm(v) > 0.3:
+			if float(v @ nrm) < 0:
+				nrm = -nrm
+			ang = float(np.degrees(np.arccos(np.clip(abs(v @ nrm) / np.linalg.norm(v), -1.0, 1.0))))
+		elif float((qa - V.mean(axis=0)) @ nrm) < 0:
+			nrm = -nrm
+		return nrm, {"rms": rms, "n": int(len(P)), "r": float(r_used), "angle": ang}
+
+	@staticmethod
+	def _ankle_log_ranges(times, log_vals) -> dict:
+		"""区間（コマの番号の範囲 [a, b]）: 全体・前方引張（行き）・後方引張（行き）・軸力から。求められないものは入れない。
+
+		前方引張（行き）= Fap の最大の山の手前で Fap が 2 N 以下だった最後のコマ 〜 最大の 5 N 以内に初めて届いたコマ。
+		後方引張（行き）= 同じく最小の谷。軸力から = Fpd が 99% 点の 97% に初めて届いたコマ〜最後（99% 点が 20 N 以上のとき。
+		可視化の「軸力から始める」と同じ目安）。"""
+		import numpy as np
+		n = len(times)
+		out = {"all": (0, n - 1)}
+		fap = log_vals.get("Fap")
+		if fap is not None and np.isfinite(fap).sum() > 10:
+			f = np.where(np.isfinite(fap), fap, 0.0)
+			k = int(np.argmax(f))
+			if f[k] > 10.0:
+				pre = np.where(f[:k + 1] <= 2.0)[0]
+				a = int(pre[-1]) if len(pre) else 0
+				hit = np.where(f[a:k + 1] >= f[k] - 5.0)[0]
+				b = a + int(hit[0]) if len(hit) else k
+				if b > a:
+					out["anterior"] = (a, b)
+			k = int(np.argmin(f))
+			if f[k] < -10.0:
+				pre = np.where(f[:k + 1] >= -2.0)[0]
+				a = int(pre[-1]) if len(pre) else 0
+				hit = np.where(f[a:k + 1] <= f[k] + 5.0)[0]
+				b = a + int(hit[0]) if len(hit) else k
+				if b > a:
+					out["posterior"] = (a, b)
+		fpd = log_vals.get("Fpd")
+		if fpd is not None and np.isfinite(fpd).sum() > 10:
+			top = float(np.nanpercentile(fpd, 99))
+			if top >= 20.0:
+				hit = np.where(np.nan_to_num(fpd, nan=-1e9) >= 0.97 * top)[0]
+				if len(hit) and int(hit[0]) < n - 2:
+					out["load"] = (int(hit[0]), n - 1)
+		return out
+
+	_ANKLE_LOG_RANGE_NAMES = {"all": "全体", "anterior": "前方引張（行き）", "posterior": "後方引張（行き）",
+	                          "load": "軸力から（可視化の「軸力から始める」と同じ）"}
+
+	def _ankle_open_log_pair_chart(self) -> None:
+		"""datalog の項目と 2点の距離を、横軸・縦軸に選んで描く画面（赤い縦線で、そのときの値を読む）。"""
+		import numpy as np
+		from matplotlib.figure import Figure
+		from matplotlib.font_manager import FontProperties
+		from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+		title = "datalog と 2点の距離のグラフ"
+		path = str(self.ankle_robot_log_path.get() or "").strip()
+		if not path or not Path(path).exists():
+			messagebox.showinfo(title, "このタブに datalog が入っていないので使えません。\n"
+			                    "②の「ロボットの datalog」に datalog（.KKR / .csv）を入れてから使ってください。", parent=self)
+			return
+		try:
+			self.config(cursor="watch"); self.update_idletasks()
+			S = self._ankle_log_pair_series()
+		except Exception as e:
+			messagebox.showwarning(title, f"グラフに使う値を作れません:\n{e}", parent=self)
+			return
+		finally:
+			try:
+				self.config(cursor="")
+			except Exception:
+				pass
+		ft = S["times"]
+		n = len(ft)
+		# 選べる量: (表示名, 単位, 各コマの値, 種類)。2点の距離は区間の始めを 0 にした変化
+		units = {"FE": "deg", "VV": "deg", "IE": "deg", "ML": "mm", "AP": "mm", "PD": "mm",
+		         "Fml": "N", "Fap": "N", "Fpd": "N", "Mfe": "N·m", "Mvv": "N·m", "Mie": "N·m"}
+		Q = [("映像の時刻", "s", np.asarray(ft, float), "time")]
+		for key, lab in self._ANKLE_LOG_ITEMS:
+			if key in S["log"]:
+				Q.append((f"ロボット {key}", units.get(key, ""), S["log"][key], "log"))
+		for k, p in enumerate(S["pairs"]):
+			Q.append((f"2点 #{k + 1} {p['name']} の距離の変化", "mm", p["dist"], "pair"))
+			if p.get("pbA") is not None:
+				# 割れ面の座標系（2026-11-17）: 区間の始めからの点 B の動き（骨 A の座標）を割れ面の法線で分ける
+				def _mk(p=p):
+					pbA, n_, R_ = p["pbA"], p["normal"], p["relR"]
+
+					def _d(idx):
+						return pbA[idx] - pbA[idx[0]]
+
+					def _open(idx):
+						return _d(idx) @ n_
+
+					def _slide(idx):
+						d_ = _d(idx)
+						return np.linalg.norm(d_ - np.outer(d_ @ n_, n_), axis=1)
+
+					def _total(idx):
+						return np.linalg.norm(_d(idx), axis=1)
+
+					def _rot(idx):
+						Rr = np.einsum("nij,kj->nik", R_[idx], R_[idx[0]])        # R(t)·R(始め)ᵀ
+						tr = np.einsum("nii->n", Rr)
+						return np.degrees(np.arccos(np.clip((tr - 1.0) / 2.0, -1.0, 1.0)))
+					return _open, _slide, _total, _rot
+				f_open, f_slide, f_total, f_rot = _mk()
+				Q.append((f"2点 #{k + 1} 開き（割れ面に垂直・＋＝開いた）", "mm", f_open, "fn"))
+				Q.append((f"2点 #{k + 1} ずれ（割れ面に沿った動きの大きさ）", "mm", f_slide, "fn"))
+				Q.append((f"2点 #{k + 1} 点Bの動きの大きさ（向きによらない）", "mm", f_total, "fn"))
+				Q.append((f"2点 #{k + 1} 回転の大きさ（骨Bの骨Aに対する）", "deg", f_rot, "fn"))
+		names = [q[0] for q in Q]
+		ranges = self._ankle_log_ranges(ft, S["log"])
+		rkeys = [k for k in ("all", "anterior", "posterior", "load") if k in ranges]
+
+		win = tk.Toplevel(self)
+		win.title(f"{title}（{str((self._ankle_active_tab_dict() or {}).get('name', ''))}）")
+		win.transient(self)
+		win.geometry(f"1100x760+{self.winfo_rootx() + 60}+{self.winfo_rooty() + 40}")
+		top = ttk.Frame(win)
+		top.pack(side="top", fill="x", padx=10, pady=(8, 2))
+		x_def = next((q[0] for q in Q if q[0] == "ロボット AP"), names[0])
+		y_def = next((q[0] for q in Q if q[3] == "pair"), next((q[0] for q in Q if q[0] == "ロボット Fap"), names[-1]))
+		x_var = tk.StringVar(win, value=x_def)
+		y_var = tk.StringVar(win, value=y_def)
+		r_var = tk.StringVar(win, value=self._ANKLE_LOG_RANGE_NAMES["anterior" if "anterior" in ranges else "all"])
+		rel_var = tk.BooleanVar(win, value=True)
+		ttk.Label(top, text="横軸:").grid(row=0, column=0, sticky="w")
+		ttk.Combobox(top, textvariable=x_var, values=names, state="readonly", width=34).grid(row=0, column=1, sticky="w", padx=(2, 12))
+		ttk.Label(top, text="縦軸:").grid(row=0, column=2, sticky="w")
+		ttk.Combobox(top, textvariable=y_var, values=names, state="readonly", width=40).grid(row=0, column=3, sticky="w", padx=(2, 12))
+		ttk.Label(top, text="区間:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+		ttk.Combobox(top, textvariable=r_var, values=[self._ANKLE_LOG_RANGE_NAMES[k] for k in rkeys], state="readonly",
+		             width=34).grid(row=1, column=1, sticky="w", padx=(2, 12), pady=(4, 0))
+		ttk.Checkbutton(top, text="datalog の変位・角度（mm・deg）も区間の始めを 0 にする（力・モーメントはそのまま）",
+		                variable=rel_var).grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
+		btns = ttk.Frame(top)
+		btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+		note = ("※ 2点の距離の変化は、区間の始めのコマを 0 にしています（+ = 離れた）。datalog は可視化と同じ時刻合わせ"
+		        f"（ロボット = 映像 − {S['offset']:.2f} 秒）と同じ平滑化をかけています。"
+		        "　赤い縦線: グラフをクリック・ドラッグ、または ← → キー（1 コマずつ）で動かします。")
+		if not S["pairs"]:
+			note = "※ 2点の組がまだありません（⑤の「＋ 2点を追加…」で置くと、縦軸に選べます）。" + note
+		_fits = []
+		for k, p in enumerate(S["pairs"]):
+			f_ = p.get("fit")
+			if f_:
+				a_ = f"・法線と点A→点Bの向きの角度 {f_['angle']:.0f}°" if f_.get("angle") is not None else ""
+				w_ = "（⚠ 平らでない。点Aを割れ面の平らな所に置き直すとよい）" if f_["rms"] > 0.5 else ""
+				_fits.append(f"#{k + 1}: 半径 {f_['r']:g} mm・{f_['n']} 点・平らさ {f_['rms']:.2f} mm{a_}{w_}")
+		if _fits:
+			note += ("\n※ 割れ面の向き = 点A のまわりの骨A の表面に当てはめた平面の法線（点B の側が ＋）。"
+			         "開き・ずれ・点Bの動きの大きさは、骨A に固定した座標で見た点B の、区間の始めからの動きです　"
+			         + "　".join(_fits))
+		ttk.Label(win, text=note, foreground="gray", font=(self.ui_font_family, 8), wraplength=1060,
+		          justify="left").pack(side="top", fill="x", padx=10)
+		info = tk.StringVar(win, value="")
+		ttk.Label(win, textvariable=info, font=(self.ui_font_family, 11, "bold"), foreground="#b71c1c").pack(
+			side="bottom", fill="x", padx=10, pady=(2, 8))
+		fig = Figure(figsize=(9, 5.6), dpi=100)
+		ax = fig.add_subplot(111)
+		fp = FontProperties(family=["Meiryo", "Yu Gothic", "MS Gothic", "sans-serif"])
+		canvas = FigureCanvasTkAgg(fig, master=win)
+		canvas.get_tk_widget().pack(side="top", fill="both", expand=True, padx=10, pady=4)
+		st = {"k": None, "a": 0, "b": n - 1, "x": None, "y": None, "line": None, "dot": None, "txt": None, "drag": False}
+
+		def _q(nm):
+			return Q[names.index(nm)]
+
+		def _cur():
+			rk = next((k for k in rkeys if self._ANKLE_LOG_RANGE_NAMES[k] == r_var.get()), "all")
+			a, b = ranges[rk]
+			qx, qy = _q(x_var.get()), _q(y_var.get())
+			idx = np.arange(a, b + 1)
+
+			def _vals(q):
+				if q[3] == "fn":
+					return np.asarray(q[2](idx), float)
+				v = np.asarray(q[2], float)[idx]
+				if q[3] in ("pair", "time"):
+					v = v - v[0]
+				elif q[3] == "log" and q[1] in ("mm", "deg") and bool(rel_var.get()):
+					fin = np.where(np.isfinite(v))[0]
+					if len(fin):
+						v = v - v[fin[0]]
+				return v
+			return a, b, idx, qx, qy, _vals(qx), _vals(qy)
+
+		def _lab(q):
+			base = f"{q[0]} [{q[1]}]" if q[1] else q[0]
+			if q[3] == "log" and q[1] in ("mm", "deg") and bool(rel_var.get()):
+				base += "（区間の始めから）"
+			return base
+
+		def redraw(*_):
+			a, b, idx, qx, qy, x, y = _cur()
+			st.update(a=a, b=b, idx=idx, x=x, y=y)
+			ax.clear()
+			ok = np.isfinite(x) & np.isfinite(y)
+			col = "#1f77b4"
+			if qy[3] in ("pair", "fn"):
+				col = S["pairs"][int(qy[0].split("#")[1].split()[0]) - 1]["color"]
+			ax.plot(x[ok], y[ok], "-", color=col, lw=1.6)
+			ax.set_xlabel(_lab(qx), fontproperties=fp)
+			ax.set_ylabel(_lab(qy), fontproperties=fp)
+			ax.set_title(f"{qy[0]} ／ {qx[0]}（{r_var.get()}）", fontproperties=fp, fontsize=10)
+			ax.grid(True, alpha=0.3)
+			if qy[3] in ("pair", "fn"):
+				ax.axhline(0.0, color="#888888", lw=0.8)
+			st["line"] = ax.axvline(np.nan, color="red", lw=1.5)
+			st["dot"], = ax.plot([np.nan], [np.nan], "o", color="red", ms=7, zorder=5)
+			st["txt"] = ax.text(0.02, 0.96, "", transform=ax.transAxes, va="top", ha="left", color="#b71c1c",
+			                    fontproperties=fp, fontsize=10,
+			                    bbox=dict(boxstyle="round", fc="white", ec="#e57373", alpha=0.9))
+			k0 = st["k"] if (st["k"] is not None and a <= st["k"] <= b and np.isfinite(x[st["k"] - a])) else None
+			if k0 is None:
+				fin = np.where(ok)[0]
+				k0 = a + (int(fin[-1]) if len(fin) else 0)
+			_set(k0)
+
+		def _set(k):
+			a, b = st["a"], st["b"]
+			k = int(np.clip(k, a, b))
+			st["k"] = k
+			x, y = st["x"], st["y"]
+			xv, yv = float(x[k - a]), float(y[k - a])
+			qx, qy = _q(x_var.get()), _q(y_var.get())
+			try:
+				st["line"].set_xdata([xv, xv])
+				st["dot"].set_data([xv], [yv])
+			except Exception:
+				pass
+			s = (f"{qx[0]} = {xv:+.3f} {qx[1]}\n{qy[0]} = {yv:+.3f} {qy[1]}\n"
+			     f"映像 {float(ft[k]):.2f} 秒（コマ {k}）")
+			st["txt"].set_text(s)
+			info.set(f"赤い線: {qx[0]} = {xv:+.3f} {qx[1]}　／　{qy[0]} = {yv:+.3f} {qy[1]}　／　映像 {float(ft[k]):.2f} 秒（コマ {k}）")
+			canvas.draw_idle()
+
+		def _pick(xm):
+			"""マウスの横の位置 → いちばん近いコマ。同じくらい近いコマが複数あれば、いまのコマに時刻が近い方。"""
+			x = st["x"]
+			ok = np.isfinite(x) & np.isfinite(st["y"])
+			if not ok.any() or xm is None:
+				return
+			d = np.where(ok, np.abs(x - xm), np.inf)
+			span = float(np.nanmax(x[ok]) - np.nanmin(x[ok])) or 1.0
+			near = np.where(d <= d.min() + 0.004 * span)[0]
+			cur = (st["k"] or st["a"]) - st["a"]
+			j = int(near[np.argmin(np.abs(near - cur))])
+			_set(st["a"] + j)
+
+		def _press(ev):
+			if ev.inaxes is ax and ev.button == 1:
+				st["drag"] = True
+				_pick(ev.xdata)
+
+		def _motion(ev):
+			if st["drag"] and ev.inaxes is ax:
+				_pick(ev.xdata)
+
+		def _release(_ev):
+			st["drag"] = False
+		canvas.mpl_connect("button_press_event", _press)
+		canvas.mpl_connect("motion_notify_event", _motion)
+		canvas.mpl_connect("button_release_event", _release)
+
+		def _key(ev):
+			# ← → で 1 コマずつ（matplotlib のキーの受け取り。グラフをクリックすると焦点が入る）
+			if ev.key == "left":
+				_set((st["k"] or 0) - 1)
+			elif ev.key == "right":
+				_set((st["k"] or 0) + 1)
+		canvas.mpl_connect("key_press_event", _key)
+		try:
+			win.after(200, canvas.get_tk_widget().focus_set)
+		except Exception:
+			pass
+
+		def _save_png():
+			p = filedialog.asksaveasfilename(parent=win, title="グラフの画像を保存", defaultextension=".png",
+			                                 filetypes=[("PNG", "*.png")], initialfile="datalog_2点の距離.png")
+			if p:
+				fig.savefig(p, dpi=200, bbox_inches="tight")
+				print(f"[datalog と 2点の距離] 画像を保存: {p}")
+
+		def _save_csv():
+			p = filedialog.asksaveasfilename(parent=win, title="CSV を保存", defaultextension=".csv",
+			                                 filetypes=[("CSV", "*.csv")], initialfile="datalog_2点の距離.csv")
+			if not p:
+				return
+			a, b, idx, qx, qy, x, y = _cur()
+			import csv
+			with open(p, "w", newline="", encoding="utf-8-sig") as f:
+				w = csv.writer(f)
+				w.writerow(["コマ", "映像の時刻 [s]", _lab(qx), _lab(qy)])
+				for j, k in enumerate(idx):
+					w.writerow([int(k), f"{float(ft[k]):.4f}", f"{float(x[j]):.5f}", f"{float(y[j]):.5f}"])
+			print(f"[datalog と 2点の距離] CSV を保存: {p}")
+		ttk.Button(btns, text="画像（PNG）を保存…", command=_save_png).pack(side="left", padx=(0, 6))
+		ttk.Button(btns, text="CSV を保存…", command=_save_csv).pack(side="left")
+		for v in (x_var, y_var, r_var, rel_var):
+			v.trace_add("write", redraw)
+		win._log_pair_state = {"S": S, "Q": Q, "st": st, "x_var": x_var, "y_var": y_var, "r_var": r_var, "rel_var": rel_var,
+		                       "ranges": ranges, "pick": _pick, "set": _set, "fig": fig, "ax": ax, "info": info}
+		redraw()
 
 	def _ankle_open_lig_compare(self) -> None:
 		"""靭帯の長さを、タブ（試験）どうしで重ねて比べる画面。"""
