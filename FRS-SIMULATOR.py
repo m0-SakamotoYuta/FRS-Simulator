@@ -3956,7 +3956,7 @@ class MainMenuGUI(_BaseWindow):
 		self._ankle_grid_fix_lbl.grid(row=2, column=0, columnspan=10, sticky="w", pady=(2, 0))
 
 		# 2点の距離の変化（2026-10-14）
-		prs = ttk.LabelFrame(grd, text="2点の距離の変化（例: 脛骨の点A と 骨片の点B。最初のコマを 0 として、距離がどれだけ変わったか）")
+		prs = ttk.LabelFrame(grd, text="2点（例: 脛骨の点A と 骨片の点B。脛骨から見て、点B が最初のコマの位置からどれだけ動いたか＝点B の移動距離）")
 		prs.grid(row=3, column=0, columnspan=10, sticky="we", pady=(6, 0))
 		_pr0 = ttk.Frame(prs)
 		_pr0.pack(fill="x", padx=6, pady=(2, 2))
@@ -3980,8 +3980,10 @@ class MainMenuGUI(_BaseWindow):
 		_log_pair_btn_state()
 		self._ankle_pairs_frame = ttk.Frame(prs)
 		self._ankle_pairs_frame.pack(fill="x", padx=6)
-		ttk.Label(prs, text='※ 2点はできるだけ近くに置いてください（それぞれ関節面の近くで、割れ目をはさんで向かい合う所）。距離は、2点を結ぶ向きの動きにはそのまま反応しますが、それに垂直な横ずれにはほとんど反応しません（例: 2点が 10 mm 離れていると、0.5 mm の横ずれでも距離は 0.01 mm しか変わりません。2点が近いほど、どの向きのずれも距離の変化に出ます）。', foreground="gray", font=(self.ui_font_family, 8), wraplength=740,
-		          justify="left").pack(fill="x", padx=6, pady=(2, 4))
+		ttk.Label(prs, text='※ 点A は骨A（例: 脛骨）の接触面、点B はそれと向かい合う骨B（例: 骨片）の接触面に置いてください。'
+		          '表示するのは「骨A から見て、点B が最初のコマの位置からどれだけ動いたか」（点B の移動距離）です。'
+		          'どの向きの動きも同じように出ます（2点を結ぶ線の長さの変化とは違い、横にずれても出ます）。', foreground="gray",
+		          font=(self.ui_font_family, 8), wraplength=740, justify="left").pack(fill="x", padx=6, pady=(2, 4))
 
 		# ロボットの datalog（2026-10-09）
 		rlg = ttk.Frame(vis_frame)
@@ -12531,7 +12533,7 @@ class MainMenuGUI(_BaseWindow):
 	def _ankle_log_pair_series(self):
 		"""いま開いているタブの、2点の距離（各コマ）と datalog（コマの時刻に合わせたもの）。
 
-		返り値: {"times": 映像の秒（最初のコマ 0）, "pairs": [{"name", "color", "dist"}],
+		返り値: {"times": 映像の秒（最初のコマ 0）, "pairs": [{"name", "color", "dist", "pbA"（骨Aの座標での点B）, "bone_a"}],
 		         "log": {項目: 各コマの値}, "log_raw": datalog, "offset": ずれ（秒・ロボット＝映像−ずれ）}
 		姿勢の平滑化・datalog の時刻合わせは、可視化・靭帯の長さを比べる画面と同じ（_ankle_lig_lengths_current_tab）。
 		datalog の値にも、骨の姿勢と同じ平滑化（Butterworth 4 次・filtfilt・同じカットオフ）をかける
@@ -12572,7 +12574,6 @@ class MainMenuGUI(_BaseWindow):
 			print(f"[datalog と 2点の距離] 平滑化に失敗（生の姿勢で計算）: {e}")
 		Ts_of = {i: np.asarray(Ts, dtype=float) for (i, nm, m, Ts) in bones_data}
 		name_of = {i: nm for (i, nm, m, Ts) in bones_data}
-		mesh_of = {i: m for (i, nm, m, Ts) in bones_data}
 		pairs = []
 		for ia, pr in self._ankle_pairs_all():
 			ib = next((i for i in Ts_of if name_of[i] == str(pr.get("bone_b", ""))), None)
@@ -12589,17 +12590,12 @@ class MainMenuGUI(_BaseWindow):
 			bname = str(self.ankle_bones[ia].get("name", ""))
 			item = {"name": str(pr.get("name") or (bname + "–" + str(pr.get("bone_b", "")))),
 			        "color": str(pr.get("color", "#d62728")), "dist": np.linalg.norm(pb - pa, axis=1)}
-			# 割れ面の座標系（2026-11-17）: 骨 A に固定した座標で、骨 B の点 B がどう動いたか。
-			# 2点の距離は 2 点を結ぶ向きのずれにしか一次で反応しない（垂直な横ずれ δ は約 δ²/2L）ので、
-			# 点 B の動きをベクトルのまま持ち、割れ面に垂直（開き）・沿った向き（ずれ）に分ける。
-			try:
-				rel = np.einsum("nij,njk->nik", np.linalg.inv(Ta[:n]), Tb[:n])          # 骨 A から見た骨 B
-				pbA = np.einsum("nij,j->ni", rel[:, :3, :3], qb) + rel[:, :3, 3]        # 骨 A の座標での点 B
-				V = np.asarray(getattr(mesh_of.get(ia), "points", np.zeros((0, 3))), dtype=float)
-				nrm, fit = self._ankle_fracture_normal(V, np.asarray(qa, float), pbA[0])
-				item.update({"pbA": pbA, "relR": rel[:, :3, :3], "normal": nrm, "fit": fit})
-			except Exception as e:
-				print(f"[datalog と 2点の距離] {item['name']}: 割れ面の向きを求められません（{e}）")
+			# 骨 A に固定した座標で見た点 B（2026-11-17）。点 A は骨 A に固定なので、
+			# 「点 A に対する点 B の動き」＝「骨 A の座標で見た点 B の動き」。その大きさ（移動距離）をグラフに出す。
+			# 2点の距離は 2 点を結ぶ向きのずれにしか一次で反応しない（垂直な横ずれ δ は約 δ²/2L）ので使わない（2026-11-18）。
+			rel = np.einsum("nij,njk->nik", np.linalg.inv(Ta[:n]), Tb[:n])          # 骨 A から見た骨 B
+			item["pbA"] = np.einsum("nij,j->ni", rel[:, :3, :3], qb) + rel[:, :3, 3]   # 骨 A の座標での点 B
+			item["bone_a"] = bname
 			pairs.append(item)
 		# datalog と時刻のずれ（可視化と同じ）
 		path = str(self.ankle_robot_log_path.get() or "").strip()
@@ -12641,43 +12637,6 @@ class MainMenuGUI(_BaseWindow):
 			v = np.where(inside, v, np.nan)
 			vals[key] = v
 		return {"times": ft, "pairs": pairs, "log": vals, "log_raw": log, "offset": float(off)}
-
-	@staticmethod
-	def _ankle_fracture_normal(V, qa, toward):
-		"""点 A のまわりの骨 A の表面に平面を当てはめた法線（割れ面の向き）。→ (単位ベクトル, {"rms", "n", "r", "angle"})
-
-		V: 骨 A のモデルの頂点（骨 A の座標）。半径 3 → 4 → 6 → 8 mm と広げ、30 点以上あれば主成分分析で平面を当てはめる。
-		向きは点 B（toward、骨 A の座標）のある側を ＋（＝開く向き）。点 A と点 B がほぼ重なっているときは、
-		骨 A の中心から点 A へ向かう側（骨の外向き）を ＋ にする。
-		rms = 平面からの点のずれ（平らさ）、angle = 法線と「点 A → 点 B」の向きの角度（°、点が離れているときだけ）。
-		"""
-		import numpy as np
-		V = np.asarray(V, dtype=float)
-		qa = np.asarray(qa, dtype=float)
-		if V.ndim != 2 or len(V) < 30:
-			raise ValueError("骨 A のモデルの点が足りません")
-		d = np.linalg.norm(V - qa, axis=1)
-		P, r_used = None, None
-		for r in (3.0, 4.0, 6.0, 8.0):
-			sel = V[d <= r]
-			if len(sel) >= 30:
-				P, r_used = sel, r
-				break
-		if P is None:
-			P, r_used = V[np.argsort(d)[:30]], float(np.sort(d)[29])
-		c = P.mean(axis=0)
-		_u, s, vt = np.linalg.svd(P - c, full_matrices=False)
-		nrm = vt[2] / np.linalg.norm(vt[2])
-		rms = float(np.sqrt(np.mean(((P - c) @ nrm) ** 2)))
-		v = np.asarray(toward, dtype=float) - qa
-		ang = None
-		if np.linalg.norm(v) > 0.3:
-			if float(v @ nrm) < 0:
-				nrm = -nrm
-			ang = float(np.degrees(np.arccos(np.clip(abs(v @ nrm) / np.linalg.norm(v), -1.0, 1.0))))
-		elif float((qa - V.mean(axis=0)) @ nrm) < 0:
-			nrm = -nrm
-		return nrm, {"rms": rms, "n": int(len(P)), "r": float(r_used), "angle": ang}
 
 	@staticmethod
 	def _ankle_log_ranges(times, log_vals) -> dict:
@@ -12753,35 +12712,17 @@ class MainMenuGUI(_BaseWindow):
 			if key in S["log"]:
 				Q.append((f"ロボット {key}", units.get(key, ""), S["log"][key], "log"))
 		for k, p in enumerate(S["pairs"]):
-			Q.append((f"2点 #{k + 1} {p['name']} の距離の変化", "mm", p["dist"], "pair"))
-			if p.get("pbA") is not None:
-				# 割れ面の座標系（2026-11-17）: 区間の始めからの点 B の動き（骨 A の座標）を割れ面の法線で分ける
-				def _mk(p=p):
-					pbA, n_, R_ = p["pbA"], p["normal"], p["relR"]
+			if p.get("pbA") is None:
+				continue
+			# 2026-11-18: 2点の量は「骨A に対する点B の移動距離」（区間の始めから・どの向きの動きも同じように出る）だけにした。
+			# 2点の距離の変化（方向で偏る）・開き・ずれ（割れ面の定義が要る）・回転は、ユーザーの判断で選択肢から外した。
+			def _mk(p=p):
+				pbA = p["pbA"]
 
-					def _d(idx):
-						return pbA[idx] - pbA[idx[0]]
-
-					def _open(idx):
-						return _d(idx) @ n_
-
-					def _slide(idx):
-						d_ = _d(idx)
-						return np.linalg.norm(d_ - np.outer(d_ @ n_, n_), axis=1)
-
-					def _total(idx):
-						return np.linalg.norm(_d(idx), axis=1)
-
-					def _rot(idx):
-						Rr = np.einsum("nij,kj->nik", R_[idx], R_[idx[0]])        # R(t)·R(始め)ᵀ
-						tr = np.einsum("nii->n", Rr)
-						return np.degrees(np.arccos(np.clip((tr - 1.0) / 2.0, -1.0, 1.0)))
-					return _open, _slide, _total, _rot
-				f_open, f_slide, f_total, f_rot = _mk()
-				Q.append((f"2点 #{k + 1} 開き（割れ面に垂直・＋＝開いた）", "mm", f_open, "fn"))
-				Q.append((f"2点 #{k + 1} ずれ（割れ面に沿った動きの大きさ）", "mm", f_slide, "fn"))
-				Q.append((f"2点 #{k + 1} 点Bの動きの大きさ（向きによらない）", "mm", f_total, "fn"))
-				Q.append((f"2点 #{k + 1} 回転の大きさ（骨Bの骨Aに対する）", "deg", f_rot, "fn"))
+				def _mov(idx):
+					return np.linalg.norm(pbA[idx] - pbA[idx[0]], axis=1)
+				return _mov
+			Q.append((f"#{k + 1} {p['name']}：点B の移動距離（{p.get('bone_a', '骨A')}に対して）", "mm", _mk(), "fn"))
 		names = [q[0] for q in Q]
 		ranges = self._ankle_log_ranges(ft, S["log"])
 		rkeys = [k for k in ("all", "anterior", "posterior", "load") if k in ranges]
@@ -12793,7 +12734,7 @@ class MainMenuGUI(_BaseWindow):
 		top = ttk.Frame(win)
 		top.pack(side="top", fill="x", padx=10, pady=(8, 2))
 		x_def = next((q[0] for q in Q if q[0] == "ロボット AP"), names[0])
-		y_def = next((q[0] for q in Q if q[3] == "pair"), next((q[0] for q in Q if q[0] == "ロボット Fap"), names[-1]))
+		y_def = next((q[0] for q in Q if q[3] == "fn"), next((q[0] for q in Q if q[0] == "ロボット Fap"), names[-1]))
 		x_var = tk.StringVar(win, value=x_def)
 		y_var = tk.StringVar(win, value=y_def)
 		r_var = tk.StringVar(win, value=self._ANKLE_LOG_RANGE_NAMES["anterior" if "anterior" in ranges else "all"])
@@ -12809,22 +12750,12 @@ class MainMenuGUI(_BaseWindow):
 		                variable=rel_var).grid(row=1, column=2, columnspan=2, sticky="w", pady=(4, 0))
 		btns = ttk.Frame(top)
 		btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
-		note = ("※ 2点の距離の変化は、区間の始めのコマを 0 にしています（+ = 離れた）。datalog は可視化と同じ時刻合わせ"
+		note = ("※ 点B の移動距離 = 骨A（点A の骨）から見て、骨B の点B が区間の始めの位置からどれだけ動いたか（どの向きの動きも同じように出ます）。"
+		        "datalog は可視化と同じ時刻合わせ"
 		        f"（ロボット = 映像 − {S['offset']:.2f} 秒）と同じ平滑化をかけています。"
 		        "　赤い縦線: グラフをクリック・ドラッグ、または ← → キー（1 コマずつ）で動かします。")
 		if not S["pairs"]:
 			note = "※ 2点の組がまだありません（⑤の「＋ 2点を追加…」で置くと、縦軸に選べます）。" + note
-		_fits = []
-		for k, p in enumerate(S["pairs"]):
-			f_ = p.get("fit")
-			if f_:
-				a_ = f"・法線と点A→点Bの向きの角度 {f_['angle']:.0f}°" if f_.get("angle") is not None else ""
-				w_ = "（⚠ 平らでない。点Aを割れ面の平らな所に置き直すとよい）" if f_["rms"] > 0.5 else ""
-				_fits.append(f"#{k + 1}: 半径 {f_['r']:g} mm・{f_['n']} 点・平らさ {f_['rms']:.2f} mm{a_}{w_}")
-		if _fits:
-			note += ("\n※ 割れ面の向き = 点A のまわりの骨A の表面に当てはめた平面の法線（点B の側が ＋）。"
-			         "開き・ずれ・点Bの動きの大きさは、骨A に固定した座標で見た点B の、区間の始めからの動きです　"
-			         + "　".join(_fits))
 		ttk.Label(win, text=note, foreground="gray", font=(self.ui_font_family, 8), wraplength=1060,
 		          justify="left").pack(side="top", fill="x", padx=10)
 		info = tk.StringVar(win, value="")
@@ -23776,7 +23707,10 @@ class MainMenuGUI(_BaseWindow):
 	# 変化を出す（+ = 離れた / − = 近づいた）。点は点A側の骨の "disp_pairs" に入れる（骨リストの共有で全タブに入る）。
 	# 距離は2点を結ぶ向きの動きにだけ強く反応する（垂直な横ずれ δ では約 δ²/2L）ので、2点は近くに置くよう案内する。
 	_ANKLE_PAIR_COLORS = ("#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#17becf", "#e377c2", "#8c564b")
-	_ANKLE_PAIR_NOTE = '※ 2点はできるだけ近くに置いてください（それぞれ関節面の近くで、割れ目をはさんで向かい合う所）。距離は、2点を結ぶ向きの動きにはそのまま反応しますが、それに垂直な横ずれにはほとんど反応しません（例: 2点が 10 mm 離れていると、0.5 mm の横ずれでも距離は 0.01 mm しか変わりません。2点が近いほど、どの向きのずれも距離の変化に出ます）。'
+	# 2026-11-18: 表示は「骨A から見た点B の移動距離」になったので、2点を近くに置く必要はなくなった
+	_ANKLE_PAIR_NOTE = ('※ 点A は骨A（例: 脛骨）の接触面、点B はそれと向かい合う骨B（例: 骨片）の接触面に置いてください。'
+	                    '表示するのは「骨A から見て、点B が最初のコマの位置からどれだけ動いたか」（点B の移動距離）で、'
+	                    'どの向きの動きも同じように出ます。動きを見たい所（骨片の接触面の上）に点B を置くことが大事です。')
 
 	def _ankle_pairs_all(self):
 		"""[(点A側の骨の番号, 組の dict)]（骨リストの順）"""
@@ -24107,8 +24041,14 @@ class MainMenuGUI(_BaseWindow):
 			pa = np.einsum('nij,j->ni', Ta[:, :3, :3], qa) + Ta[:, :3, 3]
 			pb = np.einsum('nij,j->ni', Tb[:, :3, :3], qb) + Tb[:, :3, 3]
 			dist = np.linalg.norm(pb - pa, axis=1)
+			# 2026-11-18: 表示する量は「骨A に対する点B の移動距離」（最初のコマから）。2点の距離の変化は
+			# 2点を結ぶ向きのずれにしか一次で反応しない（横ずれ 0.5 mm でも 0.01 mm）ので使わない
+			rel = np.einsum("nij,njk->nik", np.linalg.inv(Ta), Tb)
+			pbA = np.einsum("nij,j->ni", rel[:, :3, :3], qb) + rel[:, :3, 3]
+			mov = np.linalg.norm(pbA - pbA[0], axis=1)
 			items.append({"name": str(pr.get("name", "")), "color": str(pr.get("color", "#d62728")),
-			              "pa": pa, "pb": pb, "dist": dist, "chg": dist - dist[0]})
+			              "bone_a": str(self.ankle_bones[ia].get("name", "")),
+			              "pa": pa, "pb": pb, "dist": dist, "chg": mov})
 		if not items:
 			return None
 		times = np.asarray(scene.get("frame_times") or np.arange(len(items[0]["dist"])) / 30.0, dtype=float)
@@ -24161,7 +24101,7 @@ class MainMenuGUI(_BaseWindow):
 			# 右下のグラフ（すべての組を色分けして重ねる）
 			try:
 				ch = pv.Chart2D(size=(0.33, 0.22), loc=(0.66, 0.03), x_label="time [s]",
-				                y_label="distance change [mm]")
+				                y_label="displacement of B [mm]")
 				lo = min(float(np.nanmin(it["chg"])) for it in items)
 				hi = max(float(np.nanmax(it["chg"])) for it in items)
 				if hi - lo < 0.2:
@@ -24197,7 +24137,7 @@ class MainMenuGUI(_BaseWindow):
 				ls.SetPoint1(*it["pa"][fi])
 				ls.SetPoint2(*it["pb"][fi])
 				ls.Modified()
-				ta.SetInput(f"#{k + 1} {it['name']}: 距離 {it['dist'][fi]:.2f} mm（変化 {it['chg'][fi]:+.2f} mm）")
+				ta.SetInput(f"#{k + 1} {it['name']}: 点B の移動距離 {it['chg'][fi]:.2f} mm（{it['bone_a']}に対して）")
 			if st["cur"] is not None:
 				try:
 					t = float(times[fi])
@@ -24207,9 +24147,9 @@ class MainMenuGUI(_BaseWindow):
 
 		def _csv():
 			import csv
-			fp = filedialog.asksaveasfilename(parent=self, title="2点の距離の変化を CSV に保存",
+			fp = filedialog.asksaveasfilename(parent=self, title="点B の移動距離を CSV に保存",
 			                                  defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-			                                  initialfile="2点の距離の変化.csv")
+			                                  initialfile="点Bの移動距離.csv")
 			if not fp:
 				return
 			try:
@@ -24217,21 +24157,21 @@ class MainMenuGUI(_BaseWindow):
 					w = csv.writer(f)
 					hdr = ["time_s", "frame"]
 					for k, it in enumerate(items):
-						hdr += [f"#{k + 1} {it['name']} 距離[mm]", f"#{k + 1} {it['name']} 変化[mm]"]
+						hdr += [f"#{k + 1} {it['name']} 点Bの移動距離（{it['bone_a']}に対して）[mm]"]
 					w.writerow(hdr)
 					for fi in range(len(times)):
 						row = [f"{times[fi]:.4f}", fi]
 						for it in items:
-							row += [f"{it['dist'][fi]:.4f}", f"{it['chg'][fi]:.4f}"]
+							row += [f"{it['chg'][fi]:.4f}"]
 						w.writerow(row)
 				messagebox.showinfo("2点の距離", f"保存しました（{len(times)} コマ・{len(items)} 組）:\n{fp}", parent=self)
 			except Exception as e:
 				messagebox.showerror("2点の距離", f"保存できませんでした:\n{e}", parent=self)
 
-		scene.setdefault("panel_buttons", []).append(("2点の距離を CSV に保存…", _csv))
+		scene.setdefault("panel_buttons", []).append(("点B の移動距離を CSV に保存…", _csv))
 		scene["_pairs_csv"] = _csv
-		print(f"[2点の距離] {len(items)} 組を表示: " + " / ".join(
-			f"{it['name']}（最初 {it['dist'][0]:.2f} mm）" for it in items))
+		print(f"[2点の距離] {len(items)} 組を表示（点B の移動距離）: " + " / ".join(
+			f"{it['name']}（最初の 2 点の間 {it['dist'][0]:.2f} mm）" for it in items))
 		return _make
 
 	def _ankle_joint_view_cfg(self, scene_bones):

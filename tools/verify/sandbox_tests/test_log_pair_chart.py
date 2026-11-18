@@ -4,7 +4,7 @@
 261007_AP_FE60_軸力100 に脛骨と大腿骨のいちばん近い所の 2 点の組を（画面の中だけで）置き、
 2点の距離は姿勢から独立に計算した値と一致・datalog の時刻のずれは「靭帯の長さを比べる」と同じ・区間（前方引張の行き）で
 AP がほぼ増える一方・横軸 AP／縦軸 2点の初期値・赤い線（クリックの位置にいちばん近いコマ・← → で 1 コマ）・値の文字が配列と一致・
-区間を変えると描き直す・CSV（行数・値）・PNG。状態ファイル・キャッシュは書かない。2〜3 分。"""
+区間を変えると描き直す・CSV（行数・値）・PNG／2 点の量は「骨A に対する点B の移動距離」だけ（2026-11-18）。状態ファイル・キャッシュは書かない。2〜3 分。"""
 import importlib.util, os, sys, time, tempfile, csv
 HERE = os.path.dirname(os.path.abspath(__file__)); os.chdir(HERE)
 spec = importlib.util.spec_from_file_location("frs", os.path.join(HERE, "FRS-SIMULATOR.py"))
@@ -91,10 +91,10 @@ before = set(app.winfo_children())
 app._ankle_open_log_pair_chart(); pump(app, 1.0)
 win = [w for w in app.winfo_children() if w not in before and isinstance(w, tk.Toplevel)][0]
 G = win._log_pair_state
-check(G["x_var"].get() == "ロボット AP" and G["y_var"].get().startswith("2点 #1"), f"初期: 横軸 {G['x_var'].get()}・縦軸 {G['y_var'].get()}")
+check(G["x_var"].get() == "ロボット AP" and (G["y_var"].get().startswith("#1 ") and "点B の移動距離" in G["y_var"].get()), f"初期: 横軸 {G['x_var'].get()}・縦軸 {G['y_var'].get()}")
 check(G["r_var"].get() == "前方引張（行き）", f"初期の区間は前方引張（行き）: {G['r_var'].get()}")
 st = G["st"]
-check(st["a"] == a and st["b"] == b and abs(st["y"][0]) < 1e-12, "区間の始めのコマで 2点の距離の変化が 0")
+check(st["a"] == a and st["b"] == b and abs(st["y"][0]) < 1e-12, "区間の始めのコマで 点B の移動距離が 0")
 check(abs(st["x"][0]) < 1e-12 and abs(np.nanmax(st["x"]) - (np.nanmax(seg) - seg[0])) < 1e-9,
       f"横軸の AP は区間の始めを 0 にした前方変位（最大 {np.nanmax(st['x']):.2f} mm）")
 G["rel_var"].set(False); pump(app, 0.3)
@@ -122,7 +122,7 @@ G["r_var"].set("全体"); pump(app, 0.5)
 check(st["a"] == 0 and st["b"] == len(S["times"]) - 1, "区間を全体にすると描き直す")
 G["x_var"].set("映像の時刻"); G["y_var"].set("ロボット Fap"); pump(app, 0.5)
 check(abs(st["x"][0]) < 1e-12 and np.nanmax(np.abs(st["y"])) > 50, "横軸 時刻・縦軸 Fap にも切り替えられる")
-G["x_var"].set("ロボット AP"); G["y_var"].set([q[0] for q in G["Q"] if q[3] == "pair"][0]); G["r_var"].set("前方引張（行き）"); pump(app, 0.5)
+G["x_var"].set("ロボット AP"); G["y_var"].set([q[0] for q in G["Q"] if q[3] == "fn"][0]); G["r_var"].set("前方引張（行き）"); pump(app, 0.5)
 tmp = tempfile.mkdtemp()
 frs.filedialog.asksaveasfilename = lambda **k: os.path.join(tmp, k.get("initialfile", "x"))
 for w in (win,):
@@ -139,44 +139,35 @@ check(len(rows) == (b - a + 1) + 1 and rows[0][2].startswith("ロボット AP"),
 check(abs(float(rows[1 + j][3]) - st["y"][j]) < 1e-4, "CSV の値がグラフと一致")
 check(os.path.exists(ppng) and os.path.getsize(ppng) > 10000, f"PNG を保存（{os.path.getsize(ppng) if os.path.exists(ppng) else 0} バイト）")
 win.destroy()
-# ---- 割れ面の座標系（2026-11-17） ----
-rng = np.random.default_rng(1)
-Vp = np.c_[rng.uniform(-5, 5, (400, 2)), rng.normal(0, 0.02, 400)]          # z = 0 の平らな面
-nrm_, fit_ = app._ankle_fracture_normal(Vp, np.zeros(3), np.array([0.3, 0.2, 2.0]))
-check(abs(abs(nrm_[2]) - 1) < 1e-3 and nrm_[2] > 0 and fit_["rms"] < 0.05 and fit_["r"] == 3.0,
-      f"平らな面の法線は面に垂直・点B の側が ＋: {np.round(nrm_, 4)}・平らさ {fit_['rms']:.3f} mm・半径 {fit_['r']}")
-nrm2, _f2 = app._ankle_fracture_normal(Vp, np.zeros(3), np.array([0.0, 0.0, -2.0]))
-check(nrm2[2] < 0, "点B が反対側なら法線も反対向き（＋＝開く向き）")
+# ---- 点B の移動距離（2026-11-18） ----
 p0 = S["pairs"][0]
-check(p0.get("pbA") is not None and abs(np.linalg.norm(p0["normal"]) - 1) < 1e-9, "実データの 2 点の組に割れ面の向きと骨Aの座標での点Bが入る")
-print(f"   実データの当てはめ: {p0['fit']}", flush=True)
+check(p0.get("pbA") is not None and p0.get("bone_a") == names[it], f"2 点の組に、骨A（{p0.get('bone_a')}）の座標での点B が入る")
+pbA_ind = np.einsum("nij,j->ni", np.einsum("nij,njk->nik", np.linalg.inv(T2[it]), T2[jf])[:, :3, :3], qb) \
+          + np.einsum("nij,njk->nik", np.linalg.inv(T2[it]), T2[jf])[:, :3, 3]
+check(np.max(np.abs(pbA_ind - p0["pbA"])) < 1e-9, "骨A の座標での点B は、平滑化した姿勢から独立に計算した値と一致")
 before = set(app.winfo_children())
 app._ankle_open_log_pair_chart(); pump(app, 1.0)
 win = [w for w in app.winfo_children() if w not in before and isinstance(w, tk.Toplevel)][0]
 G = win._log_pair_state
-Qn = {q[0]: q for q in G["Q"]}
-ks = [k for k in Qn if k.startswith("2点 #1 ")]
-print("   選べる量:", ks, flush=True)
-need = ["開き（割れ面に垂直", "ずれ（割れ面に沿った", "点Bの動きの大きさ", "回転の大きさ"]
-check(all(any(n_ in k for k in ks) for n_ in need), "縦軸に 開き・ずれ・点Bの動きの大きさ・回転の大きさ が選べる")
+ks = [q[0] for q in G["Q"] if q[0].startswith("#")]
+print("   2点の選択肢:", ks, flush=True)
+check(len(ks) == 1 and "点B の移動距離" in ks[0] and f"{names[it]}に対して" in ks[0],
+      "2 点の量の選択肢は「点B の移動距離（骨A に対して）」だけ")
+check(not any(w_ in q[0] for q in G["Q"] for w_ in ("開き", "ずれ", "回転", "距離の変化")),
+      "開き・ずれ・回転・2点の距離の変化は選択肢に無い")
 a, b = rr["anterior"]; idx = np.arange(a, b + 1)
-fo = next(Qn[k] for k in ks if "開き" in k)[2](idx); fs = next(Qn[k] for k in ks if "ずれ" in k)[2](idx)
-ft_ = next(Qn[k] for k in ks if "点Bの動きの大きさ" in k)[2](idx); fr = next(Qn[k] for k in ks if "回転" in k)[2](idx)
-check(abs(fo[0]) < 1e-12 and abs(fs[0]) < 1e-12 and abs(ft_[0]) < 1e-12 and abs(fr[0]) < 1e-6, "区間の始めでどれも 0")
-check(np.max(np.abs(fo ** 2 + fs ** 2 - ft_ ** 2)) < 1e-9 and np.all(fs >= 0) and np.all(fr >= 0), "開き² ＋ ずれ² ＝ 動きの大きさ²・ずれと回転は 0 以上")
+mv = G["Q"][[q[0] for q in G["Q"]].index(ks[0])][2](idx)
+check(abs(mv[0]) < 1e-12 and np.all(mv >= 0) and np.max(np.abs(mv - np.linalg.norm(pbA_ind[idx] - pbA_ind[a], axis=1))) < 1e-9,
+      f"移動距離 = 区間の始めからの点B の動きの大きさ（独立に計算した値と一致・最大 {np.max(mv):.3f} mm）")
 d_chg = S["pairs"][0]["dist"][idx] - S["pairs"][0]["dist"][a]
-check(np.all(ft_ + 1e-9 >= np.abs(d_chg) - 0.05),
-      f"点Bの動きの大きさは 2点の距離の変化以上（距離 最大 {np.max(np.abs(d_chg)):.3f}・動き 最大 {np.max(ft_):.3f} mm）")
-G["y_var"].set(next(k for k in ks if "開き" in k)); pump(app, 0.4)
-check(abs(G["st"]["y"][0]) < 1e-12 and np.allclose(G["st"]["y"], fo), "縦軸を「開き」にするとその値を描く")
+check(np.all(mv + 1e-9 >= np.abs(d_chg) - 0.05),
+      f"移動距離は 2点の距離の変化以上（距離の変化 最大 {np.max(np.abs(d_chg)):.3f}・移動距離 最大 {np.max(mv):.3f} mm）")
 win.destroy()
 # 方向の偏りの確認（合成）: 点A と点B が 10 mm 離れ、点B を 2 点を結ぶ向きに垂直に 0.5 mm ずらす
-qa_ = np.zeros(3); nn = np.array([0.0, 0.0, 1.0]); pb0 = np.array([0.0, 0.0, 10.0])
-pbA_ = np.array([pb0, pb0 + np.array([0.5, 0.0, 0.0])])
-dist_chg = np.linalg.norm(pbA_[1] - qa_) - np.linalg.norm(pbA_[0] - qa_)
-dvec = pbA_[1] - pbA_[0]
-check(dist_chg < 0.02 and abs(np.linalg.norm(dvec) - 0.5) < 1e-12 and abs(dvec @ nn) < 1e-12,
-      f"横に 0.5 mm ずれると: 2点の距離の変化 {dist_chg:.4f} mm（ほぼ見えない）・点Bの動きの大きさ 0.5 mm・開き 0（ずれ 0.5）")
+qa_ = np.zeros(3); pb0 = np.array([0.0, 0.0, 10.0]); pb1 = pb0 + np.array([0.5, 0.0, 0.0])
+dist_chg = np.linalg.norm(pb1 - qa_) - np.linalg.norm(pb0 - qa_)
+check(dist_chg < 0.02 and abs(np.linalg.norm(pb1 - pb0) - 0.5) < 1e-12,
+      f"横に 0.5 mm ずれると: 2点の距離の変化 {dist_chg:.4f} mm（ほぼ見えない）・点B の移動距離 0.5 mm")
 
 app.ankle_bones[it]["disp_pairs"] = pairs_keep
 

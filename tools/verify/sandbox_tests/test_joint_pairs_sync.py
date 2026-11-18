@@ -215,7 +215,7 @@ res = app._ankle_pair_pick(ti, fm_)
 pv.Plotter.enable_surface_point_picking = _orig_esp; pv.Plotter.show = _orig_show; pv.Plotter.add_text = _orig_text
 check(res is not None, "点を置く画面で2点を置ける")
 check(any("の上をクリックしてください" in t for t in texts), "骨の上でない所をクリックしたら断る")
-check(any("できるだけ近く" in t and "横ずれ" in t for t in texts), "点を置く画面に、2点を近くに置く注意書き")
+check(any("接触面" in t and "点B の移動距離" in t for t in texts), "点を置く画面に、点を接触面に置く注意書き（2026-11-18）")
 pa, pb = res
 # 骨モデルの座標で覚えている: 最初のコマの位置に戻すと、置いた所（骨の表面）
 qa = pa; Mb = np.linalg.inv(Ti0) @ Tm0; qb = Mb[:3, :3] @ pb + Mb[:3, 3]
@@ -241,6 +241,9 @@ v["seek"](float(np.asarray(cache["timestamps"])[1500] - np.asarray(cache["timest
 Tsi = by[ti][1]; Tsm = by[fm_][1]
 def world(T, q): return np.asarray(T)[:3, :3] @ q + np.asarray(T)[:3, 3]
 dist = np.array([np.linalg.norm(world(Tsm[t], pb) - world(Tsi[t], pa)) for t in range(N)])
+# 2026-11-18: 表示は「脛骨から見た点B の、最初のコマからの移動距離」
+pbA_ = np.array([world(np.linalg.inv(np.asarray(Tsi[t])) @ np.asarray(Tsm[t]), pb) for t in range(N)])
+mov = np.linalg.norm(pbA_ - pbA_[0], axis=1)
 ta_list = []
 c2 = p.renderer.GetActors2D(); c2.InitTraversal()
 for _ in range(c2.GetNumberOfItems()):
@@ -249,9 +252,9 @@ for _ in range(c2.GetNumberOfItems()):
 print("   左上:", [t for t in ta_list if t.startswith("#")], flush=True)
 fi = int(re.search(r"Frame: (\d+)", str(v["ctrl"]["frame_label"].cget("text"))).group(1))
 t1 = next((t for t in ta_list if t.startswith("#1")), "")
-mm = re.search(r"距離 ([0-9.]+) mm（変化 ([+-][0-9.]+) mm）", t1)
-check(mm is not None and abs(float(mm.group(1)) - dist[fi]) < 0.006 and abs(float(mm.group(2)) - (dist[fi] - dist[0])) < 0.006,
-      f"左上の数値が、別に計算した距離と一致（コマ {fi}: {t1} / 計算 {dist[fi]:.2f} mm, 変化 {dist[fi]-dist[0]:+.2f}）")
+mm = re.search(r"点B の移動距離 ([0-9.]+) mm（脛骨に対して）", t1)
+check(mm is not None and abs(float(mm.group(1)) - mov[fi]) < 0.006,
+      f"左上の数値が、別に計算した点B の移動距離と一致（コマ {fi}: {t1} / 計算 {mov[fi]:.2f} mm）")
 check(any(t.startswith("#2") for t in ta_list), "2組を同時に表示")
 rens = p.render_window.GetRenderers(); rens.InitTraversal(); rl = [rens.GetNextItem() for _ in range(rens.GetNumberOfItems())]
 _nch = len(getattr(p.renderer, "_charts", None) or [])
@@ -269,13 +272,13 @@ def walkb(wd):
 		if c.winfo_class() == "TButton": names_btn.append(c)
 		walkb(c)
 walkb(v["ctrl"]["window"])
-b_csv = [b for b in names_btn if "CSV に保存" in str(b.cget("text")) and "2点" in str(b.cget("text"))]
-check(len(b_csv) == 1, "再生コントロールに「2点の距離を CSV に保存…」")
+b_csv = [b for b in names_btn if "CSV に保存" in str(b.cget("text")) and "点B の移動距離" in str(b.cget("text"))]
+check(len(b_csv) == 1, "再生コントロールに「点B の移動距離を CSV に保存…」")
 b_csv[0].invoke(); pump(app, 0.2)
 rows_ = list(csv.reader(open(OUTCSV, encoding="utf-8-sig")))
 _cd = np.array([float(r[2]) for r in rows_[1:]])
-check(len(rows_) == N + 1 and "#1 脛骨–骨片（内側） 距離[mm]" in rows_[0] and np.max(np.abs(_cd - dist)) < 1e-3
-      and abs(float(rows_[1][3])) < 1e-9, f"CSV: {len(rows_) - 1} コマ・全コマで別に計算した距離と一致（最大の差 {np.max(np.abs(_cd - dist)):.5f} mm）・最初のコマの変化は 0")
+check(len(rows_) == N + 1 and "#1 脛骨–骨片（内側） 点Bの移動距離（脛骨に対して）[mm]" in rows_[0] and np.max(np.abs(_cd - mov)) < 1e-3
+      and abs(float(rows_[1][2])) < 1e-9, f"CSV: {len(rows_) - 1} コマ・全コマで別に計算した移動距離と一致（最大の差 {np.max(np.abs(_cd - mov)):.5f} mm）・最初のコマは 0")
 p.screenshot(os.path.join(HERE, "pairs_view.png"))
 close(v)
 # 表示しない設定
@@ -300,6 +303,6 @@ def walkl(wd):
 		except Exception: pass
 		walkl(c)
 walkl(app)
-check(any("できるだけ近く" in t and "横ずれ" in t for t in labels), "⑤にも、2点を近くに置く注意書き")
+check(any("接触面" in t and "点B の移動距離" in t for t in labels), "⑤に、点を接触面に置く注意書きと、表示が点B の移動距離であることの説明（2026-11-18）")
 print(f"\n合計: NG {len(fails)} 件", flush=True)
 sys.stdout.flush(); os._exit(1 if fails else 0)
