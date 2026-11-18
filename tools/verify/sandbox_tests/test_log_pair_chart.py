@@ -34,7 +34,7 @@ app.ankle_robot_log_path.set(""); pump(app, 0.1)
 check(str(btn.cget("state")) == "disabled", "datalog を外すとボタンは押せない")
 msgs.clear(); n_top = len([w for w in app.winfo_children() if isinstance(w, tk.Toplevel)])
 app._ankle_open_log_pair_chart(); pump(app, 0.3)
-check(msgs and "datalog が入っていない" in str(msgs[-1][1][1]) and
+check(msgs and "datalog が入っていない" in str(msgs[-1][1][1]) and "⑤" in str(msgs[-1][1][1]) and
       len([w for w in app.winfo_children() if isinstance(w, tk.Toplevel)]) == n_top, "datalog が無いと理由を出して開かない")
 app.ankle_robot_log_path.set(keep_log); pump(app, 0.1)
 check(str(btn.cget("state")) == "normal", "datalog を戻すと押せる")

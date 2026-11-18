@@ -12600,7 +12600,7 @@ class MainMenuGUI(_BaseWindow):
 		# datalog と時刻のずれ（可視化と同じ）
 		path = str(self.ankle_robot_log_path.get() or "").strip()
 		if not path or not Path(path).exists():
-			raise RuntimeError("このタブに datalog が入っていません（②の「ロボットの datalog」で入れてください）。")
+			raise RuntimeError("このタブに datalog が入っていません（⑤の「ロボットの datalog を表示」の欄の 参照… か 自動で探す で入れてください）。")
 		log = self._ankle_robot_log_load(path)
 		off = float(self.ankle_robot_log_offset_s.get())
 		if bool(self.ankle_robot_log_auto.get()):
@@ -12689,7 +12689,7 @@ class MainMenuGUI(_BaseWindow):
 		path = str(self.ankle_robot_log_path.get() or "").strip()
 		if not path or not Path(path).exists():
 			messagebox.showinfo(title, "このタブに datalog が入っていないので使えません。\n"
-			                    "②の「ロボットの datalog」に datalog（.KKR / .csv）を入れてから使ってください。", parent=self)
+			                    "⑤の「ロボットの datalog を表示」の欄に、参照… か 自動で探す で datalog（.KKR / .csv）を入れてから使ってください。", parent=self)
 			return
 		try:
 			self.config(cursor="watch"); self.update_idletasks()
